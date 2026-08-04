@@ -66,6 +66,9 @@ const stageIndex = (key) => STAGES.findIndex((s) => s.key === key);
    One silicone cover can have many SKUs — one per colour, finish or
    variant — and each SKU carries its own material and unit count.  */
 
+/* The four places these covers actually sell */
+const MARKETPLACES = ["Flipkart", "Amazon", "Meesho", "Shopify"];
+
 let _skuSeq = 0;
 const skuRow = (sku = "", material = "", units = 0) => ({
   rid: ++_skuSeq,            // stable React key, never shown to the user
@@ -73,7 +76,19 @@ const skuRow = (sku = "", material = "", units = 0) => ({
   stpStatus: "Not Sent",     // STP file is tracked per SKU, not per phone
   receivedQty: null,         // how many actually arrived
   receiptState: null,        // null = unconfirmed | "full" | "short" | "none"
+  /* Listing runs per SKU per marketplace — a colour can be live on
+     Flipkart and still stuck in Amazon's catalogue queue.          */
+  listings: Object.fromEntries(MARKETPLACES.map((mp) => [mp, "Not listed"])),
 });
+
+const LISTING_STATES = ["Not listed", "In progress", "Live", "Blocked"];
+const listingTone = (st) =>
+  st === "Live" ? "ok" : st === "Blocked" ? "bad" : st === "In progress" ? "warn" : undefined;
+
+/* A SKU is fully listed when every marketplace says Live. */
+const isFullyListed = (r) => MARKETPLACES.every((mp) => r.listings?.[mp] === "Live");
+const liveCount     = (r) => MARKETPLACES.filter((mp) => r.listings?.[mp] === "Live").length;
+const blockedCount  = (r) => MARKETPLACES.filter((mp) => r.listings?.[mp] === "Blocked").length;
 
 const STP_STATUSES  = ["Not Sent", "Submitted", "Acknowledged", "In Progress", "Completed", "Rejected"];
 const stpTone = (st) => st === "Completed" ? "ok" : st === "Rejected" ? "bad" : st === "Not Sent" ? undefined : "warn";
@@ -976,6 +991,129 @@ function ReceivedChecker({ model, onSave }) {
 }
 
 
+/* ── LISTING — PER SKU, PER MARKETPLACE ──────────────────────────
+   A grid of SKUs down the side and marketplaces across the top.
+   Click any cell to cycle its status.                             */
+
+function ListingEditor({ model, onSave }) {
+  const rows = allSkus(model);
+  const [draft, setDraft] = useState(() =>
+    Object.fromEntries(rows.map((r) => [r.rid, { ...(r.listings || {}) }]))
+  );
+  const [saved, setSaved] = useState(false);
+
+  const cycle = (rid, mp) => setDraft((d) => {
+    const cur  = d[rid]?.[mp] || "Not listed";
+    const next = LISTING_STATES[(LISTING_STATES.indexOf(cur) + 1) % LISTING_STATES.length];
+    return { ...d, [rid]: { ...d[rid], [mp]: next } };
+  });
+
+  const setColumn = (mp, st) => setDraft((d) => {
+    const n = { ...d };
+    rows.forEach((r) => { n[r.rid] = { ...n[r.rid], [mp]: st }; });
+    return n;
+  });
+
+  const setAllLive = () => setDraft(Object.fromEntries(
+    rows.map((r) => [r.rid, Object.fromEntries(MARKETPLACES.map((mp) => [mp, "Live"]))])
+  ));
+
+  const save = () => { onSave(model.id, draft); setSaved(true); setTimeout(() => setSaved(false), 2000); };
+
+  /* counts read from the draft so the summary updates as you click */
+  const liveOn    = (mp) => rows.filter((r) => draft[r.rid]?.[mp] === "Live").length;
+  const blockedOn = (mp) => rows.filter((r) => draft[r.rid]?.[mp] === "Blocked").length;
+  const fully     = rows.filter((r) => MARKETPLACES.every((mp) => draft[r.rid]?.[mp] === "Live")).length;
+  const anyBlocked = rows.filter((r) => MARKETPLACES.some((mp) => draft[r.rid]?.[mp] === "Blocked")).length;
+
+  const exportListing = (fmt) => {
+    const headers = ["Brand", "Model", "Cover Type", "SKU", ...MARKETPLACES, "Fully listed"];
+    const body = rows.map((r) => [
+      model.brand, model.name, r.type, r.sku || "",
+      ...MARKETPLACES.map((mp) => draft[r.rid]?.[mp] || "Not listed"),
+      MARKETPLACES.every((mp) => draft[r.rid]?.[mp] === "Live") ? "Yes" : "No",
+    ]);
+    downloadReport(`Listing_${model.brand}_${model.name}`, headers, body, fmt);
+  };
+
+  if (!rows.length) return null;
+
+  return (
+    <div>
+      <h2 style={{ color: "var(--warn)" }}>▸ Marketplace listing</h2>
+      <div className="card">
+        <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
+          Click any cell to cycle it: Not listed → In progress → Live → Blocked.
+          Use a column header button to set a whole marketplace at once.
+        </div>
+
+        <button className="btn" style={{ fontSize: 11, padding: "4px 9px", marginBottom: 12 }}
+          onClick={setAllLive}>Mark everything live</button>
+
+        <div style={{ overflowX: "auto", marginBottom: 12 }}>
+          <table>
+            <thead>
+              <tr>
+                <th style={{ minWidth: 130 }}>Cover type</th>
+                <th style={{ minWidth: 140 }}>SKU</th>
+                {MARKETPLACES.map((mp) => (
+                  <th key={mp} style={{ textAlign: "center", minWidth: 96 }}>
+                    <div>{mp}</div>
+                    <button className="btn"
+                      style={{ fontSize: 9, padding: "1px 5px", marginTop: 3, fontWeight: 400 }}
+                      onClick={() => setColumn(mp, "Live")}>all live</button>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.rid} style={{ cursor: "default" }}>
+                  <td style={{ fontWeight: 550 }}>{r.type}</td>
+                  <td className="n" style={{ fontSize: 12 }}>{r.sku || "—"}</td>
+                  {MARKETPLACES.map((mp) => {
+                    const st = draft[r.rid]?.[mp] || "Not listed";
+                    return (
+                      <td key={mp} style={{ textAlign: "center", padding: "6px 4px" }}>
+                        <button className="btn"
+                          title={`${r.sku || r.type} on ${mp} — click to change`}
+                          style={{ fontSize: 10, padding: "3px 7px", width: "100%",
+                            color: st === "Live" ? "var(--ok)" : st === "Blocked" ? "var(--bad)"
+                                 : st === "In progress" ? "var(--warn)" : "var(--dim)",
+                            borderColor: st === "Live" ? "var(--ok)" : st === "Blocked" ? "var(--bad)" : undefined }}
+                          onClick={() => cycle(r.rid, mp)}>
+                          {st === "Not listed" ? "—" : st === "In progress" ? "WIP" : st}
+                        </button>
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
+          <button className="btn" data-primary="1" onClick={save}>{saved ? "✓ Saved" : "Save listing status"}</button>
+          <button className="btn" onClick={() => exportListing("csv")}>↓ CSV</button>
+          <button className="btn" onClick={() => exportListing("excel")}>↓ Excel</button>
+        </div>
+
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <Tag tone={fully === rows.length ? "ok" : undefined}>{fully} of {rows.length} SKUs fully listed</Tag>
+          {anyBlocked > 0 && <Tag tone="bad">{anyBlocked} blocked</Tag>}
+          {MARKETPLACES.map((mp) => (
+            <Tag key={mp} tone={liveOn(mp) === rows.length ? "ok" : blockedOn(mp) ? "bad" : undefined}>
+              {mp} {liveOn(mp)}/{rows.length}
+            </Tag>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 /* ── RESEARCH STAGE: EDIT PHONE DETAILS ─────────────────────────
    Inline editor in the detail panel so you can correct the brand,
    model name, launch date and segment right where you're looking. */
@@ -1030,7 +1168,7 @@ function ResearchEditor({ model, onSave }) {
   );
 }
 
-function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave }) {
+function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave }) {
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -1111,6 +1249,11 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
           {/* Received stage: goods receipt per cover type */}
           {model.stage === "received" && (
             <ReceivedChecker model={model} onSave={onReceiptSave} />
+          )}
+
+          {/* Listing can start as soon as stock is in, and stays editable once live */}
+          {["received", "live"].includes(model.stage) && (
+            <ListingEditor model={model} onSave={onListingSave} />
           )}
 
           {/* the pipeline */}
@@ -1445,6 +1588,9 @@ function Dashboard({ models, onOpen, onAdd }) {
   const noCovers      = planned.filter((m) => allSkus(m).length === 0).length;
   const missingSkus   = planned.filter((m) => allSkus(m).some((r) => !r.sku?.trim())).length;
   const unconfRec     = received.filter((m) => allSkus(m).some((r) => !isConfirmed(r))).length;
+  const listable      = models.filter((m) => ["received","live"].includes(m.stage) && allSkus(m).length);
+  const fullyListed   = listable.filter((m) => allSkus(m).every(isFullyListed)).length;
+  const listBlocked   = listable.filter((m) => allSkus(m).some((r) => blockedCount(r) > 0)).length;
   const launching14   = models.filter((m) => m.stage !== "live" && m.daysToLaunch >= 0 && m.daysToLaunch <= 14);
 
   /* funnel max for % bar width */
@@ -1457,6 +1603,11 @@ function Dashboard({ models, onOpen, onAdd }) {
       ps.push({ model: m, type: "warn", text: `Launches in ${m.daysToLaunch} day${m.daysToLaunch === 1 ? "" : "s"}` });
     if (m.stage === "planned" && allSkus(m).length === 0)
       ps.push({ model: m, type: "warn", text: "No covers planned yet" });
+    if (m.stage === "live" && allSkus(m).some((r) => !isFullyListed(r)))
+      ps.push({ model: m, type: "warn",
+        text: `Live but not listed everywhere — ${allSkus(m).filter((r) => !isFullyListed(r)).length} SKU(s) incomplete` });
+    if (allSkus(m).some((r) => blockedCount(r) > 0))
+      ps.push({ model: m, type: "bad", text: "Listing blocked on a marketplace" });
     if (m.stage === "ordered" && !m.po)
       ps.push({ model: m, type: "warn", text: "No PO number recorded" });
     if (m.stage === "production" && allSkus(m).some((r) => r.stpStatus === "Rejected"))
@@ -1516,6 +1667,11 @@ function Dashboard({ models, onOpen, onAdd }) {
           sub={received.length ? (unconfRec > 0 ? `${unconfRec} unconfirmed` : "All confirmed") : "None yet"} />
         <KPI label="Live & selling"   value={live.length}  tone={live.length > 0 ? "ok" : undefined}
           sub={live.length ? `${qty(liveUnits)} units in market` : "Nothing live yet"} />
+        <KPI label="Fully listed"      value={fullyListed}
+             tone={listable.length && fullyListed === listable.length ? "ok" : listBlocked ? "bad" : undefined}
+             sub={listable.length
+               ? `of ${listable.length} ready${listBlocked ? ` · ${listBlocked} blocked` : ""}`
+               : "None ready yet"} />
         <KPI label="Running late"     value={late.length}  tone={late.length > 0 ? "bad" : "ok"}
           sub={late.length > 0 ? `${late.map(m=>m.name).join(", ").slice(0,40)}` : "All on time"} />
         <KPI label="Launching ≤ 14d"  value={launching14.length}
@@ -1635,6 +1791,15 @@ function buildReportRows(reportKey, models) {
           r.type, r.sku || "", r.material || "", r.units, r.receivedQty ?? "—",
           isConfirmed(r) ? shortfallOf(r) : "—", receiptLabel(r)])),
     };
+    case "listing":
+      return {
+        headers: ["Brand", "Model", "Stage", "Cover Type", "SKU", ...MARKETPLACES, "Fully listed"],
+        rows: models.filter((m) => ["received", "live"].includes(m.stage)).flatMap((m) =>
+          allSkus(m).map((r) => [m.brand, m.name, STAGES[m.index].label, r.type, r.sku || "",
+            ...MARKETPLACES.map((mp) => r.listings?.[mp] || "Not listed"),
+            isFullyListed(r) ? "Yes" : "No"])),
+      };
+
     case "late": return {
       headers: ["Brand", "Model", "Segment", "Launch Date", "Stage", "Days Late", "Days to Launch"],
       rows: models.filter((m) => m.isLate).map((m) => [m.brand, m.name, m.segment, m.launch,
@@ -1651,6 +1816,7 @@ const REPORT_DEFS = [
   { key: "ordered",    label: "Ordered" },
   { key: "production", label: "Production / STP" },
   { key: "received",   label: "Received" },
+  { key: "listing",    label: "Listing" },
   { key: "late",       label: "Late Models" },
 ];
 
@@ -1791,6 +1957,19 @@ export default function App() {
     say("STP status saved");
   };
 
+  /* listingsByRid = { rid: { Flipkart: "Live", ... } } */
+  const saveListings = (id, listingsByRid) => {
+    setPhones((list) => list.map((p) => p.id !== id ? p : {
+      ...p,
+      covers: p.covers.map((c) => ({
+        ...c,
+        skus: c.skus.map((r) => listingsByRid[r.rid]
+          ? { ...r, listings: { ...r.listings, ...listingsByRid[r.rid] } } : r),
+      })),
+    }));
+    say("Listing status saved");
+  };
+
   /* PO number is typed by the buyer, never invented by the app */
   const savePO = (id, po) => {
     setPhones((list) => list.map((p) => p.id !== id ? p : { ...p, po: po.trim() }));
@@ -1873,7 +2052,7 @@ export default function App() {
         {view === "reports"   && <Reports models={models} />}
       </div>
 
-      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onResearchSave={saveResearch} onSKUSave={saveSKU} onSTPUpdate={updateSTP} onReceiptSave={saveReceipt} onPOSave={savePO} />}
+      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onResearchSave={saveResearch} onSKUSave={saveSKU} onSTPUpdate={updateSTP} onReceiptSave={saveReceipt} onPOSave={savePO} onListingSave={saveListings} />}
       {adding && <AddForm onClose={() => setAdding(false)} onSave={addPhone} />}
       {confirmReset && (
         <>
