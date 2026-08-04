@@ -115,12 +115,9 @@ const receiptLabel = (r) =>
   r.receiptState === "short" ? "Short" :
   r.receiptState === "none"  ? "Not received" : "Pending";
 
-const cover = (type, skus = []) => ({ type, skus: skus.length ? skus : [skuRow()] });
-
-/* Flatten every SKU across every cover type — used by tables, exports
-   and reports so they all read from one place.                       */
-const allSkus = (model) =>
-  (model.covers || []).flatMap((c) => c.skus.map((r) => ({ ...r, type: c.type })));
+/* Every phone holds one flat list of SKUs. Each SKU carries its own
+   material and unit count — that's the whole structure.              */
+const allSkus = (model) => model.skus || [];
 
 /* No demo data — start empty so you can enter your real phones */
 const EMPTY = [];
@@ -307,6 +304,15 @@ const CSS = `
   background: var(--card); color: var(--text); font: inherit; font-size: 13px; outline: none;
 }
 .app input:focus, .app select:focus { border-color: var(--accent); }
+/* Native option popups don't inherit from the select, so in dark mode they
+   render dark-on-dark and look empty. These two lines make them readable. */
+.app option { background: var(--card); color: var(--text); }
+.app select { -webkit-appearance: none; appearance: none; cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--dim) 50%),
+                    linear-gradient(135deg, var(--dim) 50%, transparent 50%);
+  background-position: calc(100% - 16px) calc(50% + 1px), calc(100% - 11px) calc(50% + 1px);
+  background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
+  padding-right: 30px; }
 .app .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .app textarea {
   width: 100%; padding: 9px 11px; border-radius: 9px; border: 1px solid var(--line);
@@ -500,234 +506,150 @@ function Table({ models, onOpen }) {
    "Silicone Cover" can hold ten SKUs in ten different colours.      */
 
 function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
-  /* draft = the covers array being edited. Saved on demand. */
   const [draft, setDraft] = useState(
-    () => model.covers.length
-      ? model.covers.map((c) => ({ type: c.type, skus: c.skus.map((r) => ({ ...r })) }))
-      : []
+    () => (model.skus || []).map((r) => ({ ...r }))
   );
-  const [bulkFor, setBulkFor] = useState(null);   // which cover type is pasting
   const [bulkText, setBulkText] = useState("");
-  const [bulkErr, setBulkErr] = useState("");
+  const [bulkErr,  setBulkErr]  = useState("");
   const [saved, setSaved] = useState(false);
 
-  const has = (type) => draft.some((c) => c.type === type);
-
-  const toggleType = (type) => setDraft((d) =>
-    has(type) ? d.filter((c) => c.type !== type)
-              : [...d, { type, skus: [skuRow()] }]
-  );
-
-  const addRow = (type) => setDraft((d) =>
-    d.map((c) => c.type === type ? { ...c, skus: [...c.skus, skuRow()] } : c)
-  );
-
-  const removeRow = (type, rid) => setDraft((d) =>
-    d.map((c) => c.type === type
-      ? { ...c, skus: c.skus.length > 1 ? c.skus.filter((r) => r.rid !== rid) : c.skus }
-      : c)
-  );
-
-  const editRow = (type, rid, patch) => setDraft((d) =>
-    d.map((c) => c.type === type
-      ? { ...c, skus: c.skus.map((r) => r.rid === rid ? { ...r, ...patch } : r) }
-      : c)
-  );
+  const addRow    = ()      => setDraft((d) => [...d, skuRow()]);
+  const removeRow = (rid)   => setDraft((d) => d.filter((r) => r.rid !== rid));
+  const editRow   = (rid, patch) =>
+    setDraft((d) => d.map((r) => (r.rid === rid ? { ...r, ...patch } : r)));
 
   /* Bulk paste: one line per SKU — "SKU, Material, Units" */
-  const applyBulk = (type, raw) => {
+  const applyBulk = (raw, mode) => {
     const lines = raw.trim().split(/\r?\n/).filter((l) => l.trim());
-    const parsed = [];
-    const bad = [];
+    const parsed = [], bad = [];
     lines.forEach((line, i) => {
-      /* skip a header row if the user pasted one straight from Excel */
-      if (i === 0 && /^\s*sku\s*[,\t]/i.test(line)) return;
+      if (i === 0 && /^\s*sku\s*[,\t]/i.test(line)) return;   // skip a header row
       const parts = line.split(/[,\t]/).map((x) => x.trim());
       const sku = parts[0];
       if (!sku) { bad.push(i + 1); return; }
       const material = parts[1] || "";
-      /* Join everything after the material before parsing digits — a pasted
-         "5,000" arrives split across two parts and must not become 5.     */
+      /* join everything after the material so a pasted "5,000" isn't read as 5 */
       const n = parseInt(parts.slice(2).join("").replace(/[^\d]/g, ""), 10);
-      /* No units given? Use the material's default rather than zero. */
-      const units = Number.isFinite(n) ? n : defaultQtyFor(material);
-      parsed.push(skuRow(sku, material, units));
+      parsed.push(skuRow(sku, material, Number.isFinite(n) ? n : defaultQtyFor(material)));
     });
-    if (!parsed.length) {
-      setBulkErr("No valid rows found. Each line needs at least a SKU.");
-      return;
-    }
-    /* replace this cover type's SKU list with the pasted one */
-    setDraft((d) => d.map((c) => c.type === type ? { ...c, skus: parsed } : c));
-    setBulkErr(bad.length ? `Added ${parsed.length}. Skipped ${bad.length} blank line(s).` : "");
+    if (!parsed.length) { setBulkErr("No valid rows found. Each line needs at least a SKU."); return; }
+    setDraft((d) => mode === "append"
+      ? [...d.filter((r) => r.sku.trim() || r.material.trim() || r.units > 0), ...parsed]
+      : parsed);
+    setBulkErr(bad.length ? `${parsed.length} added, ${bad.length} blank line(s) skipped.` : "");
     setBulkText("");
-    setBulkFor(null);
   };
 
   const save = () => {
-    /* drop completely blank rows, keep everything else exactly as typed */
-    const cleaned = draft.map((c) => ({
-      type: c.type,
-      skus: c.skus.filter((r) => r.sku.trim() || r.material.trim() || r.units > 0),
-    })).filter((c) => c.skus.length);
+    const cleaned = draft.filter((r) => r.sku.trim() || r.material.trim() || r.units > 0);
     onSave(model.id, cleaned);
     setSaved(true); setTimeout(() => setSaved(false), 2000);
   };
 
-  const rows        = draft.flatMap((c) => c.skus);
-  const missingSku  = rows.filter((r) => !r.sku.trim()).length;
-  const totalUnits  = rows.reduce((s, r) => s + (r.units || 0), 0);
+  const missingSku = draft.filter((r) => !r.sku.trim()).length;
+  const totalUnits = draft.reduce((s, r) => s + (r.units || 0), 0);
 
   return (
     <div>
       <h2 style={{ color: "var(--warn)" }}>
-        {stage === "planned" ? "▸ Planned — cover types & SKUs" : "▸ Covers & SKUs (editable)"}
+        {stage === "planned" ? "▸ Planned — SKUs to make" : "▸ SKUs (editable)"}
       </h2>
       <div className="card">
-        <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
-          Pick the cover types you want, then add one row per SKU underneath.
-          Each SKU has its own material and units — so one cover type can hold many colours.
+        <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 14, lineHeight: 1.5 }}>
+          Add SKUs one at a time, or paste a whole list below. Each SKU has its own
+          material and unit count.
           {stage === "planned"
             ? <strong> Every SKU needs a code before you can move to Ordered.</strong>
-            : <strong> Adding a SKU here changes what you ordered — re-send the PO and STP file.</strong>}
+            : <strong> Changing SKUs here changes what you ordered — re-send the PO and STP file.</strong>}
         </div>
 
-        {/* cover type selector */}
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 18 }}>
-          {COVER_TYPES.map((type) => (
-            <button key={type} className="btn" data-on={has(type) ? "1" : "0"}
-              onClick={() => toggleType(type)}>
-              {has(type) ? <CheckCircle2 size={12} /> : <Circle size={12} />}{type}
-            </button>
-          ))}
-        </div>
-
-        {/* one block per selected cover type */}
-        {draft.map((c) => {
-          const typeUnits = c.skus.reduce((s, r) => s + (r.units || 0), 0);
-          return (
-            <div key={c.type} style={{ marginBottom: 18, paddingBottom: 16, borderBottom: "1px solid var(--line)" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
-                <span style={{ fontWeight: 600, fontSize: 14 }}>{c.type}</span>
-                <Tag>{c.skus.length} SKU{c.skus.length !== 1 ? "s" : ""}</Tag>
-                <Tag tone={typeUnits > 0 ? "ok" : undefined}>{qty(typeUnits)} units</Tag>
-                <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-                  <button className="btn" style={{ fontSize: 11, padding: "4px 9px" }}
-                    onClick={() => { setBulkFor(bulkFor === c.type ? null : c.type); setBulkText(""); setBulkErr(""); }}>
-                    {bulkFor === c.type ? "▲ Close paste" : "▼ Bulk paste"}
-                  </button>
-                  <button className="btn" style={{ fontSize: 11, padding: "4px 9px" }}
-                    onClick={() => addRow(c.type)}>
-                    <Plus size={11} />Add SKU
-                  </button>
-                </span>
-              </div>
-
-              {/* bulk paste box for this cover type */}
-              {bulkFor === c.type && (
-                <div style={{ marginBottom: 12, padding: 12, borderRadius: 9, border: "1px solid var(--accent)" }}>
-                  <div style={{ fontSize: 11, color: "var(--dim)", marginBottom: 6, lineHeight: 1.5 }}>
-                    One line per SKU. Columns: <code>SKU, Material, Units</code><br />
-                    Leave units blank and the material default is used ({MATERIALS.map((m) => `${m.name} ${m.defaultQty}`).join(" · ")}).<br />
-                    Paste straight from Excel — tabs work too, and a header row is skipped automatically.
-                  </div>
-                  <textarea rows={5} value={bulkText}
-                    style={{ fontFamily: "var(--mono)", fontSize: 12, resize: "vertical" }}
-                    placeholder={"SIL-A57-BLK, Silicone Cover, 30\nSIL-A57-BLU, Silicone Cover\nTPU-A57-CLR, TPU+PC, 50"}
-                    onChange={(e) => setBulkText(e.target.value)} />
-                  {bulkErr && <div style={{ color: "var(--warn)", fontSize: 11, marginTop: 5 }}>{bulkErr}</div>}
-                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                    <button className="btn" data-primary="1" style={{ fontSize: 12 }}
-                      onClick={() => applyBulk(c.type, bulkText)}>
-                      Replace {c.type} SKUs
-                    </button>
-                    <button className="btn" style={{ fontSize: 12 }}
-                      onClick={() => { setBulkFor(null); setBulkText(""); setBulkErr(""); }}>Cancel</button>
-                  </div>
-                </div>
-              )}
-
-              {/* SKU rows */}
-              <div style={{ overflowX: "auto" }}>
-                <table>
-                  <thead>
-                    <tr>
-                      <th style={{ minWidth: 170 }}>SKU *</th>
-                      <th style={{ minWidth: 150 }}>Material</th>
-                      <th style={{ minWidth: 90 }}>Units</th>
-                      <th style={{ width: 34 }}></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {c.skus.map((r) => (
-                      <tr key={r.rid} style={{ cursor: "default" }}>
-                        <td style={{ padding: "6px 8px" }}>
-                          <input value={r.sku} placeholder="SIL-SAM-A57-BLK"
-                            style={{ fontFamily: "var(--mono)", fontSize: 12,
-                              borderColor: !r.sku.trim() ? "var(--bad)" : undefined }}
-                            onChange={(e) => editRow(c.type, r.rid, { sku: e.target.value })} />
-                        </td>
-                        <td style={{ padding: "6px 8px" }}>
-                          <select value={r.material} style={{ fontSize: 12 }}
-                            onChange={(e) => {
-                              const name = e.target.value;
-                              /* only fill units if the buyer hasn't typed their own */
-                              const untouched = !r.units || r.units === defaultQtyFor(r.material);
-                              editRow(c.type, r.rid, untouched
-                                ? { material: name, units: defaultQtyFor(name) }
-                                : { material: name });
-                            }}>
-                            <option value="">— select —</option>
-                            {MATERIALS.map((m) => <option key={m.name} value={m.name}>{m.name} · {m.defaultQty}</option>)}
-                          </select>
-                        </td>
-                        <td style={{ padding: "6px 8px" }}>
-                          <input type="number" min="0" value={r.units || ""}
-                            placeholder={r.material ? String(defaultQtyFor(r.material)) : "qty"}
-                            title={r.material ? `Default for ${r.material} is ${defaultQtyFor(r.material)}` : undefined}
-                            style={{ fontFamily: "var(--mono)", fontSize: 12 }}
-                            onChange={(e) => editRow(c.type, r.rid, { units: +e.target.value })} />
-                        </td>
-                        <td style={{ padding: "6px 4px", textAlign: "center" }}>
-                          {c.skus.length > 1 && (
-                            <button className="btn" title="Remove this SKU"
-                              style={{ padding: "4px 6px", color: "var(--bad)", borderColor: "transparent" }}
-                              onClick={() => removeRow(c.type, r.rid)}>
-                              <X size={12} />
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          );
-        })}
-
-        {draft.length === 0 && (
-          <div style={{ fontSize: 13, color: "var(--dim)", padding: "14px 0" }}>
-            Select at least one cover type above to start adding SKUs.
-          </div>
-        )}
-
-        {/* summary + save */}
+        {/* the SKU table */}
         {draft.length > 0 && (
-          <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-            <button className="btn" data-primary="1" onClick={save}>
-              {saved ? "✓ Saved" : "Save covers & SKUs"}
-            </button>
-            <span style={{ fontSize: 12, color: "var(--dim)" }}>
-              {draft.length} cover type{draft.length !== 1 ? "s" : ""} ·
-              {" "}{rows.length} SKU{rows.length !== 1 ? "s" : ""} ·
-              {" "}{qty(totalUnits)} units
-            </span>
-            {missingSku > 0 && (
-              <Tag tone="bad">{missingSku} SKU{missingSku !== 1 ? "s" : ""} still blank</Tag>
-            )}
+          <div style={{ overflowX: "auto", marginBottom: 12 }}>
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ minWidth: 190 }}>SKU *</th>
+                  <th style={{ minWidth: 170 }}>Material</th>
+                  <th style={{ minWidth: 100 }}>Units</th>
+                  <th style={{ width: 34 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {draft.map((r) => (
+                  <tr key={r.rid} style={{ cursor: "default" }}>
+                    <td style={{ padding: "6px 8px" }}>
+                      <input value={r.sku} placeholder="SIL-A57-BLK"
+                        style={{ fontFamily: "var(--mono)", fontSize: 12,
+                          borderColor: !r.sku.trim() ? "var(--bad)" : undefined }}
+                        onChange={(e) => editRow(r.rid, { sku: e.target.value })} />
+                    </td>
+                    <td style={{ padding: "6px 8px" }}>
+                      <select value={r.material} style={{ fontSize: 12 }}
+                        onChange={(e) => {
+                          const name = e.target.value;
+                          /* fill units only if the buyer hasn't typed their own figure */
+                          const untouched = !r.units || r.units === defaultQtyFor(r.material);
+                          editRow(r.rid, untouched
+                            ? { material: name, units: defaultQtyFor(name) }
+                            : { material: name });
+                        }}>
+                        <option value="">— select —</option>
+                        {MATERIALS.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+                      </select>
+                    </td>
+                    <td style={{ padding: "6px 8px" }}>
+                      <input type="number" min="0" value={r.units || ""}
+                        placeholder={r.material ? String(defaultQtyFor(r.material)) : "qty"}
+                        style={{ fontFamily: "var(--mono)", fontSize: 12 }}
+                        onChange={(e) => editRow(r.rid, { units: +e.target.value })} />
+                    </td>
+                    <td style={{ padding: "6px 4px", textAlign: "center" }}>
+                      <button className="btn" title="Remove this SKU"
+                        style={{ padding: "4px 6px", color: "var(--bad)", borderColor: "transparent" }}
+                        onClick={() => removeRow(r.rid)}>
+                        <X size={12} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
+
+        <button className="btn" style={{ fontSize: 11, padding: "5px 10px", marginBottom: 16 }}
+          onClick={addRow}><Plus size={11} />Add SKU</button>
+
+        {/* bulk paste — always here, nothing to toggle */}
+        <div style={{ borderTop: "1px solid var(--line)", paddingTop: 14 }}>
+          <div style={{ fontSize: 11, color: "var(--dim)", marginBottom: 6, lineHeight: 1.5 }}>
+            Or paste a list — one line per SKU: <code>SKU, Material, Units</code><br />
+            Leave units off to use the material default. Tabs from Excel work, header row is skipped.
+          </div>
+          <textarea rows={4} value={bulkText}
+            style={{ fontFamily: "var(--mono)", fontSize: 12, resize: "vertical" }}
+            placeholder={"SIL-A57-BLK, Silicone Cover, 30\nSIL-A57-BLU, Silicone Cover\nTPU-A57-CLR, TPU+PC"}
+            onChange={(e) => setBulkText(e.target.value)} />
+          {bulkErr && <div style={{ color: "var(--warn)", fontSize: 11, marginTop: 5 }}>{bulkErr}</div>}
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button className="btn" style={{ fontSize: 11, padding: "4px 9px", opacity: bulkText.trim() ? 1 : 0.4 }}
+              onClick={() => bulkText.trim() && applyBulk(bulkText, "append")}>Add these to the list</button>
+            <button className="btn" style={{ fontSize: 11, padding: "4px 9px", opacity: bulkText.trim() ? 1 : 0.4 }}
+              onClick={() => bulkText.trim() && applyBulk(bulkText, "replace")}>Replace the list</button>
+          </div>
+        </div>
+
+        {/* save */}
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginTop: 16 }}>
+          <button className="btn" data-primary="1" onClick={save}>
+            {saved ? "✓ Saved" : "Save SKUs"}
+          </button>
+          <span style={{ fontSize: 12, color: "var(--dim)" }}>
+            {draft.length} SKU{draft.length !== 1 ? "s" : ""} · {qty(totalUnits)} units
+          </span>
+          {missingSku > 0 && <Tag tone="bad">{missingSku} still blank</Tag>}
+        </div>
       </div>
     </div>
   );
@@ -773,8 +695,8 @@ function POField({ model, onSave }) {
 
 function SKUExport({ model, onPOSave }) {
   const exportFile = (fmt) => {
-    const headers = ["Cover Type", "Material", "SKU", "Units Planned"];
-    const rows = allSkus(model).map((r) => [r.type, r.material || "", r.sku || "", r.units]);
+    const headers = ["SKU", "Material", "Units Planned"];
+    const rows = allSkus(model).map((r) => [r.sku || "", r.material || "", r.units]);
     const isCSV = fmt === "csv";
     const sep = isCSV ? "," : "	";
     const mime = isCSV ? "text/csv" : "application/vnd.ms-excel";
@@ -799,13 +721,12 @@ function SKUExport({ model, onPOSave }) {
         )}
         <div style={{ overflowX: "auto", marginBottom: 12 }}>
           <table>
-            <thead><tr><th>Cover Type</th><th>Material</th><th>SKU</th><th>Units</th></tr></thead>
+            <thead><tr><th>SKU</th><th>Material</th><th>Units</th></tr></thead>
             <tbody>
               {allSkus(model).map((r) => (
                 <tr key={r.rid} style={{ cursor: "default" }}>
-                  <td style={{ fontWeight: 550 }}>{r.type}</td>
+                  <td className="n" style={{ fontWeight: 550, fontSize: 12 }}>{r.sku || <span style={{ color: "var(--warn)" }}>missing</span>}</td>
                   <td style={{ color: "var(--dim)", fontSize: 12 }}>{r.material || "—"}</td>
-                  <td className="n" style={{ fontSize: 12 }}>{r.sku || <span style={{ color: "var(--warn)" }}>missing</span>}</td>
                   <td className="n">{qty(r.units)}</td>
                 </tr>
               ))}
@@ -837,8 +758,8 @@ function ProductionSTP({ model, onSTPUpdate }) {
   const save   = () => { onSTPUpdate(model.id, draft); setSaved(true); setTimeout(() => setSaved(false), 2000); };
 
   const exportSTP = (fmt) => {
-    const headers = ["Brand", "Model", "PO", "Cover Type", "SKU", "Material", "Units", "STP Status"];
-    const body = rows.map((r) => [model.brand, model.name, model.po || "", r.type,
+    const headers = ["Brand", "Model", "PO", "SKU", "Material", "Units", "STP Status"];
+    const body = rows.map((r) => [model.brand, model.name, model.po || "",
       r.sku || "", r.material || "", r.units, draft[r.rid] || "Not Sent"]);
     downloadReport(`STP_${model.brand}_${model.name}`, headers, body, fmt);
   };
@@ -871,12 +792,11 @@ function ProductionSTP({ model, onSTPUpdate }) {
 
         <div style={{ overflowX: "auto", marginBottom: 12 }}>
           <table>
-            <thead><tr><th>Cover type</th><th>SKU</th><th>Material</th><th>Units</th><th style={{ minWidth: 150 }}>STP status</th></tr></thead>
+            <thead><tr><th>SKU</th><th>Material</th><th>Units</th><th style={{ minWidth: 150 }}>STP status</th></tr></thead>
             <tbody>
               {rows.map((r) => (
                 <tr key={r.rid} style={{ cursor: "default" }}>
-                  <td style={{ fontWeight: 550 }}>{r.type}</td>
-                  <td className="n" style={{ fontSize: 12 }}>{r.sku || <span style={{ color: "var(--warn)" }}>missing</span>}</td>
+                  <td className="n" style={{ fontWeight: 550, fontSize: 12 }}>{r.sku || <span style={{ color: "var(--warn)" }}>missing</span>}</td>
                   <td style={{ color: "var(--dim)", fontSize: 12 }}>{r.material || <span style={{ color: "var(--bad)" }}>missing</span>}</td>
                   <td className="n">{qty(r.units)}</td>
                   <td style={{ padding: "6px 8px" }}>
@@ -914,7 +834,7 @@ function ProductionSTP({ model, onSTPUpdate }) {
 function ReceivedChecker({ model, onSave }) {
   const [rows, setRows] = useState(() =>
     allSkus(model).map((r) => ({
-      rid: r.rid, type: r.type, sku: r.sku, material: r.material,
+      rid: r.rid, sku: r.sku, material: r.material,
       planned: r.units,
       received: r.receivedQty ?? null,
       state: r.receiptState ?? null,
@@ -962,7 +882,7 @@ function ReceivedChecker({ model, onSave }) {
         <div style={{ overflowX: "auto", marginBottom: 12 }}>
           <table>
             <thead><tr>
-              <th>Cover type</th><th>SKU</th><th>Planned</th>
+              <th>SKU</th><th>Material</th><th>Planned</th>
               <th style={{ minWidth: 110 }}>Received</th><th>Short by</th><th>Status</th><th></th>
             </tr></thead>
             <tbody>
@@ -970,8 +890,8 @@ function ReceivedChecker({ model, onSave }) {
                 const gapRow = r.state == null ? null : Math.max(0, r.planned - (r.received || 0));
                 return (
                   <tr key={r.rid} style={{ cursor: "default" }}>
-                    <td style={{ fontWeight: 550 }}>{r.type}</td>
-                    <td className="n" style={{ fontSize: 12 }}>{r.sku || "—"}</td>
+                    <td className="n" style={{ fontWeight: 550, fontSize: 12 }}>{r.sku || "—"}</td>
+                    <td style={{ color: "var(--dim)", fontSize: 12 }}>{r.material || "—"}</td>
                     <td className="n">{qty(r.planned)}</td>
                     <td style={{ padding: "6px 8px" }}>
                       <input type="number" min="0" value={r.received ?? ""} placeholder="qty"
@@ -1053,9 +973,9 @@ function ListingEditor({ model, onSave }) {
   const anyBlocked = rows.filter((r) => MARKETPLACES.some((mp) => draft[r.rid]?.[mp] === "Blocked")).length;
 
   const exportListing = (fmt) => {
-    const headers = ["Brand", "Model", "Cover Type", "SKU", ...MARKETPLACES, "Fully listed"];
+    const headers = ["Brand", "Model", "SKU", "Material", ...MARKETPLACES, "Fully listed"];
     const body = rows.map((r) => [
-      model.brand, model.name, r.type, r.sku || "",
+      model.brand, model.name, r.sku || "", r.material || "",
       ...MARKETPLACES.map((mp) => draft[r.rid]?.[mp] || "Not listed"),
       MARKETPLACES.every((mp) => draft[r.rid]?.[mp] === "Live") ? "Yes" : "No",
     ]);
@@ -1080,8 +1000,8 @@ function ListingEditor({ model, onSave }) {
           <table>
             <thead>
               <tr>
-                <th style={{ minWidth: 130 }}>Cover type</th>
-                <th style={{ minWidth: 140 }}>SKU</th>
+                <th style={{ minWidth: 150 }}>SKU</th>
+                <th style={{ minWidth: 130 }}>Material</th>
                 {MARKETPLACES.map((mp) => (
                   <th key={mp} style={{ textAlign: "center", minWidth: 96 }}>
                     <div>{mp}</div>
@@ -1095,14 +1015,14 @@ function ListingEditor({ model, onSave }) {
             <tbody>
               {rows.map((r) => (
                 <tr key={r.rid} style={{ cursor: "default" }}>
-                  <td style={{ fontWeight: 550 }}>{r.type}</td>
-                  <td className="n" style={{ fontSize: 12 }}>{r.sku || "—"}</td>
+                  <td className="n" style={{ fontWeight: 550, fontSize: 12 }}>{r.sku || "—"}</td>
+                  <td style={{ color: "var(--dim)", fontSize: 12 }}>{r.material || "—"}</td>
                   {MARKETPLACES.map((mp) => {
                     const st = draft[r.rid]?.[mp] || "Not listed";
                     return (
                       <td key={mp} style={{ textAlign: "center", padding: "6px 4px" }}>
                         <button className="btn"
-                          title={`${r.sku || r.type} on ${mp} — click to change`}
+                          title={`${r.sku || "SKU"} on ${mp} — click to change`}
                           style={{ fontSize: 10, padding: "3px 7px", width: "100%",
                             color: st === "Live" ? "var(--ok)" : st === "Blocked" ? "var(--bad)"
                                  : st === "In progress" ? "var(--warn)" : "var(--dim)",
@@ -1222,33 +1142,27 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
         <div className="panel-body">
           {/* covers */}
           <div>
-            <h2>Covers planned — {model.covers.length} type{model.covers.length !== 1 ? "s" : ""}, {allSkus(model).length} SKU{allSkus(model).length !== 1 ? "s" : ""}, {qty(model.units)} units</h2>
-            {model.covers.length ? (
+            <h2>SKUs planned — {allSkus(model).length} SKU{allSkus(model).length !== 1 ? "s" : ""}, {qty(model.units)} units</h2>
+            {allSkus(model).length ? (
               <div className="card" style={{ padding: 0, overflowX: "auto" }}>
                 <table>
-                  <thead><tr><th>Cover type</th><th>SKU</th><th>Material</th><th>Units</th></tr></thead>
+                  <thead><tr><th>SKU</th><th>Material</th><th>Units</th></tr></thead>
                   <tbody>
-                    {model.covers.flatMap((c) =>
-                      c.skus.map((r, i) => (
-                        <tr key={r.rid} style={{ cursor: "default" }}>
-                          {/* only label the first row of each group, so the eye groups them */}
-                          <td style={{ fontWeight: i === 0 ? 550 : 400, color: i === 0 ? undefined : "var(--dim)" }}>
-                            {i === 0 ? c.type : ""}
-                          </td>
-                          <td className="n" style={{ fontSize: 12 }}>
-                            {r.sku || <span style={{ color: "var(--warn)" }}>no SKU</span>}
-                          </td>
-                          <td style={{ color: "var(--dim)", fontSize: 12 }}>
-                            {r.material || <span style={{ color: "var(--bad)" }}>—</span>}
-                          </td>
-                          <td className="n">{qty(r.units)}</td>
-                        </tr>
-                      ))
-                    )}
+                    {allSkus(model).map((r) => (
+                      <tr key={r.rid} style={{ cursor: "default" }}>
+                        <td className="n" style={{ fontWeight: 550, fontSize: 12 }}>
+                          {r.sku || <span style={{ color: "var(--warn)" }}>no SKU</span>}
+                        </td>
+                        <td style={{ color: "var(--dim)", fontSize: 12 }}>
+                          {r.material || <span style={{ color: "var(--bad)" }}>—</span>}
+                        </td>
+                        <td className="n">{qty(r.units)}</td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
-            ) : <div style={{ color: "var(--dim)", fontSize: 13 }}>No covers planned yet.</div>}
+            ) : <div style={{ color: "var(--dim)", fontSize: 13 }}>No SKUs planned yet.</div>}
           </div>
 
           {/* Research stage: edit phone details */}
@@ -1346,10 +1260,10 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
                     onClick={() => !blocked && onAdvance(model.id)}>
                     Move to {next.label} →
                   </button>
-                  {noCovers && <span style={{ fontSize: 11, color: "var(--bad)" }}>Add covers in Planned stage first</span>}
+                  {noCovers && <span style={{ fontSize: 11, color: "var(--bad)" }}>Add SKUs in the Planned stage first</span>}
                   {!noCovers && missingSkus.length > 0 && (
                     <span style={{ fontSize: 11, color: "var(--bad)" }}>
-                      {missingSkus.length} SKU{missingSkus.length > 1 ? "s" : ""} still blank in: {[...new Set(missingSkus.map(r => r.type))].join(", ")}
+                      {missingSkus.length} SKU{missingSkus.length > 1 ? "s" : ""} still missing a code
                     </span>
                   )}
                 </div>
@@ -1390,8 +1304,6 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
 
 /* ── 11. ADD FORM ─────────────────────────────────────────────── */
 
-const COVER_TYPES = ["TPU Cover", "Transparent Cover", "Silicone Cover", "Magsafe Cover",
-                     "Leather Cover", "Rugged Cover", "Kickstand Cover"];
 const NEW_MODEL = {
   brand: "", name: "", segment: "Mid Range", launch: "",
   covers: [],
@@ -1432,7 +1344,7 @@ function AddForm({ onClose, onSave }) {
       name: form.name.trim(),
       segment: form.segment,
       launch: form.launch,
-      covers: [],   // covers are added in Planned stage
+      skus: [],   // SKUs are added in the Planned stage
       stage: "research",
       po: null,
       done: { research: iso(TODAY) },
@@ -1530,11 +1442,11 @@ function downloadReport(filename, headers, rows, fmt) {
 
 /* Planned report — every phone at Planned stage with cover details */
 function plannedReport(models, fmt) {
-  const headers = ["Brand", "Model", "Segment", "Launch Date", "Cover Type", "Material", "SKU", "Units Planned"];
+  const headers = ["Brand", "Model", "Segment", "Launch Date", "SKU", "Material", "Units Planned"];
   const rows = [];
   models.filter((m) => m.stage === "planned").forEach((m) =>
     allSkus(m).forEach((r) =>
-      rows.push([m.brand, m.name, m.segment, m.launch, r.type, r.material || "", r.sku || "", r.units])
+      rows.push([m.brand, m.name, m.segment, m.launch, r.sku || "", r.material || "", r.units])
     )
   );
   downloadReport("Planned_Models_Report", headers, rows, fmt);
@@ -1542,11 +1454,11 @@ function plannedReport(models, fmt) {
 
 /* Ordered report — every phone at Ordered with full SKU list */
 function orderedReport(models, fmt) {
-  const headers = ["Brand", "Model", "Segment", "Launch Date", "PO Number", "Cover Type", "Material", "SKU", "Units"];
+  const headers = ["Brand", "Model", "Segment", "Launch Date", "PO Number", "SKU", "Material", "Units"];
   const rows = [];
   models.filter((m) => m.stage === "ordered").forEach((m) =>
     allSkus(m).forEach((r) =>
-      rows.push([m.brand, m.name, m.segment, m.launch, m.po || "", r.type, r.material || "", r.sku || "", r.units])
+      rows.push([m.brand, m.name, m.segment, m.launch, m.po || "", r.sku || "", r.material || "", r.units])
     )
   );
   downloadReport("Ordered_Models_Report", headers, rows, fmt);
@@ -1565,7 +1477,7 @@ function productionReport(models, fmt) {
       const stpRequired = (!r.material || !r.sku) ? "YES — missing data" : "YES";
       rows.push([
         m.brand, m.name, m.segment, m.launch, m.po || "",
-        r.type, r.material || "MISSING", r.sku || "MISSING", r.units,
+        r.sku || "MISSING", r.material || "MISSING", r.units,
         stpRequired, r.stpStatus || "Not Sent"
       ]);
     })
@@ -1782,43 +1694,43 @@ function Dashboard({ models, onOpen, onAdd }) {
 function buildReportRows(reportKey, models) {
   switch (reportKey) {
     case "all": return {
-      headers: ["Brand", "Model", "Segment", "Launch Date", "Stage", "PO Number", "Cover Types", "SKUs", "Total Units", "Late?", "Days to Launch"],
+      headers: ["Brand", "Model", "Segment", "Launch Date", "Stage", "PO Number", "SKUs", "Total Units", "Late?", "Days to Launch"],
       rows: models.map((m) => [m.brand, m.name, m.segment, m.launch, STAGES[m.index].label,
-        m.po || "", m.covers.length, allSkus(m).length, m.units, m.isLate ? `Yes (+${m.worstDelay}d)` : "No",
+        m.po || "", allSkus(m).length, m.units, m.isLate ? `Yes (+${m.worstDelay}d)` : "No",
         m.daysToLaunch < 0 ? `${-m.daysToLaunch}d ago` : `in ${m.daysToLaunch}d`]),
     };
     case "planned": return {
-      headers: ["Brand", "Model", "Segment", "Launch Date", "Cover Type", "Material", "SKU", "Units Planned", "SKU Status"],
+      headers: ["Brand", "Model", "Segment", "Launch Date", "SKU", "Material", "Units Planned", "SKU Status"],
       rows: models.filter((m) => m.stage === "planned").flatMap((m) =>
         allSkus(m).length ? allSkus(m).map((r) => [m.brand, m.name, m.segment, m.launch,
-          r.type, r.material || "", r.sku || "", r.units, r.sku ? "✓ OK" : "⚠ Missing"])
+          r.sku || "", r.material || "", r.units, r.sku ? "✓ OK" : "⚠ Missing"])
         : [[m.brand, m.name, m.segment, m.launch, "—", "—", "—", "—", "No covers yet"]]),
     };
     case "ordered": return {
-      headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "Cover Type", "Material", "SKU", "Units"],
+      headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "SKU", "Material", "Units"],
       rows: models.filter((m) => m.stage === "ordered").flatMap((m) =>
         allSkus(m).map((r) => [m.brand, m.name, m.segment, m.launch, m.po || "",
-          r.type, r.material || "", r.sku || "", r.units])),
+          r.sku || "", r.material || "", r.units])),
     };
     case "production": return {
-      headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "Cover Type", "Material", "SKU", "Units", "STP Required", "STP Status"],
+      headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "SKU", "Material", "Units", "STP Required", "STP Status"],
       rows: models.filter((m) => m.stage === "production").flatMap((m) =>
         allSkus(m).map((r) => [m.brand, m.name, m.segment, m.launch, m.po || "",
-          r.type, r.material || "MISSING", r.sku || "MISSING", r.units,
+          r.sku || "MISSING", r.material || "MISSING", r.units,
           (!r.material || !r.sku) ? "YES — fix data" : "YES", r.stpStatus || "Not Sent"])),
     };
     case "received": return {
-      headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "Cover Type", "SKU", "Material", "Planned Qty", "Received Qty", "Short By", "Status"],
+      headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "SKU", "Material", "Planned Qty", "Received Qty", "Short By", "Status"],
       rows: models.filter((m) => m.stage === "received").flatMap((m) =>
         allSkus(m).map((r) => [m.brand, m.name, m.segment, m.launch, m.po || "",
-          r.type, r.sku || "", r.material || "", r.units, r.receivedQty ?? "—",
+          r.sku || "", r.material || "", r.units, r.receivedQty ?? "—",
           isConfirmed(r) ? shortfallOf(r) : "—", receiptLabel(r)])),
     };
     case "listing":
       return {
-        headers: ["Brand", "Model", "Stage", "Cover Type", "SKU", ...MARKETPLACES, "Fully listed"],
+        headers: ["Brand", "Model", "Stage", "SKU", "Material", ...MARKETPLACES, "Fully listed"],
         rows: models.filter((m) => ["received", "live"].includes(m.stage)).flatMap((m) =>
-          allSkus(m).map((r) => [m.brand, m.name, STAGES[m.index].label, r.type, r.sku || "",
+          allSkus(m).map((r) => [m.brand, m.name, STAGES[m.index].label, r.sku || "", r.material || "",
             ...MARKETPLACES.map((mp) => r.listings?.[mp] || "Not listed"),
             isFullyListed(r) ? "Yes" : "No"])),
       };
@@ -1962,9 +1874,9 @@ export default function App() {
   };
 
   /* save covers array from PlannedSKUEditor */
-  const saveSKU = (id, covers) => {
-    setPhones((list) => list.map((p) => p.id !== id ? p : { ...p, covers }));
-    say("Covers saved");
+  const saveSKU = (id, skus) => {
+    setPhones((list) => list.map((p) => p.id !== id ? p : { ...p, skus }));
+    say("SKUs saved");
   };
 
   /* update STP file status from ProductionSTP */
@@ -1972,10 +1884,7 @@ export default function App() {
   const updateSTP = (id, statusByRid) => {
     setPhones((list) => list.map((p) => p.id !== id ? p : {
       ...p,
-      covers: p.covers.map((c) => ({
-        ...c,
-        skus: c.skus.map((r) => statusByRid[r.rid] ? { ...r, stpStatus: statusByRid[r.rid] } : r),
-      })),
+      skus: p.skus.map((r) => statusByRid[r.rid] ? { ...r, stpStatus: statusByRid[r.rid] } : r),
     }));
     say("STP status saved");
   };
@@ -1984,11 +1893,8 @@ export default function App() {
   const saveListings = (id, listingsByRid) => {
     setPhones((list) => list.map((p) => p.id !== id ? p : {
       ...p,
-      covers: p.covers.map((c) => ({
-        ...c,
-        skus: c.skus.map((r) => listingsByRid[r.rid]
-          ? { ...r, listings: { ...r.listings, ...listingsByRid[r.rid] } } : r),
-      })),
+      skus: p.skus.map((r) => listingsByRid[r.rid]
+        ? { ...r, listings: { ...r.listings, ...listingsByRid[r.rid] } } : r),
     }));
     say("Listing status saved");
   };
@@ -2003,14 +1909,10 @@ export default function App() {
   const saveReceipt = (id, receiptRows) => {
     setPhones((list) => list.map((p) => {
       if (p.id !== id) return p;
-      const updated = p.covers.map((c) => ({
-        ...c,
-        skus: c.skus.map((row) => {
-          const r = receiptRows.find((rr) => rr.rid === row.rid);
-          return r ? { ...row, receivedQty: r.received, receiptState: r.state } : row;
-        }),
-      }));
-      return { ...p, covers: updated };
+      return { ...p, skus: p.skus.map((row) => {
+        const r = receiptRows.find((rr) => rr.rid === row.rid);
+        return r ? { ...row, receivedQty: r.received, receiptState: r.state } : row;
+      }) };
     }));
     say("Receipt saved");
   };
