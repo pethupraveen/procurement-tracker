@@ -70,9 +70,21 @@ let _skuSeq = 0;
 const skuRow = (sku = "", material = "", units = 0) => ({
   rid: ++_skuSeq,            // stable React key, never shown to the user
   sku, material, units,
-  receivedQty: null,
-  receivedOk: null,
+  stpStatus: "Not Sent",     // STP file is tracked per SKU, not per phone
+  receivedQty: null,         // how many actually arrived
+  receiptState: null,        // null = unconfirmed | "full" | "short" | "none"
 });
+
+const STP_STATUSES  = ["Not Sent", "Submitted", "Acknowledged", "In Progress", "Completed", "Rejected"];
+const stpTone = (st) => st === "Completed" ? "ok" : st === "Rejected" ? "bad" : st === "Not Sent" ? undefined : "warn";
+
+/* A SKU is settled once someone has said what happened to it. */
+const isConfirmed = (r) => r.receiptState != null;
+const shortfallOf = (r) => Math.max(0, (r.units || 0) - (r.receivedQty || 0));
+const receiptLabel = (r) =>
+  r.receiptState === "full"  ? "Received in full" :
+  r.receiptState === "short" ? "Short" :
+  r.receiptState === "none"  ? "Not received" : "Pending";
 
 const cover = (type, skus = []) => ({ type, skus: skus.length ? skus : [skuRow()] });
 
@@ -458,7 +470,7 @@ function Table({ models, onOpen }) {
    Every SKU has its own material and unit count, so a single
    "Silicone Cover" can hold ten SKUs in ten different colours.      */
 
-function PlannedSKUEditor({ model, onSave }) {
+function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
   /* draft = the covers array being edited. Saved on demand. */
   const [draft, setDraft] = useState(
     () => model.covers.length
@@ -537,12 +549,16 @@ function PlannedSKUEditor({ model, onSave }) {
 
   return (
     <div>
-      <h2 style={{ color: "var(--warn)" }}>▸ Planned — cover types &amp; SKUs</h2>
+      <h2 style={{ color: "var(--warn)" }}>
+        {stage === "planned" ? "▸ Planned — cover types & SKUs" : "▸ Covers & SKUs (editable)"}
+      </h2>
       <div className="card">
         <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
           Pick the cover types you want, then add one row per SKU underneath.
           Each SKU has its own material and units — so one cover type can hold many colours.
-          <strong> Every SKU needs a code before you can move to Ordered.</strong>
+          {stage === "planned"
+            ? <strong> Every SKU needs a code before you can move to Ordered.</strong>
+            : <strong> Adding a SKU here changes what you ordered — re-send the PO and STP file.</strong>}
         </div>
 
         {/* cover type selector */}
@@ -677,10 +693,44 @@ function PlannedSKUEditor({ model, onSave }) {
 }
 
 
+/* ── PO NUMBER — typed by the buyer, never invented ──────────────── */
+
+function POField({ model, onSave }) {
+  const [po, setPo] = useState(model.po || "");
+  const [saved, setSaved] = useState(false);
+  const dirty = po.trim() !== (model.po || "");
+  const save = () => { onSave(model.id, po); setSaved(true); setTimeout(() => setSaved(false), 1800); };
+
+  return (
+    <div style={{ marginBottom: 16, paddingBottom: 14, borderBottom: "1px solid var(--line)" }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <Field label="Purchase order number">
+            <input value={po} placeholder="Type your real PO number"
+              style={{ fontFamily: "var(--mono)" }}
+              onChange={(e) => setPo(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && dirty && save()} />
+          </Field>
+        </div>
+        <button className="btn" data-primary="1" style={{ opacity: dirty ? 1 : 0.4 }}
+          onClick={() => dirty && save()}>
+          {saved ? "✓ Saved" : "Save PO"}
+        </button>
+      </div>
+      {!model.po && (
+        <div style={{ fontSize: 11, color: "var(--warn)", marginTop: 4 }}>
+          No PO recorded yet — the export will go out without one.
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 /* ── ORDERED STAGE: EXPORT PLANNED SKUs ──────────────────────────
    Download a CSV/Excel of all SKUs so supplier can confirm.       */
 
-function SKUExport({ model }) {
+function SKUExport({ model, onPOSave }) {
   const exportFile = (fmt) => {
     const headers = ["Cover Type", "Material", "SKU", "Units Planned"];
     const rows = allSkus(model).map((r) => [r.type, r.material || "", r.sku || "", r.units]);
@@ -698,8 +748,9 @@ function SKUExport({ model }) {
   const missing = allSkus(model).filter((r) => !r.sku);
   return (
     <div>
-      <h2>▸ Ordered — SKU export for supplier</h2>
+      <h2>▸ Ordered — PO number &amp; SKU export</h2>
       <div className="card">
+        <POField model={model} onSave={onPOSave} />
         {missing.length > 0 && (
           <div style={{ color: "var(--warn)", fontSize: 12, marginBottom: 10 }}>
             {missing.length} cover{missing.length > 1 ? "s" : ""} still missing SKU — go back to Planned to fix.
@@ -730,80 +781,84 @@ function SKUExport({ model }) {
 }
 
 
-/* ── PRODUCTION STAGE: STP FILE ──────────────────────────────────
-   Export a materials summary to send as an STP file request.
-   After sending, track the STP file status.                       */
-
-const STP_STATUSES = ["Not Sent", "Submitted", "Acknowledged", "In Progress", "Completed", "Rejected"];
+/* ── PRODUCTION STAGE: STP FILE, TRACKED PER SKU ─────────────────
+   One material can be rejected while the others pass, so each SKU
+   carries its own STP status.                                     */
 
 function ProductionSTP({ model, onSTPUpdate }) {
-  const [status, setStatus] = useState(model.stpStatus || "Not Sent");
+  const rows = allSkus(model);
+  const [draft, setDraft] = useState(
+    () => Object.fromEntries(rows.map((r) => [r.rid, r.stpStatus || "Not Sent"]))
+  );
   const [saved, setSaved] = useState(false);
 
+  const setAll = (st) => setDraft(Object.fromEntries(rows.map((r) => [r.rid, st])));
+  const save   = () => { onSTPUpdate(model.id, draft); setSaved(true); setTimeout(() => setSaved(false), 2000); };
+
   const exportSTP = (fmt) => {
-    const headers = ["Brand", "Model", "Cover Type", "Material", "SKU", "Units", "PO Number"];
-    const rows = allSkus(model).map((r) => [model.brand, model.name, r.type, r.material || "", r.sku || "", r.units, model.po || ""]);
-    const isCSV = fmt === "csv";
-    const sep = isCSV ? "," : "	";
-    const ext  = isCSV ? ".csv" : ".xls";
-    const mime = isCSV ? "text/csv" : "application/vnd.ms-excel";
-    const lines = [headers, ...rows].map((r) =>
-      isCSV ? r.map((v) => `"${String(v).replace(/"/g,'""')}"`).join(",") : r.join("\t")).join("\n");
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob(["﻿" + lines], { type: mime + ";charset=utf-8;" }));
-    a.download = `STP_${model.brand}_${model.name.replace(/\s+/g,"_")}${ext}`;
-    a.click(); URL.revokeObjectURL(a.href);
+    const headers = ["Brand", "Model", "PO", "Cover Type", "SKU", "Material", "Units", "STP Status"];
+    const body = rows.map((r) => [model.brand, model.name, model.po || "", r.type,
+      r.sku || "", r.material || "", r.units, draft[r.rid] || "Not Sent"]);
+    downloadReport(`STP_${model.brand}_${model.name}`, headers, body, fmt);
   };
 
-  const save = () => { onSTPUpdate(model.id, status); setSaved(true); setTimeout(() => setSaved(false), 2000); };
-
-  const toneOf = (s) => s === "Completed" ? "ok" : s === "Rejected" ? "bad" : s === "Not Sent" ? "mute" : "warn";
+  const count = (st) => rows.filter((r) => draft[r.rid] === st).length;
+  const missingData = rows.filter((r) => !r.material || !r.sku);
 
   return (
     <div>
-      <h2 style={{ color: "var(--warn)" }}>▸ Production — STP file</h2>
+      <h2 style={{ color: "var(--warn)" }}>▸ Production — STP file per SKU</h2>
       <div className="card">
-        {/* summary table */}
-        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Materials ordered — {model.covers.length} cover type{model.covers.length !== 1 ? "s" : ""}, {allSkus(model).length} SKU{allSkus(model).length !== 1 ? "s" : ""}</div>
-        <div style={{ overflowX: "auto", marginBottom: 14 }}>
+        <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
+          Each SKU has its own STP file, so one material can be rejected while the rest pass.
+        </div>
+
+        {missingData.length > 0 && (
+          <div style={{ fontSize: 12, color: "var(--bad)", marginBottom: 12 }}>
+            {missingData.length} SKU{missingData.length > 1 ? "s" : ""} missing a material or code — fix in Planned before filing.
+          </div>
+        )}
+
+        {/* set every row at once */}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+          <span style={{ fontSize: 11, color: "var(--dim)" }}>Set all:</span>
+          {STP_STATUSES.map((st) => (
+            <button key={st} className="btn" style={{ fontSize: 11, padding: "3px 8px" }}
+              onClick={() => setAll(st)}>{st}</button>
+          ))}
+        </div>
+
+        <div style={{ overflowX: "auto", marginBottom: 12 }}>
           <table>
-            <thead><tr><th>Cover Type</th><th>Material</th><th>SKU</th><th>Units</th></tr></thead>
+            <thead><tr><th>Cover type</th><th>SKU</th><th>Material</th><th>Units</th><th style={{ minWidth: 150 }}>STP status</th></tr></thead>
             <tbody>
-              {allSkus(model).map((r) => (
+              {rows.map((r) => (
                 <tr key={r.rid} style={{ cursor: "default" }}>
                   <td style={{ fontWeight: 550 }}>{r.type}</td>
+                  <td className="n" style={{ fontSize: 12 }}>{r.sku || <span style={{ color: "var(--warn)" }}>missing</span>}</td>
                   <td style={{ color: "var(--dim)", fontSize: 12 }}>{r.material || <span style={{ color: "var(--bad)" }}>missing</span>}</td>
-                  <td className="n" style={{ fontSize: 12 }}>{r.sku || "—"}</td>
                   <td className="n">{qty(r.units)}</td>
+                  <td style={{ padding: "6px 8px" }}>
+                    <select value={draft[r.rid] || "Not Sent"} style={{ fontSize: 12 }}
+                      onChange={(e) => setDraft((d) => ({ ...d, [r.rid]: e.target.value }))}>
+                      {STP_STATUSES.map((st) => <option key={st}>{st}</option>)}
+                    </select>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
 
-        {/* export */}
-        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-          <button className="btn" data-primary="1" onClick={() => exportSTP("csv")}>↓ Export STP (CSV)</button>
-          <button className="btn" onClick={() => exportSTP("excel")}>↓ Export STP (Excel)</button>
-        </div>
-
-        {/* status tracker */}
-        <div style={{ borderTop: "1px solid var(--line)", paddingTop: 14 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10 }}>STP file status</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 12 }}>
-            {STP_STATUSES.map((st) => (
-              <button key={st} className="btn" data-on={status === st ? "1" : "0"}
-                style={{ fontSize: 12 }} onClick={() => setStatus(st)}>
-                {st}
-              </button>
-            ))}
-          </div>
-          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <span className="tag" data-tone={toneOf(status)}>{status}</span>
-            <button className="btn" data-primary="1" style={{ fontSize: 12 }} onClick={save}>
-              {saved ? "✓ Saved" : "Save status"}
-            </button>
-          </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <button className="btn" data-primary="1" onClick={save}>{saved ? "✓ Saved" : "Save STP status"}</button>
+          <button className="btn" onClick={() => exportSTP("csv")}>↓ CSV</button>
+          <button className="btn" onClick={() => exportSTP("excel")}>↓ Excel</button>
+          <span style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {count("Completed") > 0 && <Tag tone="ok">{count("Completed")} completed</Tag>}
+            {count("Rejected")  > 0 && <Tag tone="bad">{count("Rejected")} rejected</Tag>}
+            {count("Not Sent")  > 0 && <Tag>{count("Not Sent")} not sent</Tag>}
+          </span>
         </div>
       </div>
     </div>
@@ -818,76 +873,107 @@ function ProductionSTP({ model, onSTPUpdate }) {
 function ReceivedChecker({ model, onSave }) {
   const [rows, setRows] = useState(() =>
     allSkus(model).map((r) => ({
-      rid: r.rid, type: r.type, sku: r.sku, material: r.material, planned: r.units,
+      rid: r.rid, type: r.type, sku: r.sku, material: r.material,
+      planned: r.units,
       received: r.receivedQty ?? null,
-      ok: r.receivedOk ?? null,
+      state: r.receiptState ?? null,
     }))
   );
   const [saved, setSaved] = useState(false);
 
-  const update = (rid, patch) =>
-    setRows((r) => r.map((row) => row.rid === rid ? { ...row, ...patch } : row));
+  /* Typing a quantity decides the state, so the two can never disagree. */
+  const setQty = (rid, qtyIn) => setRows((rs) => rs.map((row) => {
+    if (row.rid !== rid) return row;
+    const n = qtyIn === "" ? null : Math.max(0, +qtyIn);
+    if (n === null) return { ...row, received: null, state: null };
+    return { ...row, received: n,
+      state: n === 0 ? "none" : n >= row.planned ? "full" : "short" };
+  }));
+
+  /* Quick buttons for the two common cases */
+  const markFull = (rid) => setRows((rs) => rs.map((r) =>
+    r.rid === rid ? { ...r, received: r.planned, state: "full" } : r));
+  const markNone = (rid) => setRows((rs) => rs.map((r) =>
+    r.rid === rid ? { ...r, received: 0, state: "none" } : r));
+  const markAllFull = () => setRows((rs) => rs.map((r) => ({ ...r, received: r.planned, state: "full" })));
 
   const save = () => { onSave(model.id, rows); setSaved(true); setTimeout(() => setSaved(false), 2000); };
 
-  const allConfirmed = rows.every((r) => r.ok !== null);
-  const allOk        = rows.every((r) => r.ok === true);
+  const pending   = rows.filter((r) => r.state == null).length;
+  const short     = rows.filter((r) => r.state === "short");
+  const none      = rows.filter((r) => r.state === "none");
+  const totalPlan = rows.reduce((s, r) => s + r.planned, 0);
+  const totalRecd = rows.reduce((s, r) => s + (r.received || 0), 0);
+  const gap       = totalPlan - totalRecd;
 
   return (
     <div>
-      <h2 style={{ color: "var(--warn)" }}>▸ Received — confirm each cover</h2>
+      <h2 style={{ color: "var(--warn)" }}>▸ Received — confirm each SKU</h2>
       <div className="card">
-        <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 14 }}>
-          Tick <strong>Received</strong> or <strong>Not received</strong> for every cover type.
-          Once all are confirmed you can move to Live.
+        <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
+          Type how many actually arrived. Short deliveries are recorded, not hidden —
+          the shortfall shows up in the received report so you can chase it.
         </div>
 
-        {rows.map((row) => (
-          <div key={row.rid} style={{ display: "flex", gap: 12, alignItems: "center",
-            padding: "11px 0", borderBottom: "1px solid var(--line)", flexWrap: "wrap" }}>
-            <div style={{ flex: 1, minWidth: 180 }}>
-              <div style={{ fontWeight: 570 }}>{row.type}</div>
-              <div className="n" style={{ fontSize: 11, color: "var(--dim)" }}>{row.sku || "no SKU"}{row.material ? " · " + row.material : ""}</div>
-              <div className="n" style={{ fontSize: 11, color: "var(--dim)" }}>
-                Planned: {qty(row.planned)}
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <input type="number" min="0" max={row.planned * 2} value={row.received ?? ""}
-                placeholder="qty received"
-                style={{ width: 110, fontFamily: "var(--mono)" }}
-                onChange={(e) => update(row.rid, { received: +e.target.value })} />
-              <button className="btn" data-on={row.ok === true ? "1" : "0"}
-                style={{ fontSize: 12, color: row.ok === true ? "var(--ok)" : undefined }}
-                onClick={() => update(row.rid, { ok: true })}>
-                <CheckCircle2 size={13} /> Received
-              </button>
-              <button className="btn"
-                style={{ fontSize: 12, color: row.ok === false ? "var(--bad)" : undefined,
-                  borderColor: row.ok === false ? "var(--bad)" : undefined }}
-                onClick={() => update(row.rid, { ok: false })}>
-                ✕ Not received
-              </button>
-            </div>
-          </div>
-        ))}
+        <button className="btn" style={{ fontSize: 11, padding: "4px 9px", marginBottom: 12 }}
+          onClick={markAllFull}>Mark all received in full</button>
 
-        <div style={{ marginTop: 14, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          {allConfirmed
-            ? allOk
-              ? <span className="tag" data-tone="ok">All covers received ✓</span>
-              : <span className="tag" data-tone="warn">Some covers not received — flag before going live</span>
-            : <span className="tag" data-tone="mute">{rows.filter(r => r.ok === null).length} cover{rows.filter(r => r.ok === null).length !== 1 ? "s" : ""} still unconfirmed</span>}
+        <div style={{ overflowX: "auto", marginBottom: 12 }}>
+          <table>
+            <thead><tr>
+              <th>Cover type</th><th>SKU</th><th>Planned</th>
+              <th style={{ minWidth: 110 }}>Received</th><th>Short by</th><th>Status</th><th></th>
+            </tr></thead>
+            <tbody>
+              {rows.map((r) => {
+                const gapRow = r.state == null ? null : Math.max(0, r.planned - (r.received || 0));
+                return (
+                  <tr key={r.rid} style={{ cursor: "default" }}>
+                    <td style={{ fontWeight: 550 }}>{r.type}</td>
+                    <td className="n" style={{ fontSize: 12 }}>{r.sku || "—"}</td>
+                    <td className="n">{qty(r.planned)}</td>
+                    <td style={{ padding: "6px 8px" }}>
+                      <input type="number" min="0" value={r.received ?? ""} placeholder="qty"
+                        style={{ fontFamily: "var(--mono)", fontSize: 12, width: 100 }}
+                        onChange={(e) => setQty(r.rid, e.target.value)} />
+                    </td>
+                    <td className="n" style={{ color: gapRow > 0 ? "var(--bad)" : "var(--dim)" }}>
+                      {gapRow == null ? "—" : gapRow > 0 ? qty(gapRow) : "0"}
+                    </td>
+                    <td>
+                      <Tag tone={r.state === "full" ? "ok" : r.state === "short" ? "warn" : r.state === "none" ? "bad" : undefined}>
+                        {receiptLabel(r)}
+                      </Tag>
+                    </td>
+                    <td style={{ whiteSpace: "nowrap", padding: "6px 4px" }}>
+                      <button className="btn" title="Received in full"
+                        style={{ padding: "3px 6px", fontSize: 11 }}
+                        onClick={() => markFull(r.rid)}><CheckCircle2 size={11} /></button>
+                      <button className="btn" title="Nothing arrived"
+                        style={{ padding: "3px 6px", fontSize: 11, marginLeft: 4, color: "var(--bad)" }}
+                        onClick={() => markNone(r.rid)}><X size={11} /></button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <button className="btn" data-primary="1" onClick={save}>{saved ? "✓ Saved" : "Save receipt"}</button>
+          {pending > 0
+            ? <Tag>{pending} still unconfirmed</Tag>
+            : gap > 0
+              ? <Tag tone="warn">{qty(gap)} units short overall</Tag>
+              : <Tag tone="ok">All {qty(totalRecd)} units received</Tag>}
+          {short.length > 0 && <Tag tone="warn">{short.length} short</Tag>}
+          {none.length  > 0 && <Tag tone="bad">{none.length} not received</Tag>}
         </div>
       </div>
     </div>
   );
 }
-
-
-/* ── 10. DETAIL PANEL ────────────────────────────────────────────
-   One scrolling panel. Covers, timeline. No tabs.                  */
 
 
 /* ── RESEARCH STAGE: EDIT PHONE DETAILS ─────────────────────────
@@ -944,7 +1030,7 @@ function ResearchEditor({ model, onSave }) {
   );
 }
 
-function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave }) {
+function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave }) {
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -1006,14 +1092,15 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
             <ResearchEditor model={model} onSave={onResearchSave} />
           )}
 
-          {/* Planned stage: choose covers, set SKU + material */}
-          {model.stage === "planned" && (
-            <PlannedSKUEditor model={model} onSave={onSKUSave} />
+          {/* Covers stay editable after Planned — a new colour can come up
+              mid-production and you shouldn't have to move the phone back. */}
+          {["planned", "ordered", "production"].includes(model.stage) && (
+            <PlannedSKUEditor model={model} onSave={onSKUSave} stage={model.stage} />
           )}
 
           {/* Ordered stage: export SKU list for the supplier */}
           {model.stage === "ordered" && (
-            <SKUExport model={model} />
+            <SKUExport model={model} onPOSave={onPOSave} />
           )}
 
           {/* Production stage: STP file + status */}
@@ -1101,7 +1188,7 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
             }
             /* Gate: Received → Live — every cover must be confirmed */
             if (model.stage === "received") {
-              const unconfirmed = allSkus(model).filter((r) => r.receivedOk === null || r.receivedOk === undefined);
+              const unconfirmed = allSkus(model).filter((r) => !isConfirmed(r));
               const blocked     = unconfirmed.length > 0;
               return (
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -1313,7 +1400,7 @@ function productionReport(models, fmt) {
       rows.push([
         m.brand, m.name, m.segment, m.launch, m.po || "",
         r.type, r.material || "MISSING", r.sku || "MISSING", r.units,
-        stpRequired, m.stpStatus || "Not Sent"
+        stpRequired, r.stpStatus || "Not Sent"
       ]);
     })
   );
@@ -1353,11 +1440,11 @@ function Dashboard({ models, onOpen, onAdd }) {
   const totalUnits    = models.reduce((s, m) => s + m.units, 0);
   const liveUnits     = live.reduce((s, m) => s + m.units, 0);
   const prodUnits     = prod.reduce((s, m) => s + m.units, 0);
-  const stpNotSent    = prod.filter((m) => !m.stpStatus || m.stpStatus === "Not Sent").length;
-  const stpDone       = prod.filter((m) => m.stpStatus === "Completed").length;
+  const stpNotSent    = prod.filter((m) => allSkus(m).some((r) => !r.stpStatus || r.stpStatus === "Not Sent")).length;
+  const stpDone       = prod.filter((m) => allSkus(m).length && allSkus(m).every((r) => r.stpStatus === "Completed")).length;
   const noCovers      = planned.filter((m) => allSkus(m).length === 0).length;
   const missingSkus   = planned.filter((m) => allSkus(m).some((r) => !r.sku?.trim())).length;
-  const unconfRec     = received.filter((m) => allSkus(m).some((r) => r.receivedOk === null || r.receivedOk === undefined)).length;
+  const unconfRec     = received.filter((m) => allSkus(m).some((r) => !isConfirmed(r))).length;
   const launching14   = models.filter((m) => m.stage !== "live" && m.daysToLaunch >= 0 && m.daysToLaunch <= 14);
 
   /* funnel max for % bar width */
@@ -1370,9 +1457,17 @@ function Dashboard({ models, onOpen, onAdd }) {
       ps.push({ model: m, type: "warn", text: `Launches in ${m.daysToLaunch} day${m.daysToLaunch === 1 ? "" : "s"}` });
     if (m.stage === "planned" && allSkus(m).length === 0)
       ps.push({ model: m, type: "warn", text: "No covers planned yet" });
+    if (m.stage === "ordered" && !m.po)
+      ps.push({ model: m, type: "warn", text: "No PO number recorded" });
+    if (m.stage === "production" && allSkus(m).some((r) => r.stpStatus === "Rejected"))
+      ps.push({ model: m, type: "bad", text: "STP file rejected on one or more SKUs" });
+    if (allSkus(m).some((r) => r.receiptState === "short"))
+      ps.push({ model: m, type: "warn", text: `Short delivery — ${qty(allSkus(m).reduce((s, r) => s + shortfallOf(r), 0))} units missing` });
+    if (allSkus(m).some((r) => r.receiptState === "none"))
+      ps.push({ model: m, type: "bad", text: "One or more SKUs never arrived" });
     if (m.stage === "planned" && allSkus(m).some((r) => !r.sku?.trim()))
       ps.push({ model: m, type: "warn", text: "SKU still blank — can't move to Ordered" });
-    if (m.stage === "production" && (!m.stpStatus || m.stpStatus === "Not Sent"))
+    if (m.stage === "production" && allSkus(m).some((r) => !r.stpStatus || r.stpStatus === "Not Sent"))
       ps.push({ model: m, type: "warn", text: "STP file not sent yet" });
     return ps;
   });
@@ -1531,14 +1626,14 @@ function buildReportRows(reportKey, models) {
       rows: models.filter((m) => m.stage === "production").flatMap((m) =>
         allSkus(m).map((r) => [m.brand, m.name, m.segment, m.launch, m.po || "",
           r.type, r.material || "MISSING", r.sku || "MISSING", r.units,
-          (!r.material || !r.sku) ? "YES — fix data" : "YES", m.stpStatus || "Not Sent"])),
+          (!r.material || !r.sku) ? "YES — fix data" : "YES", r.stpStatus || "Not Sent"])),
     };
     case "received": return {
-      headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "Cover Type", "SKU", "Material", "Planned Qty", "Received Qty", "Status"],
+      headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "Cover Type", "SKU", "Material", "Planned Qty", "Received Qty", "Short By", "Status"],
       rows: models.filter((m) => m.stage === "received").flatMap((m) =>
         allSkus(m).map((r) => [m.brand, m.name, m.segment, m.launch, m.po || "",
           r.type, r.sku || "", r.material || "", r.units, r.receivedQty ?? "—",
-          r.receivedOk === true ? "Received" : r.receivedOk === false ? "Not received" : "Pending"])),
+          isConfirmed(r) ? shortfallOf(r) : "—", receiptLabel(r)])),
     };
     case "late": return {
       headers: ["Brand", "Model", "Segment", "Launch Date", "Stage", "Days Late", "Days to Launch"],
@@ -1648,7 +1743,7 @@ export default function App() {
     const done = { ...p.done };
     /* mark every stage up to the new one as done */
     STAGES.slice(0, stageIndex(stageKey) + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
-    return { ...p, stage: stageKey, done, po: p.po || (stageIndex(stageKey) >= stageIndex("ordered") ? "PO-" + String(100 + p.id) : null) };
+    return { ...p, stage: stageKey, done };
   }));
 
   const advance = (id) => {
@@ -1684,9 +1779,22 @@ export default function App() {
   };
 
   /* update STP file status from ProductionSTP */
-  const updateSTP = (id, stpStatus) => {
-    setPhones((list) => list.map((p) => p.id !== id ? p : { ...p, stpStatus }));
-    say("STP status updated: " + stpStatus);
+  /* STP status is set per SKU — rows is a map of rid -> status */
+  const updateSTP = (id, statusByRid) => {
+    setPhones((list) => list.map((p) => p.id !== id ? p : {
+      ...p,
+      covers: p.covers.map((c) => ({
+        ...c,
+        skus: c.skus.map((r) => statusByRid[r.rid] ? { ...r, stpStatus: statusByRid[r.rid] } : r),
+      })),
+    }));
+    say("STP status saved");
+  };
+
+  /* PO number is typed by the buyer, never invented by the app */
+  const savePO = (id, po) => {
+    setPhones((list) => list.map((p) => p.id !== id ? p : { ...p, po: po.trim() }));
+    say(po.trim() ? "PO number saved" : "PO number cleared");
   };
 
   /* save goods receipt rows from ReceivedChecker */
@@ -1697,7 +1805,7 @@ export default function App() {
         ...c,
         skus: c.skus.map((row) => {
           const r = receiptRows.find((rr) => rr.rid === row.rid);
-          return r ? { ...row, receivedQty: r.received, receivedOk: r.ok } : row;
+          return r ? { ...row, receivedQty: r.received, receiptState: r.state } : row;
         }),
       }));
       return { ...p, covers: updated };
@@ -1765,7 +1873,7 @@ export default function App() {
         {view === "reports"   && <Reports models={models} />}
       </div>
 
-      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onResearchSave={saveResearch} onSKUSave={saveSKU} onSTPUpdate={updateSTP} onReceiptSave={saveReceipt} />}
+      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onResearchSave={saveResearch} onSKUSave={saveSKU} onSTPUpdate={updateSTP} onReceiptSave={saveReceipt} onPOSave={savePO} />}
       {adding && <AddForm onClose={() => setAdding(false)} onSave={addPhone} />}
       {confirmReset && (
         <>
