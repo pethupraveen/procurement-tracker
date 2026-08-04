@@ -1638,7 +1638,10 @@ export default function App() {
   };
 
   const resetAll = () => {
-    setPhones(SEED);
+    /* spread into a new array — React compares references, so passing the
+       same SEED constant a second time looks like "no change" and skips
+       the re-render. A fresh copy always triggers the update.           */
+    setPhones(SEED.map((p) => ({ ...p, covers: p.covers.map((c) => ({ ...c })) })));
     setOpenId(null);
     setAdding(false);
     setConfirmReset(false);
