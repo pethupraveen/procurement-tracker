@@ -69,6 +69,20 @@ const stageIndex = (key) => STAGES.findIndex((s) => s.key === key);
 /* The four places these covers actually sell */
 const MARKETPLACES = ["Flipkart", "Amazon", "Meesho", "Shopify"];
 
+/* Materials you actually buy. Edit this one array to change the
+   dropdown everywhere it appears.                               */
+/* The four materials you actually order, each with the quantity you
+   normally book. Picking a material fills the units for you — you can
+   always type over it.                                                */
+const MATERIALS = [
+  { name: "TPU+PC",           defaultQty: 50 },
+  { name: "Silicone Cover",   defaultQty: 30 },
+  { name: "TPU+PC+MSF",       defaultQty: 50 },
+  { name: "Silicone MagSafe", defaultQty: 30 },
+];
+const MATERIAL_NAMES = MATERIALS.map((m) => m.name);
+const defaultQtyFor  = (name) => MATERIALS.find((m) => m.name === name)?.defaultQty ?? 0;
+
 let _skuSeq = 0;
 const skuRow = (sku = "", material = "", units = 0) => ({
   rid: ++_skuSeq,            // stable React key, never shown to the user
@@ -535,7 +549,9 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
       /* Join everything after the material before parsing digits — a pasted
          "5,000" arrives split across two parts and must not become 5.     */
       const n = parseInt(parts.slice(2).join("").replace(/[^\d]/g, ""), 10);
-      parsed.push(skuRow(sku, material, Number.isFinite(n) ? n : 0));
+      /* No units given? Use the material's default rather than zero. */
+      const units = Number.isFinite(n) ? n : defaultQtyFor(material);
+      parsed.push(skuRow(sku, material, units));
     });
     if (!parsed.length) {
       setBulkErr("No valid rows found. Each line needs at least a SKU.");
@@ -612,11 +628,12 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
                 <div style={{ marginBottom: 12, padding: 12, borderRadius: 9, border: "1px solid var(--accent)" }}>
                   <div style={{ fontSize: 11, color: "var(--dim)", marginBottom: 6, lineHeight: 1.5 }}>
                     One line per SKU. Columns: <code>SKU, Material, Units</code><br />
+                    Leave units blank and the material default is used ({MATERIALS.map((m) => `${m.name} ${m.defaultQty}`).join(" · ")}).<br />
                     Paste straight from Excel — tabs work too, and a header row is skipped automatically.
                   </div>
                   <textarea rows={5} value={bulkText}
                     style={{ fontFamily: "var(--mono)", fontSize: 12, resize: "vertical" }}
-                    placeholder={"SIL-SAM-A57-BLK, Liquid Silicone, 5000\nSIL-SAM-A57-BLU, Liquid Silicone, 4000\nSIL-SAM-A57-RED, Liquid Silicone, 3000"}
+                    placeholder={"SIL-A57-BLK, Silicone Cover, 30\nSIL-A57-BLU, Silicone Cover\nTPU-A57-CLR, TPU+PC, 50"}
                     onChange={(e) => setBulkText(e.target.value)} />
                   {bulkErr && <div style={{ color: "var(--warn)", fontSize: 11, marginTop: 5 }}>{bulkErr}</div>}
                   <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
@@ -652,13 +669,22 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
                         </td>
                         <td style={{ padding: "6px 8px" }}>
                           <select value={r.material} style={{ fontSize: 12 }}
-                            onChange={(e) => editRow(c.type, r.rid, { material: e.target.value })}>
+                            onChange={(e) => {
+                              const name = e.target.value;
+                              /* only fill units if the buyer hasn't typed their own */
+                              const untouched = !r.units || r.units === defaultQtyFor(r.material);
+                              editRow(c.type, r.rid, untouched
+                                ? { material: name, units: defaultQtyFor(name) }
+                                : { material: name });
+                            }}>
                             <option value="">— select —</option>
-                            {MATERIALS.map((m) => <option key={m}>{m}</option>)}
+                            {MATERIALS.map((m) => <option key={m.name} value={m.name}>{m.name} · {m.defaultQty}</option>)}
                           </select>
                         </td>
                         <td style={{ padding: "6px 8px" }}>
                           <input type="number" min="0" value={r.units || ""}
+                            placeholder={r.material ? String(defaultQtyFor(r.material)) : "qty"}
+                            title={r.material ? `Default for ${r.material} is ${defaultQtyFor(r.material)}` : undefined}
                             style={{ fontFamily: "var(--mono)", fontSize: 12 }}
                             onChange={(e) => editRow(c.type, r.rid, { units: +e.target.value })} />
                         </td>
@@ -1370,9 +1396,6 @@ const NEW_MODEL = {
   brand: "", name: "", segment: "Mid Range", launch: "",
   covers: [],
 };
-
-const MATERIALS = ["Soft TPU", "Hard PC", "TPU + PC Hybrid", "Liquid Silicone",
-                    "PU Leather", "PC + Magnet Array", "Tempered Glass", "Rugged Composite"];
 
 function AddForm({ onClose, onSave }) {
   const [form, setForm] = useState(NEW_MODEL);
