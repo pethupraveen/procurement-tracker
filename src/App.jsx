@@ -15,7 +15,7 @@ import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, Layou
      4. See what's running late
 
    Read this file top to bottom. It's in dependency order:
-     helpers -> stages -> scoring -> data -> derive -> UI
+     helpers -> stages -> data -> derive -> UI
    ═══════════════════════════════════════════════════════════════ */
 
 
@@ -62,67 +62,11 @@ const stageIndex = (key) => STAGES.findIndex((s) => s.key === key);
    against the planned date to get the delay. Stages not in `done`
    haven't happened yet.                                            */
 
-const D = (n) => shift(iso(TODAY), n);   // n days from today
-
-/* helper so the seed data below stays readable */
+/* helper so the cover helper stays readable */
 const cover = (type, units, sku, material) => ({ type, units, sku: sku || '', material: material || '' });
 
-const SEED = [
-  {
-    id: 1, brand: "Redmi", name: "Note 15 Pro 5G", segment: "Mid Range",
-    launch: D(-12), stage: "live", po: "PO-101",
-    done: { research: D(-112), planned: D(-96), ordered: D(-87), production: D(-71), received: D(-36), live: D(-12) },
-    covers: [cover("TPU Cover", 30000, "TPU-RDM-N15-BLK", "Soft TPU"), cover("Transparent Cover", 34000, "TRN-RDM-N15-CLR", "Hard PC")],
-  },
-  {
-    id: 2, brand: "Samsung", name: "Galaxy S26 Ultra", segment: "Flagship",
-    launch: D(-40), stage: "live", po: "PO-102",
-    done: { research: D(-140), planned: D(-124), ordered: D(-115), production: D(-98), received: D(-63), live: D(-38) },
-    covers: [cover("Magsafe Cover", 9000, "MAG-SAM-S26-BLK", "PC + Magnet Array"), cover("Leather Cover", 4000, "LTH-SAM-S26-BRN", "PU Leather")],
-  },
-  {
-    id: 3, brand: "Oppo", name: "Reno 15 5G", segment: "Premium",
-    launch: D(30), stage: "received", po: "PO-103",
-    /* stock arrived a week early — delay comes out negative, which is fine */
-    done: { research: D(-70), planned: D(-55), ordered: D(-44), production: D(-29), received: D(-2) },
-    covers: [{ ...cover("Magsafe Cover", 7000, "MAG-OPP-R15-BLK", "PC + Magnet Array"), receivedQty: 6800, receivedOk: true },
-          { ...cover("Transparent Cover", 11000, "TRN-OPP-R15-CLR", "Hard PC"), receivedQty: null, receivedOk: null }],
-  },
-  {
-    id: 4, brand: "Realme", name: "15 Pro 5G", segment: "Mid Range",
-    launch: D(26), stage: "production", po: "PO-104",
-    /* PROBLEM CASE: production finished 12 days after it was due */
-    done: { research: D(-74), planned: D(-58), ordered: D(-46), production: D(-22) },
-    stpStatus: "Submitted",
-    covers: [cover("TPU Cover", 18000, "TPU-REA-15P-BLK", "Soft TPU"), cover("Kickstand Cover", 8000, "KCK-REA-15P-BLK", "TPU + PC Hybrid")],
-  },
-  {
-    id: 5, brand: "OnePlus", name: "Nord 6", segment: "Mid Range",
-    launch: D(50), stage: "ordered", po: "PO-105",
-    /* PROBLEM CASE: PO is placed but production was due 10 days ago and
-       hasn't started — caught because the NEXT stage is already overdue */
-    done: { research: D(-50), planned: D(-33), ordered: D(-20) },
-    covers: [cover("Magsafe Cover", 9000, "MAG-ONE-N6-BLK", "PC + Magnet Array"), cover("Silicone Cover", 11000, "SIL-ONE-N6-WHT", "Liquid Silicone")],
-  },
-  {
-    id: 6, brand: "Poco", name: "X8 Pro 5G", segment: "Mid Range",
-    launch: D(85), stage: "planned", po: null,
-    done: { research: D(-15), planned: D(-1) },
-    covers: [cover("TPU Cover", 26000, "TPU-POC-X8-BLK", "Soft TPU"), cover("Rugged Cover", 12000, "RGD-POC-X8-GRY", "Rugged Composite")],
-  },
-  {
-    id: 7, brand: "Nothing", name: "Phone (4a)", segment: "Mid Range",
-    launch: D(95), stage: "research", po: null,
-    done: { research: D(-3) },
-    covers: [],
-  },
-  {
-    id: 8, brand: "Tecno", name: "Camon 40 Pro", segment: "Budget",
-    launch: D(90), stage: "research", po: null,
-    done: { research: D(-8) },
-    covers: [],
-  },
-];
+/* No demo data — start empty so you can enter your real phones */
+const EMPTY = [];
 
 
 /* ── 5. DERIVED VALUES ───────────────────────────────────────────
@@ -387,7 +331,7 @@ const Field = ({ label, hint, children }) => (
 /* ── 8. BOARD VIEW ───────────────────────────────────────────────
    One column per stage. Drag a card to move the model forward.     */
 
-function Board({ models, onOpen, onMove }) {
+function Board({ models, onOpen, onMove, onAdd }) {
   const [dragging, setDragging] = useState(null);
   const [over, setOver] = useState(null);
 
@@ -395,6 +339,15 @@ function Board({ models, onOpen, onMove }) {
     if (dragging && dragging.stage !== stageKey) onMove(dragging.id, stageKey);
     setDragging(null); setOver(null);
   };
+
+  if (models.length === 0) return (
+    <div className="card" style={{ textAlign: "center", padding: "48px 24px" }}>
+      <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
+      <div style={{ fontSize: 16, fontWeight: 640, marginBottom: 8 }}>Board is empty</div>
+      <div style={{ fontSize: 13, color: "var(--dim)", marginBottom: 20 }}>Add a phone to see it appear here.</div>
+      <button className="btn" data-primary="1" onClick={onAdd}><Plus size={14} />Add phone</button>
+    </div>
+  );
 
   return (
     <div className="board">
@@ -1290,7 +1243,7 @@ function KPI({ label, value, sub, tone, onCSV, onXLS }) {
 
 
 /* ── DASHBOARD ─────────────────────────────────────────────────── */
-function Dashboard({ models, onOpen }) {
+function Dashboard({ models, onOpen, onAdd }) {
   const byStage   = (k) => models.filter((m) => m.stage === k);
   const late      = models.filter((m) => m.isLate);
   const live      = byStage("live");
@@ -1329,11 +1282,26 @@ function Dashboard({ models, onOpen }) {
 
   return (
     <div>
+      {/* ── empty state ── */}
+      {models.length === 0 && (
+        <div className="card" style={{ textAlign: "center", padding: "48px 24px", marginBottom: 20 }}>
+          <div style={{ fontSize: 32, marginBottom: 12 }}>📱</div>
+          <div style={{ fontSize: 17, fontWeight: 640, marginBottom: 8 }}>No phones tracked yet</div>
+          <div style={{ fontSize: 13, color: "var(--dim)", marginBottom: 20, lineHeight: 1.6, maxWidth: 360, margin: "0 auto 20px" }}>
+            Click <strong>Add phone</strong> to start tracking your first new model.
+            Every phone moves through Research → Planned → Ordered → Production → Received → Live.
+          </div>
+          <button className="btn" data-primary="1" onClick={onAdd}>
+            <Plus size={14} />Add your first phone
+          </button>
+        </div>
+      )}
+
       {/* ── 10 KPI cards ── */}
-      <div style={{ marginBottom: 6 }}>
+      {models.length > 0 && <div style={{ marginBottom: 6 }}>
         <h2>Key numbers</h2>
-      </div>
-      <div className="kpi-grid">
+      </div>}
+      {models.length > 0 && <div className="kpi-grid">
         <KPI label="Phones tracked"   value={models.length}   sub="across all stages" />
         <KPI label="Research"         value={research.length} sub={research.length ? research.map(m=>m.name).join(", ").slice(0,40) : "None yet"} />
         <KPI label="Planned"          value={planned.length}
@@ -1363,10 +1331,10 @@ function Dashboard({ models, onOpen }) {
           sub={launching14.length ? launching14.map(m=>`${m.name} in ${m.daysToLaunch}d`).join(", ").slice(0,50) : "None urgent"} />
         <KPI label="Units in pipeline" value={qty(totalUnits)} tone="accent"
           sub={liveUnits ? `${qty(liveUnits)} live · ${qty(totalUnits - liveUnits)} in pipeline` : "No live yet"} />
-      </div>
+      </div>}
 
       {/* ── pipeline funnel ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 20 }}>
+      {models.length > 0 && <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 20 }}>
         <div className="card">
           <h2>Pipeline funnel</h2>
           <div className="funnel">
@@ -1403,10 +1371,10 @@ function Dashboard({ models, onOpen }) {
             })}
           </div>
         </div>
-      </div>
+      </div>}
 
       {/* ── alerts ── */}
-      {problems.length > 0 && (
+      {models.length > 0 && problems.length > 0 && (
         <div className="card">
           <h2>Needs attention — {problems.length} item{problems.length !== 1 ? "s" : ""}</h2>
           <div style={{ display: "grid", gap: 8 }}>
@@ -1424,7 +1392,7 @@ function Dashboard({ models, onOpen }) {
           </div>
         </div>
       )}
-      {problems.length === 0 && (
+      {models.length > 0 && problems.length === 0 && (
         <div className="card" style={{ borderColor: "color-mix(in srgb, var(--ok) 40%, var(--line))" }}>
           <div style={{ display: "flex", gap: 10, alignItems: "center", fontSize: 13 }}>
             <CheckCircle2 size={16} style={{ color: "var(--ok)" }} />
@@ -1563,7 +1531,7 @@ function Reports({ models }) {
 }
 
 export default function App() {
-  const [phones, setPhones] = useState(SEED);
+  const [phones, setPhones] = useState(EMPTY);
   const [openId, setOpenId] = useState(null);
   const [adding, setAdding] = useState(false);
   const [view, setView] = useState("dashboard");
@@ -1638,14 +1606,11 @@ export default function App() {
   };
 
   const resetAll = () => {
-    /* spread into a new array — React compares references, so passing the
-       same SEED constant a second time looks like "no change" and skips
-       the re-render. A fresh copy always triggers the update.           */
-    setPhones(SEED.map((p) => ({ ...p, covers: p.covers.map((c) => ({ ...c })) })));
+    setPhones([]);
     setOpenId(null);
     setAdding(false);
     setConfirmReset(false);
-    say("All data reset to demo state");
+    say("All phones deleted");
   };
 
   const addPhone = (data) => {
@@ -1685,7 +1650,7 @@ export default function App() {
               {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
             </button>
             <button className="btn" style={{ color: "var(--bad)", borderColor: "var(--bad)" }}
-              onClick={() => setConfirmReset(true)} title="Reset all data to demo state">
+              onClick={() => setConfirmReset(true)} title="Delete all phones and start fresh">
               Reset
             </button>
             <button className="btn" data-primary="1" onClick={() => setAdding(true)}>
@@ -1694,8 +1659,8 @@ export default function App() {
           </div>
         </div>
 
-        {view === "dashboard" && <Dashboard models={models} onOpen={setOpenId} />}
-        {view === "board"     && <Board models={models} onOpen={setOpenId} onMove={moveTo} />}
+        {view === "dashboard" && <Dashboard models={models} onOpen={setOpenId} onAdd={() => setAdding(true)} />}
+        {view === "board"     && <Board models={models} onOpen={setOpenId} onMove={moveTo} onAdd={() => setAdding(true)} />}
         {view === "table"     && <Table models={models} onOpen={setOpenId} />}
         {view === "reports"   && <Reports models={models} />}
       </div>
@@ -1712,17 +1677,17 @@ export default function App() {
             borderRadius: 14, padding: 28, width: "min(380px, 90vw)",
             display: "flex", flexDirection: "column", gap: 14
           }}>
-            <div style={{ fontSize: 16, fontWeight: 640 }}>Reset all data?</div>
+            <div style={{ fontSize: 16, fontWeight: 640 }}>Delete all phones?</div>
             <div style={{ fontSize: 13, color: "var(--dim)", lineHeight: 1.6 }}>
-              This will delete every phone you've added and every edit you've made,
-              and restore the 8 demo phones. There is no undo.
+              This will permanently delete every phone and all their data.
+              The list will be empty. There is no undo.
             </div>
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
               <button className="btn" onClick={() => setConfirmReset(false)}>Cancel</button>
               <button className="btn" data-primary="1"
                 style={{ background: "var(--bad)", borderColor: "var(--bad)" }}
                 onClick={resetAll}>
-                Yes, reset everything
+                Yes, delete all
               </button>
             </div>
           </div>
