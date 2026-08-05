@@ -119,6 +119,31 @@ const receiptLabel = (r) =>
    material and unit count — that's the whole structure.              */
 const allSkus = (model) => model.skus || [];
 
+/* Each sales entry: { rid, date, marketplace, units, revenue, returns, notes }
+   Accumulated on the phone — never overwritten, always appended.      */
+const SALE_MARKETPLACES = ["Flipkart", "Amazon", "Meesho", "Shopify"];
+
+function salesSummary(entries) {
+  if (!entries || !entries.length)
+    return { total: 0, revenue: 0, returns: 0, d7: 0, d30: 0, byMarketplace: {} };
+  const cut7  = new Date(Date.now() -  7 * 864e5);
+  const cut30 = new Date(Date.now() - 30 * 864e5);
+  let total = 0, revenue = 0, returns = 0, d7 = 0, d30 = 0;
+  const byMp = {};
+  entries.forEach((e) => {
+    const d = new Date(e.date);
+    total   += e.units   || 0;
+    revenue += e.revenue || 0;
+    returns += e.returns || 0;
+    if (d >= cut7)  d7  += e.units || 0;
+    if (d >= cut30) d30 += e.units || 0;
+    const mp = e.marketplace || "All";
+    byMp[mp] = (byMp[mp] || 0) + (e.units || 0);
+  });
+  const returnRate = total > 0 ? ((returns / total) * 100).toFixed(1) : "0.0";
+  return { total, revenue, returns, returnRate, d7, d30, byMarketplace: byMp };
+}
+
 /* No demo data — start empty so you can enter your real phones */
 const EMPTY = [];
 
@@ -173,19 +198,114 @@ function derive(model) {
     daysToLaunch: daysFromToday(model.launch),
     worstDelay,
     isLate: worstDelay > 3,
+    sales: salesSummary(model.salesEntries),
   };
 }
 
 /* problems worth showing at the top of the screen */
+/* Single source of truth for every alert in the app.
+   Board cards, the Dashboard panel, and any future notification
+   system all call this — nothing generates alerts independently. */
 function problemsOf(model) {
-  const list = [];
+  const ps = [];
+  const push = (type, text) => ps.push({ model, type, text });
+
   if (model.isLate)
-    list.push({ model, text: `${model.worstDelay} days behind schedule` });
-  if (model.stage !== "live" && model.daysToLaunch >= 0 && model.daysToLaunch <= 14)
-    list.push({ model, text: `Launches in ${model.daysToLaunch} days, still at ${STAGES[model.index].label}` });
-  return list;
+    push("bad", `+${model.worstDelay}d behind schedule`);
+
+  if (model.stage !== "live" && model.daysToLaunch != null
+      && model.daysToLaunch >= 0 && model.daysToLaunch <= 14)
+    push("warn", `Launches in ${model.daysToLaunch} day${model.daysToLaunch === 1 ? "" : "s"} — still at ${STAGES[model.index].label}`);
+
+  if (model.stage === "planned" && allSkus(model).length === 0)
+    push("warn", "No SKUs planned yet");
+
+  if (model.stage === "planned" && allSkus(model).some((r) => !r.sku?.trim()))
+    push("warn", "SKU still blank — can't move to Ordered");
+
+  if (model.stage === "ordered" && !model.po)
+    push("warn", "No PO number recorded");
+
+  if (model.stage === "production" && allSkus(model).some((r) => !r.stpStatus || r.stpStatus === "Not Sent"))
+    push("warn", "STP file not sent yet");
+
+  if (model.stage === "production" && allSkus(model).some((r) => r.stpStatus === "Rejected"))
+    push("bad", "STP file rejected on one or more SKUs");
+
+  if (allSkus(model).some((r) => r.receiptState === "short"))
+    push("warn", `Short delivery — ${qty(allSkus(model).reduce((s, r) => s + shortfallOf(r), 0))} units missing`);
+
+  if (allSkus(model).some((r) => r.receiptState === "none"))
+    push("bad", "One or more SKUs never arrived");
+
+  if (allSkus(model).some((r) => blockedCount(r) > 0))
+    push("bad", "Listing blocked on a marketplace");
+
+  if (model.stage === "live" && allSkus(model).some((r) => !isFullyListed(r)))
+    push("warn", `Live but not fully listed — ${allSkus(model).filter((r) => !isFullyListed(r)).length} SKU(s) incomplete`);
+
+  return ps;
 }
 
+
+
+/* ── USERS, ROLES & PERMISSIONS ──────────────────────────────────
+   Each user has a name, role, and a PIN (stored as a simple hash
+   so the plain text is never kept in state).
+
+   Default accounts — change PINs via the Admin panel:
+     admin       / 1234
+     procurement / 1111
+     warehouse   / 2222
+     catalog     / 3333
+     sales       / 4444
+
+   PINs are hashed with a tiny djb2 function — good enough to avoid
+   storing plain text; not a security guarantee for production use.
+   ─────────────────────────────────────────────────────────────── */
+
+const hashPin = (pin) => {
+  let h = 5381;
+  for (let i = 0; i < pin.length; i++) h = (h * 33) ^ pin.charCodeAt(i);
+  return (h >>> 0).toString(36);
+};
+
+const DEFAULT_USERS = [
+  { id: "u1", name: "Arjun (Admin)",       role: "admin",       pin: hashPin("1234"), avatar: "A" },
+  { id: "u2", name: "Priya (Procurement)", role: "procurement", pin: hashPin("1111"), avatar: "P" },
+  { id: "u3", name: "Ravi (Warehouse)",    role: "warehouse",   pin: hashPin("2222"), avatar: "R" },
+  { id: "u4", name: "Sunita (Catalog)",    role: "catalog",     pin: hashPin("3333"), avatar: "S" },
+  { id: "u5", name: "Kiran (Sales)",       role: "sales",       pin: hashPin("4444"), avatar: "K" },
+];
+
+const ROLES = [
+  { key: "admin",       label: "Admin",       color: "var(--bad)"    },
+  { key: "procurement", label: "Procurement", color: "var(--accent)"  },
+  { key: "warehouse",   label: "Warehouse",   color: "var(--warn)"   },
+  { key: "catalog",     label: "Catalog",     color: "var(--ok)"     },
+  { key: "sales",       label: "Sales",       color: "var(--dim)"    },
+];
+
+const ROLE_CAN_ADVANCE_TO = {
+  admin:       ["planned","ordered","production","received","live"],
+  procurement: ["planned","ordered"],
+  warehouse:   ["production","received","live"],
+  catalog:     [],
+  sales:       [],
+};
+
+const CAN = {
+  addPhone:    (r) => ["admin","procurement"].includes(r),
+  editResearch:(r) => ["admin","procurement"].includes(r),
+  editSKUs:    (r) => ["admin","procurement"].includes(r),
+  savePO:      (r) => ["admin","procurement"].includes(r),
+  updateSTP:   (r) => ["admin","warehouse"].includes(r),
+  saveReceipt: (r) => ["admin","warehouse"].includes(r),
+  saveListing: (r) => ["admin","catalog"].includes(r),
+  logSales:    (r) => ["admin","sales"].includes(r),
+  manageUsers: (r) => r === "admin",
+  reset:       (r) => r === "admin",
+};
 
 /* ── 6. STYLES ───────────────────────────────────────────────────
    All colours are CSS variables set on .app. Change them in one
@@ -506,6 +626,14 @@ function Table({ models, onOpen }) {
    "Silicone Cover" can hold ten SKUs in ten different colours.      */
 
 function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
+  if (!onSave) return (
+    <div>
+      <h2 style={{ color: "var(--warn)" }}>▸ SKUs</h2>
+      <div className="card" style={{ color: "var(--dim)", fontSize: 13 }}>
+        Your role cannot edit SKUs. Contact Procurement or Admin.
+      </div>
+    </div>
+  );
   const [draft, setDraft] = useState(
     () => (model.skus || []).map((r) => ({ ...r }))
   );
@@ -1060,11 +1188,175 @@ function ListingEditor({ model, onSave }) {
 }
 
 
+
+/* ── SALES TRACKING — shown when stage === "live" ────────────────
+   Log a sale by date, marketplace, units, revenue and returns.
+   Entries accumulate; nothing is ever overwritten.               */
+
+function SalesTracker({ model, onSave, canLog }) {
+  const [form, setForm] = useState({
+    date: iso(TODAY), marketplace: "Flipkart", units: "", revenue: "", returns: "", notes: "",
+  });
+  const [saved, setSaved] = useState(false);
+  const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const s = model.sales;
+
+  const submit = () => {
+    if (!form.units || +form.units <= 0) return;
+    onSave(model.id, {
+      rid: Date.now(),
+      date: form.date, marketplace: form.marketplace,
+      units: +form.units, revenue: +form.revenue || 0,
+      returns: +form.returns || 0, notes: form.notes.trim(),
+    });
+    setForm((f) => ({ ...f, units: "", revenue: "", returns: "", notes: "" }));
+    setSaved(true); setTimeout(() => setSaved(false), 2000);
+  };
+
+  const exportSales = (fmt) => {
+    const entries = model.salesEntries || [];
+    const headers = ["Date", "Marketplace", "Units Sold", "Revenue (₹)", "Returns", "Notes"];
+    const rows = entries.map((e) => [e.date, e.marketplace, e.units, e.revenue || 0, e.returns || 0, e.notes || ""]);
+    downloadReport(`Sales_${model.brand}_${model.name}`, headers, rows, fmt);
+  };
+
+  return (
+    <div>
+      <h2 style={{ color: "var(--ok)" }}>▸ Sales tracking</h2>
+      <div className="card">
+
+        {/* KPI row */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 10, marginBottom: 16 }}>
+          {[
+            ["Total units", qty(s.total)],
+            ["Last 7 days", qty(s.d7)],
+            ["Last 30 days", qty(s.d30)],
+            ["Revenue", s.revenue ? "₹" + Math.round(s.revenue).toLocaleString("en-IN") : "—"],
+            ["Returns", s.returns > 0 ? qty(s.returns) + " (" + s.returnRate + "%)" : "0"],
+          ].map(([label, value], i) => (
+            <div key={i} className="card" style={{ padding: "10px 12px", background: "var(--bg)" }}>
+              <div style={{ fontSize: 11, color: "var(--dim)" }}>{label}</div>
+              <div className="n" style={{ fontSize: 18, fontWeight: 620, marginTop: 4 }}>{value}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* by marketplace */}
+        {Object.keys(s.byMarketplace).length > 0 && (
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+            {SALE_MARKETPLACES.filter(mp => s.byMarketplace[mp]).map((mp) => (
+              <div key={mp}>
+                <Tag>{mp}</Tag>
+                <span className="n" style={{ marginLeft: 6, fontSize: 13 }}>{qty(s.byMarketplace[mp])}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* log new entry */}
+        {canLog ? (
+          <div style={{ borderTop: "1px solid var(--line)", paddingTop: 14 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10 }}>Log a sale</div>
+            <div className="two" style={{ marginBottom: 10 }}>
+              <Field label="Date">
+                <input type="date" value={form.date} onChange={(e) => set("date", e.target.value)} />
+              </Field>
+              <Field label="Marketplace">
+                <select value={form.marketplace} onChange={(e) => set("marketplace", e.target.value)}>
+                  {SALE_MARKETPLACES.map((mp) => <option key={mp}>{mp}</option>)}
+                </select>
+              </Field>
+            </div>
+            <div className="two" style={{ marginBottom: 10 }}>
+              <Field label="Units sold *">
+                <input type="number" min="0" value={form.units} placeholder="0"
+                  style={{ fontFamily: "var(--mono)" }}
+                  onChange={(e) => set("units", e.target.value)} />
+              </Field>
+              <Field label="Revenue (₹)">
+                <input type="number" min="0" value={form.revenue} placeholder="0"
+                  style={{ fontFamily: "var(--mono)" }}
+                  onChange={(e) => set("revenue", e.target.value)} />
+              </Field>
+            </div>
+            <div className="two" style={{ marginBottom: 10 }}>
+              <Field label="Returns">
+                <input type="number" min="0" value={form.returns} placeholder="0"
+                  style={{ fontFamily: "var(--mono)" }}
+                  onChange={(e) => set("returns", e.target.value)} />
+              </Field>
+              <Field label="Notes (optional)">
+                <input value={form.notes} placeholder="Flipkart sale event, etc."
+                  onChange={(e) => set("notes", e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && +form.units > 0 && submit()} />
+              </Field>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn" data-primary="1"
+                style={{ opacity: +form.units > 0 ? 1 : 0.4 }}
+                onClick={() => +form.units > 0 && submit()}>
+                {saved ? "✓ Logged" : "Log sale"}
+              </button>
+              <button className="btn" onClick={() => exportSales("csv")}>↓ CSV</button>
+              <button className="btn" onClick={() => exportSales("excel")}>↓ Excel</button>
+            </div>
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: "var(--dim)", borderTop: "1px solid var(--line)", paddingTop: 12 }}>
+            Sales can be logged by the Sales or Admin role.
+          </div>
+        )}
+
+        {/* entry history */}
+        {(model.salesEntries || []).length > 0 && (
+          <div style={{ marginTop: 16 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
+              History — {(model.salesEntries || []).length} entr{(model.salesEntries || []).length === 1 ? "y" : "ies"}
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table>
+                <thead><tr><th>Date</th><th>Marketplace</th><th>Units</th><th>Revenue</th><th>Returns</th><th>Notes</th></tr></thead>
+                <tbody>
+                  {[...(model.salesEntries || [])].reverse().slice(0, 20).map((e) => (
+                    <tr key={e.rid} style={{ cursor: "default" }}>
+                      <td className="n" style={{ fontSize: 12 }}>{showDate(e.date)}</td>
+                      <td style={{ fontSize: 12 }}>{e.marketplace}</td>
+                      <td className="n">{qty(e.units)}</td>
+                      <td className="n" style={{ fontSize: 12 }}>{e.revenue ? "₹" + Math.round(e.revenue).toLocaleString("en-IN") : "—"}</td>
+                      <td className="n" style={{ fontSize: 12, color: e.returns > 0 ? "var(--bad)" : undefined }}>{e.returns || 0}</td>
+                      <td style={{ fontSize: 11, color: "var(--dim)" }}>{e.notes || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {!(model.salesEntries || []).length && s.total === 0 && (
+          <div style={{ fontSize: 13, color: "var(--dim)", marginTop: 10 }}>
+            No sales logged yet. Log the first entry above.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 /* ── RESEARCH STAGE: EDIT PHONE DETAILS ─────────────────────────
    Inline editor in the detail panel so you can correct the brand,
    model name, launch date and segment right where you're looking. */
 
 function ResearchEditor({ model, onSave }) {
+  if (!onSave) return (
+    <div>
+      <h2 style={{ color: "var(--warn)" }}>▸ Research — edit phone details</h2>
+      <div className="card" style={{ color: "var(--dim)", fontSize: 13 }}>
+        Your role cannot edit phone details. Contact Procurement or Admin.
+      </div>
+    </div>
+  );
   const [form, setForm] = useState({
     brand:   model.brand,
     name:    model.name,
@@ -1114,7 +1406,7 @@ function ResearchEditor({ model, onSave }) {
   );
 }
 
-function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave }) {
+function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave, onSalesLog, canLog, role }) {
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -1196,6 +1488,11 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
             <ListingEditor model={model} onSave={onListingSave} />
           )}
 
+          {/* Sales tracking */}
+          {model.stage === "live" && (
+            <SalesTracker model={model} onSave={onSalesLog} canLog={canLog} />
+          )}
+
           {/* the pipeline */}
           <div>
             <h2>Progress</h2>
@@ -1248,6 +1545,19 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
           )}
           {!isLast && (() => {
             const next = STAGES[model.index + 1];
+            /* Role gate: can this role advance to the next stage? */
+            if (role && !ROLE_CAN_ADVANCE_TO[role]?.includes(next.key)) {
+              return (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <button className="btn" style={{ opacity: 0.35, cursor: "not-allowed" }}>
+                    Move to {next.label} →
+                  </button>
+                  <span style={{ fontSize: 11, color: "var(--dim)" }}>
+                    {ROLES.find(r => r.key === role)?.label} cannot advance to {next.label}
+                  </span>
+                </div>
+              );
+            }
             /* Gate: Planned → Ordered — every cover must have a SKU */
             if (model.stage === "planned") {
               const missingSkus = allSkus(model).filter((r) => !r.sku?.trim());
@@ -1531,32 +1841,7 @@ function Dashboard({ models, onOpen, onAdd }) {
   /* funnel max for % bar width */
   const funnelMax = Math.max(1, models.length);
 
-  const problems = models.flatMap((m) => {
-    const ps = [];
-    if (m.isLate) ps.push({ model: m, type: "bad",  text: `+${m.worstDelay}d behind schedule` });
-    if (m.stage !== "live" && m.daysToLaunch >= 0 && m.daysToLaunch <= 14)
-      ps.push({ model: m, type: "warn", text: `Launches in ${m.daysToLaunch} day${m.daysToLaunch === 1 ? "" : "s"}` });
-    if (m.stage === "planned" && allSkus(m).length === 0)
-      ps.push({ model: m, type: "warn", text: "No covers planned yet" });
-    if (m.stage === "live" && allSkus(m).some((r) => !isFullyListed(r)))
-      ps.push({ model: m, type: "warn",
-        text: `Live but not listed everywhere — ${allSkus(m).filter((r) => !isFullyListed(r)).length} SKU(s) incomplete` });
-    if (allSkus(m).some((r) => blockedCount(r) > 0))
-      ps.push({ model: m, type: "bad", text: "Listing blocked on a marketplace" });
-    if (m.stage === "ordered" && !m.po)
-      ps.push({ model: m, type: "warn", text: "No PO number recorded" });
-    if (m.stage === "production" && allSkus(m).some((r) => r.stpStatus === "Rejected"))
-      ps.push({ model: m, type: "bad", text: "STP file rejected on one or more SKUs" });
-    if (allSkus(m).some((r) => r.receiptState === "short"))
-      ps.push({ model: m, type: "warn", text: `Short delivery — ${qty(allSkus(m).reduce((s, r) => s + shortfallOf(r), 0))} units missing` });
-    if (allSkus(m).some((r) => r.receiptState === "none"))
-      ps.push({ model: m, type: "bad", text: "One or more SKUs never arrived" });
-    if (m.stage === "planned" && allSkus(m).some((r) => !r.sku?.trim()))
-      ps.push({ model: m, type: "warn", text: "SKU still blank — can't move to Ordered" });
-    if (m.stage === "production" && allSkus(m).some((r) => !r.stpStatus || r.stpStatus === "Not Sent"))
-      ps.push({ model: m, type: "warn", text: "STP file not sent yet" });
-    return ps;
-  });
+  const problems = models.flatMap(problemsOf);
 
   return (
     <div>
@@ -1602,6 +1887,13 @@ function Dashboard({ models, onOpen, onAdd }) {
           sub={received.length ? (unconfRec > 0 ? `${unconfRec} unconfirmed` : "All confirmed") : "None yet"} />
         <KPI label="Live & selling"   value={live.length}  tone={live.length > 0 ? "ok" : undefined}
           sub={live.length ? `${qty(liveUnits)} units in market` : "Nothing live yet"} />
+        <KPI label="Units sold"
+             value={qty(models.filter(m=>m.stage==="live").reduce((s,m)=>s+m.sales.total,0))}
+             sub={(() => {
+               const rev = models.filter(m=>m.stage==="live").reduce((s,m)=>s+m.sales.revenue,0);
+               return rev > 0 ? "₹"+Math.round(rev).toLocaleString("en-IN")+" revenue" : "Live phones only";
+             })()}
+             tone={models.some(m=>m.stage==="live"&&m.sales.total>0) ? "ok" : undefined} />
         <KPI label="Fully listed"      value={fullyListed}
              tone={listable.length && fullyListed === listable.length ? "ok" : listBlocked ? "bad" : undefined}
              sub={listable.length
@@ -1735,6 +2027,16 @@ function buildReportRows(reportKey, models) {
             isFullyListed(r) ? "Yes" : "No"])),
       };
 
+    case "sales":
+      return {
+        headers: ["Brand","Model","Date","Marketplace","Units Sold","Revenue (₹)","Returns","Notes"],
+        rows: models.filter(m=>m.stage==="live").flatMap((m) =>
+          (m.salesEntries||[]).map((e) => [
+            m.brand, m.name, e.date, e.marketplace,
+            e.units, e.revenue||0, e.returns||0, e.notes||""
+          ])),
+      };
+
     case "late": return {
       headers: ["Brand", "Model", "Segment", "Launch Date", "Stage", "Days Late", "Days to Launch"],
       rows: models.filter((m) => m.isLate).map((m) => [m.brand, m.name, m.segment, m.launch,
@@ -1753,6 +2055,7 @@ const REPORT_DEFS = [
   { key: "received",   label: "Received" },
   { key: "listing",    label: "Listing" },
   { key: "late",       label: "Late Models" },
+  { key: "sales",      label: "Sales" },
 ];
 
 function Reports({ models }) {
@@ -1823,7 +2126,255 @@ function Reports({ models }) {
   );
 }
 
+
+
+/* ── USER MANAGER — Admin only ───────────────────────────────────
+   Create, rename, change role and reset PIN for any user.
+   Shown in a modal when Admin clicks "Manage Users".             */
+
+function UserManager({ users, onSave, onClose }) {
+  const [list, setList] = useState(users.map(u => ({ ...u })));
+  const [editing, setEditing] = useState(null);   // user id being edited
+  const [form, setForm]       = useState({});
+  const [newPin, setNewPin]   = useState("");
+  const [msg, setMsg]         = useState("");
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const startEdit = (u) => { setEditing(u.id); setForm({ name: u.name.split(" (")[0], role: u.role }); setNewPin(""); setMsg(""); };
+  const cancelEdit = () => { setEditing(null); setNewPin(""); setMsg(""); };
+
+  const saveUser = (id) => {
+    if (!form.name?.trim()) return;
+    setList(l => l.map(u => u.id !== id ? u : {
+      ...u,
+      name: form.name.trim() + " (" + ROLES.find(r => r.key === form.role)?.label + ")",
+      role: form.role,
+      ...(newPin.length >= 4 ? { pin: hashPin(newPin) } : {}),
+    }));
+    setMsg("Saved"); setTimeout(() => setMsg(""), 1500);
+    setEditing(null); setNewPin("");
+  };
+
+  const addUser = () => {
+    const id = "u" + Date.now();
+    const u = { id, name: "New User (Procurement)", role: "procurement", pin: hashPin("0000"), avatar: "N" };
+    setList(l => [...l, u]);
+    startEdit(u);
+  };
+
+  const removeUser = (id) => {
+    if (list.length <= 1) return;
+    setList(l => l.filter(u => u.id !== id));
+    if (editing === id) cancelEdit();
+  };
+
+  return (
+    <>
+      <div className="shade" style={{ zIndex: 60 }} onClick={onClose} />
+      <div style={{ position: "fixed", zIndex: 61, top: "50%", left: "50%",
+        transform: "translate(-50%, -50%)", background: "var(--card)",
+        border: "1px solid var(--line)", borderRadius: 14, padding: 24,
+        width: "min(520px, 94vw)", maxHeight: "85vh", overflowY: "auto",
+        display: "flex", flexDirection: "column", gap: 16 }}>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ flex: 1, fontSize: 15, fontWeight: 650 }}>User accounts</div>
+          <button className="btn" style={{ padding: "4px 8px" }} onClick={addUser}>
+            <Plus size={13} />New user
+          </button>
+          <button className="btn btn-icon" onClick={onClose}><X size={14} /></button>
+        </div>
+
+        {list.map((u) => {
+          const r = ROLES.find(x => x.key === u.role);
+          const isEditing = editing === u.id;
+          return (
+            <div key={u.id} className="card" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {!isEditing ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{ width: 34, height: 34, borderRadius: "50%", background: r?.color || "var(--accent)",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    fontSize: 14, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
+                    {u.avatar}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>{u.name.split(" (")[0]}</div>
+                    <div style={{ fontSize: 11, color: "var(--dim)" }}>{r?.label}</div>
+                  </div>
+                  <button className="btn" style={{ fontSize: 11, padding: "4px 8px" }}
+                    onClick={() => startEdit(u)}>Edit</button>
+                  {list.length > 1 && (
+                    <button className="btn" style={{ fontSize: 11, padding: "4px 8px", color: "var(--bad)" }}
+                      onClick={() => removeUser(u.id)}>Remove</button>
+                  )}
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: "var(--accent)" }}>Editing account</div>
+                  <div className="two">
+                    <Field label="Display name">
+                      <input value={form.name || ""} placeholder="Name"
+                        onChange={(e) => set("name", e.target.value)} />
+                    </Field>
+                    <Field label="Role">
+                      <select value={form.role} onChange={(e) => set("role", e.target.value)}>
+                        {ROLES.map(r => <option key={r.key} value={r.key}>{r.label}</option>)}
+                      </select>
+                    </Field>
+                  </div>
+                  <Field label="New PIN (leave blank to keep current — min 4 digits)"
+                    hint={newPin.length >= 4 ? "✓ PIN will be updated" : ""}>
+                    <input type="password" value={newPin} placeholder="New PIN"
+                      maxLength={6} style={{ fontFamily: "var(--mono)", letterSpacing: 3 }}
+                      onChange={(e) => setNewPin(e.target.value.replace(/\D/g,""))} />
+                  </Field>
+                  <div style={{ fontSize: 11, color: "var(--dim)" }}>
+                    Avatar letter is the first letter of the name.
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn" data-primary="1" onClick={() => saveUser(u.id)}
+                      style={{ opacity: form.name?.trim() ? 1 : 0.4 }}>
+                      {msg || "Save"}
+                    </button>
+                    <button className="btn" onClick={cancelEdit}>Cancel</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        <button className="btn" data-primary="1" onClick={() => { onSave(list); onClose(); }}>
+          Save all and close
+        </button>
+      </div>
+    </>
+  );
+}
+
+
+/* ── LOGIN SCREEN ────────────────────────────────────────────────
+   Shown when no session is active. Pick a user, enter PIN.
+   Admin can also reach User Management from the nav bar.          */
+
+function LoginScreen({ users, onLogin, theme, onTheme }) {
+  const [selected, setSelected] = useState(null);
+  const [pin, setPin]           = useState("");
+  const [error, setError]       = useState("");
+  const [showPin, setShowPin]   = useState(false);
+
+  const attempt = () => {
+    if (!selected) return;
+    if (hashPin(pin) === selected.pin) {
+      setError(""); onLogin(selected);
+    } else {
+      setError("Wrong PIN. Try again.");
+      setPin("");
+    }
+  };
+
+  const roleInfo = selected ? ROLES.find(r => r.key === selected.role) : null;
+
+  return (
+    <div className="app" data-theme={theme} style={{ minHeight: "100vh",
+      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+      <style>{CSS}</style>
+      <div style={{ width: "min(420px, 94vw)", display: "flex", flexDirection: "column", gap: 20 }}>
+
+        {/* header */}
+        <div style={{ textAlign: "center", marginBottom: 8 }}>
+          <Package size={28} style={{ color: "var(--accent)", marginBottom: 8 }} />
+          <h1 style={{ margin: "0 0 4px", fontSize: 22 }}>Procurement Tracker</h1>
+          <div className="sub">Select your account to continue</div>
+        </div>
+
+        {/* user grid */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          {users.map((u) => {
+            const r = ROLES.find(x => x.key === u.role);
+            const active = selected?.id === u.id;
+            return (
+              <button key={u.id} className="btn card"
+                style={{ flexDirection: "column", gap: 8, padding: "14px 12px", textAlign: "center",
+                  border: active ? "2px solid var(--accent)" : "1px solid var(--line)",
+                  background: active ? "var(--card)" : undefined }}
+                onClick={() => { setSelected(u); setPin(""); setError(""); }}>
+                <div style={{ width: 40, height: 40, borderRadius: "50%", background: r?.color || "var(--accent)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 17, fontWeight: 700, color: "#fff", margin: "0 auto" }}>
+                  {u.avatar}
+                </div>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{u.name.split(" (")[0]}</div>
+                  <div style={{ fontSize: 11, color: "var(--dim)" }}>{r?.label}</div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* PIN entry */}
+        {selected && (
+          <div className="card" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>
+              Sign in as <span style={{ color: "var(--accent)" }}>{selected.name.split(" (")[0]}</span>
+              <span style={{ fontSize: 11, color: "var(--dim)", marginLeft: 8, fontWeight: 400 }}>
+                {roleInfo?.label}
+              </span>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ flex: 1, position: "relative" }}>
+                <input
+                  type={showPin ? "text" : "password"}
+                  value={pin}
+                  placeholder="Enter PIN"
+                  autoFocus
+                  style={{ fontFamily: "var(--mono)", fontSize: 15, letterSpacing: 4, width: "100%" }}
+                  onChange={(e) => { setPin(e.target.value.replace(/\D/g,"")); setError(""); }}
+                  onKeyDown={(e) => e.key === "Enter" && attempt()}
+                  maxLength={6}
+                />
+              </div>
+              <button className="btn" title={showPin ? "Hide" : "Show"}
+                style={{ padding: "0 12px" }}
+                onClick={() => setShowPin(v => !v)}>
+                {showPin ? "🙈" : "👁"}
+              </button>
+            </div>
+            {error && <div style={{ fontSize: 12, color: "var(--bad)" }}>{error}</div>}
+            <button className="btn" data-primary="1" onClick={attempt}
+              style={{ opacity: pin.length >= 4 ? 1 : 0.4 }}>
+              Sign in
+            </button>
+          </div>
+        )}
+
+        {/* theme toggle at bottom */}
+        <div style={{ textAlign: "center" }}>
+          <button className="btn btn-icon" onClick={onTheme} aria-label="Switch theme"
+            style={{ margin: "0 auto" }}>
+            {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 export default function App() {
+  /* ── session state ── */
+  const [users, setUsers]     = useState(DEFAULT_USERS);
+  const [session, setSession] = useState(null);   // null = logged out
+  const [manageUsers, setManageUsers] = useState(false);
+
+  const role = session?.role ?? "none";
+  const currentUser = session;
+
+  const login  = (user) => setSession(user);
+  const logout = () => { setSession(null); setOpenId(null); setAdding(false); };
+
+  /* ── app state ── */
   const [phones, setPhones] = useState(EMPTY);
   const [openId, setOpenId] = useState(null);
   const [adding, setAdding] = useState(false);
@@ -1917,6 +2468,14 @@ export default function App() {
     say("Receipt saved");
   };
 
+  const logSale = (id, entry) => {
+    setPhones((list) => list.map((p) => p.id !== id ? p : {
+      ...p,
+      salesEntries: [...(p.salesEntries || []), entry],
+    }));
+    say("Sale logged");
+  };
+
   const resetAll = () => {
     setPhones([]);
     setOpenId(null);
@@ -1932,6 +2491,16 @@ export default function App() {
     setOpenId(id);
     say(`${data.brand} ${data.name} added and tracking`);
   };
+
+  /* ── show login screen when no session ── */
+  if (!session) return (
+    <LoginScreen
+      users={users}
+      onLogin={login}
+      theme={theme}
+      onTheme={() => setTheme(t => t === "dark" ? "light" : "dark")}
+    />
+  );
 
   return (
     <div className="app" data-theme={theme}>
@@ -1957,17 +2526,51 @@ export default function App() {
             <button className="btn" data-on={view === "reports" ? "1" : "0"} onClick={() => setView("reports")}>
               <FileText size={14} />Reports
             </button>
+            {/* Logged-in user badge */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{
+                width: 30, height: 30, borderRadius: "50%",
+                background: ROLES.find(r => r.key === role)?.color || "var(--accent)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 13, fontWeight: 700, color: "#fff", flexShrink: 0
+              }}>
+                {currentUser?.avatar}
+              </div>
+              <div style={{ lineHeight: 1.2 }}>
+                <div style={{ fontSize: 12, fontWeight: 600 }}>{currentUser?.name?.split(" (")[0]}</div>
+                <div style={{ fontSize: 10, color: "var(--dim)" }}>{ROLES.find(r => r.key === role)?.label}</div>
+              </div>
+              {CAN.manageUsers(role) && (
+                <button className="btn" style={{ fontSize: 11, padding: "4px 8px" }}
+                  onClick={() => setManageUsers(true)}>
+                  Users
+                </button>
+              )}
+              <button className="btn" style={{ fontSize: 11, padding: "4px 8px" }}
+                onClick={logout} title="Sign out">
+                Sign out
+              </button>
+            </div>
             <button className="btn btn-icon" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
                     aria-label="Switch theme">
               {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
             </button>
-            <button className="btn" style={{ color: "var(--bad)", borderColor: "var(--bad)" }}
-              onClick={() => setConfirmReset(true)} title="Delete all phones and start fresh">
-              Reset
-            </button>
-            <button className="btn" data-primary="1" onClick={() => setAdding(true)}>
-              <Plus size={14} />Add phone
-            </button>
+            {CAN.reset(role) && (
+              <button className="btn" style={{ color: "var(--bad)", borderColor: "var(--bad)" }}
+                onClick={() => setConfirmReset(true)} title="Delete all phones">
+                Reset
+              </button>
+            )}
+            {CAN.addPhone(role) ? (
+              <button className="btn" data-primary="1" onClick={() => setAdding(true)}>
+                <Plus size={14} />Add phone
+              </button>
+            ) : (
+              <button className="btn" style={{ opacity: 0.35, cursor: "not-allowed" }}
+                title={`${ROLES.find(r=>r.key===role)?.label} cannot add phones`}>
+                <Plus size={14} />Add phone
+              </button>
+            )}
           </div>
         </div>
 
@@ -1977,7 +2580,7 @@ export default function App() {
         {view === "reports"   && <Reports models={models} />}
       </div>
 
-      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onResearchSave={saveResearch} onSKUSave={saveSKU} onSTPUpdate={updateSTP} onReceiptSave={saveReceipt} onPOSave={savePO} onListingSave={saveListings} />}
+      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onResearchSave={CAN.editResearch(role) ? saveResearch : null} onSKUSave={CAN.editSKUs(role) ? saveSKU : null} onSTPUpdate={CAN.updateSTP(role) ? updateSTP : null} onReceiptSave={CAN.saveReceipt(role) ? saveReceipt : null} onPOSave={CAN.savePO(role) ? savePO : null} onListingSave={CAN.saveListing(role) ? saveListings : null} onSalesLog={logSale} canLog={CAN.logSales(role)} role={role} />}
       {adding && <AddForm onClose={() => setAdding(false)} onSave={addPhone} />}
       {confirmReset && (
         <>
@@ -2004,6 +2607,18 @@ export default function App() {
             </div>
           </div>
         </>
+      )}
+      {manageUsers && CAN.manageUsers(role) && (
+        <UserManager
+          users={users}
+          onSave={(updated) => {
+            setUsers(updated);
+            const me = updated.find(u => u.id === session?.id);
+            if (me) setSession(me);
+            say("Users saved");
+          }}
+          onClose={() => setManageUsers(false)}
+        />
       )}
       {toast  && <div className="toast">{toast}</div>}
     </div>
