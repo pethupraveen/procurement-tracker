@@ -308,6 +308,68 @@ const CAN = {
 };
 
 
+
+/* ── ADVANCE LOGIC — one source of truth ─────────────────────────
+   gateBlock()     — is the DATA ready to move on? returns a reason or null
+   advanceStatus() — combines the data gate with the role permission.
+   Used by the Detail footer, the board's quick-advance button, and the
+   "Needs my action" filter, so all three can never disagree.       */
+
+function gateBlock(model) {
+  if (model.stage === "planned") {
+    if (allSkus(model).length === 0) return "No SKUs added yet";
+    const missing = allSkus(model).filter((r) => !r.sku?.trim());
+    if (missing.length) return `${missing.length} SKU${missing.length > 1 ? "s" : ""} missing a code`;
+  }
+  if (model.stage === "received") {
+    const unconf = allSkus(model).filter((r) => !isConfirmed(r));
+    if (unconf.length) return `${unconf.length} SKU${unconf.length > 1 ? "s" : ""} not confirmed`;
+  }
+  return null;
+}
+
+function advanceStatus(model, role) {
+  const next = STAGES[model.index + 1];
+  if (!next) return { ok: false, next: null, reason: "Already live" };
+  if (role && role !== "none" && !ROLE_CAN_ADVANCE_TO[role]?.includes(next.key))
+    return { ok: false, next, reason: `${ROLES.find(r => r.key === role)?.label} can't move to ${next.label}` };
+  const block = gateBlock(model);
+  if (block) return { ok: false, next, reason: block };
+  return { ok: true, next, reason: null };
+}
+
+/* ── SEARCH & SORT ──────────────────────────────────────────────── */
+
+/* Matches brand, model name, PO, or any SKU code / material */
+function matchesSearch(model, q) {
+  if (!q?.trim()) return true;
+  const t = q.trim().toLowerCase();
+  if (`${model.brand} ${model.name}`.toLowerCase().includes(t)) return true;
+  if ((model.po || "").toLowerCase().includes(t)) return true;
+  if (model.segment?.toLowerCase().includes(t)) return true;
+  return allSkus(model).some((r) =>
+    (r.sku || "").toLowerCase().includes(t) || (r.material || "").toLowerCase().includes(t));
+}
+
+/* Late first, then soonest launch. Puts what needs attention on top. */
+function byUrgency(a, b) {
+  if (a.isLate !== b.isLate) return a.isLate ? -1 : 1;
+  const da = a.daysToLaunch ?? 9999, db = b.daysToLaunch ?? 9999;
+  return da - db;
+}
+
+/* One place that decides whether a model survives the active filters */
+function passesFilters(model, f, role) {
+  if (!matchesSearch(model, f.q)) return false;
+  if (f.needsAction && !advanceStatus(model, role).ok) return false;
+  if (f.lateOnly && !model.isLate) return false;
+  if (f.soonOnly && !(model.daysToLaunch != null && model.daysToLaunch >= 0 && model.daysToLaunch <= 30)) return false;
+  if (f.brand && model.brand !== f.brand) return false;
+  return true;
+}
+
+const EMPTY_FILTERS = { q: "", needsAction: false, lateOnly: false, soonOnly: false, brand: "" };
+
 /* ── DATABASE LAYER ──────────────────────────────────────────────
    Supabase REST API called directly — no npm package required.
    URL and anon key are stored in localStorage and managed through
@@ -606,19 +668,116 @@ const Field = ({ label, hint, children }) => (
     {hint && <span className="field-h">{hint}</span>}
   </label>
 );
+
+/* ── FILTER BAR — shared by Board and List ───────────────────────
+   Search, "needs my action", quick chips, and density toggle.
+   State lives in App so switching views keeps your filters.      */
+
+function FilterBar({ filters, setFilters, models, role, compact, setCompact, showDensity }) {
+  const set = (k, v) => setFilters((f) => ({ ...f, [k]: v }));
+  const brands = [...new Set(models.map((m) => m.brand))].sort();
+
+  const actionable = models.filter((m) => advanceStatus(m, role).ok).length;
+  const lateCount  = models.filter((m) => m.isLate).length;
+  const soonCount  = models.filter((m) => m.daysToLaunch != null && m.daysToLaunch >= 0 && m.daysToLaunch <= 30).length;
+  const anyActive  = filters.q || filters.needsAction || filters.lateOnly || filters.soonOnly || filters.brand;
+
+  return (
+    <div className="card" style={{ marginBottom: 14, padding: "12px 14px",
+      display: "flex", flexDirection: "column", gap: 10 }}>
+
+      {/* search row */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 200, position: "relative" }}>
+          <input
+            value={filters.q}
+            placeholder="Search brand, model, SKU, material or PO…"
+            style={{ paddingLeft: 32 }}
+            onChange={(e) => set("q", e.target.value)}
+          />
+          <span style={{ position: "absolute", left: 11, top: "50%", transform: "translateY(-50%)",
+            fontSize: 13, color: "var(--dim)", pointerEvents: "none" }}>⌕</span>
+          {filters.q && (
+            <button className="btn" title="Clear search"
+              style={{ position: "absolute", right: 5, top: "50%", transform: "translateY(-50%)",
+                padding: "2px 6px", border: "none" }}
+              onClick={() => set("q", "")}>
+              <X size={12} />
+            </button>
+          )}
+        </div>
+
+        {showDensity && (
+          <button className="btn" style={{ fontSize: 11, padding: "6px 10px" }}
+            onClick={() => setCompact(!compact)}
+            title={compact ? "Show full cards" : "Show compact cards"}>
+            {compact ? "⊞ Full" : "⊟ Compact"}
+          </button>
+        )}
+
+        {anyActive && (
+          <button className="btn" style={{ fontSize: 11, padding: "6px 10px", color: "var(--dim)" }}
+            onClick={() => setFilters(EMPTY_FILTERS)}>
+            Clear all
+          </button>
+        )}
+      </div>
+
+      {/* chip row */}
+      <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
+        <button className="btn" data-on={filters.needsAction ? "1" : "0"}
+          style={{ fontSize: 11, padding: "5px 10px" }}
+          title="Only phones you can move forward right now"
+          onClick={() => set("needsAction", !filters.needsAction)}>
+          {filters.needsAction ? <CheckCircle2 size={11} /> : <Circle size={11} />}
+          Needs my action
+          <span style={{ opacity: 0.7, marginLeft: 3 }}>{actionable}</span>
+        </button>
+
+        <button className="btn" data-on={filters.lateOnly ? "1" : "0"}
+          style={{ fontSize: 11, padding: "5px 10px",
+            color: filters.lateOnly ? undefined : (lateCount ? "var(--bad)" : undefined) }}
+          onClick={() => set("lateOnly", !filters.lateOnly)}>
+          Late
+          <span style={{ opacity: 0.7, marginLeft: 3 }}>{lateCount}</span>
+        </button>
+
+        <button className="btn" data-on={filters.soonOnly ? "1" : "0"}
+          style={{ fontSize: 11, padding: "5px 10px" }}
+          onClick={() => set("soonOnly", !filters.soonOnly)}>
+          Launching ≤30d
+          <span style={{ opacity: 0.7, marginLeft: 3 }}>{soonCount}</span>
+        </button>
+
+        {brands.length > 1 && (
+          <select value={filters.brand} onChange={(e) => set("brand", e.target.value)}
+            style={{ fontSize: 11, padding: "5px 10px", width: "auto", minWidth: 110 }}>
+            <option value="">All brands</option>
+            {brands.map((b) => <option key={b} value={b}>{b}</option>)}
+          </select>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 /* ── 8. BOARD VIEW ───────────────────────────────────────────────
    One column per stage. Drag a card to move the model forward.     */
 
-function Board({ models, onOpen, onMove, onAdd }) {
+function Board({ models, allModels, onOpen, onMove, onAdd, onAdvance, role, compact, filters }) {
   const [dragging, setDragging] = useState(null);
-  const [over, setOver] = useState(null);
+  const [over, setOver]         = useState(null);
+  const [collapsed, setCollapsed] = useState({});   // { stageKey: true }
 
   const drop = (stageKey) => {
     if (dragging && dragging.stage !== stageKey) onMove(dragging.id, stageKey);
     setDragging(null); setOver(null);
   };
 
-  if (models.length === 0) return (
+  const toggleCol = (k) => setCollapsed((c) => ({ ...c, [k]: !c[k] }));
+
+  if (allModels.length === 0) return (
     <div className="card" style={{ textAlign: "center", padding: "48px 24px" }}>
       <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
       <div style={{ fontSize: 16, fontWeight: 640, marginBottom: 8 }}>Board is empty</div>
@@ -627,17 +786,57 @@ function Board({ models, onOpen, onMove, onAdd }) {
     </div>
   );
 
+  const anyFilter = filters.q || filters.needsAction || filters.lateOnly || filters.soonOnly || filters.brand;
+
+  if (models.length === 0) return (
+    <div className="card" style={{ textAlign: "center", padding: "40px 24px" }}>
+      <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>No phones match your filters</div>
+      <div style={{ fontSize: 13, color: "var(--dim)" }}>
+        {filters.needsAction
+          ? "Nothing is waiting on your role right now."
+          : "Try clearing the search or filter chips above."}
+      </div>
+    </div>
+  );
+
   return (
     <div className="board">
       {STAGES.map((stage) => {
-        const inThisStage = models.filter((m) => m.stage === stage.key);
+        const inThisStage = models.filter((m) => m.stage === stage.key).sort(byUrgency);
+        const totalHere   = allModels.filter((m) => m.stage === stage.key).length;
+        const isCollapsed = collapsed[stage.key];
+
+        /* collapsed column — a thin vertical strip */
+        if (isCollapsed) return (
+          <div className="col" key={stage.key}
+            style={{ minWidth: 46, maxWidth: 46, cursor: "pointer" }}
+            onClick={() => toggleCol(stage.key)}
+            title={`Expand ${stage.label}`}>
+            <div className="col-head" style={{ justifyContent: "center", padding: "10px 0" }}>
+              <span className="col-count">{inThisStage.length}</span>
+            </div>
+            <div style={{ writingMode: "vertical-rl", textOrientation: "mixed",
+              padding: "10px 0", fontSize: 11, color: "var(--dim)", textAlign: "center",
+              letterSpacing: 0.5 }}>
+              {stage.label}
+            </div>
+          </div>
+        );
+
         return (
           <div className="col" key={stage.key}>
             <div className="col-head">
               <span className="col-name">{stage.label}</span>
-              <span className="col-count">{inThisStage.length}</span>
+              <span className="col-count">
+                {anyFilter && inThisStage.length !== totalHere
+                  ? `${inThisStage.length}/${totalHere}`
+                  : inThisStage.length}
+              </span>
+              <button className="btn" title={`Collapse ${stage.label}`}
+                style={{ padding: "1px 5px", fontSize: 10, border: "none", marginLeft: 4 }}
+                onClick={() => toggleCol(stage.key)}>‹</button>
             </div>
-            <div className="col-hint">{stage.hint}</div>
+            {!compact && <div className="col-hint">{stage.hint}</div>}
             <div
               className="col-body"
               data-over={over === stage.key ? "1" : "0"}
@@ -645,27 +844,70 @@ function Board({ models, onOpen, onMove, onAdd }) {
               onDragLeave={() => setOver((o) => (o === stage.key ? null : o))}
               onDrop={() => drop(stage.key)}
             >
-              {inThisStage.map((m) => (
-                <div
-                  className="card pcard" key={m.id} draggable
-                  onDragStart={() => setDragging(m)}
-                  onDragEnd={() => { setDragging(null); setOver(null); }}
-                  onClick={() => onOpen(m.id)}
-                >
-                  <div className="row" style={{ alignItems: "flex-start" }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 11, color: "var(--dim)" }}>{m.brand}</div>
-                      <div style={{ fontSize: 13, fontWeight: 570, lineHeight: 1.2 }}>{m.name}</div>
+              {inThisStage.map((m) => {
+                const st = advanceStatus(m, role);
+                return (
+                  <div
+                    className="card pcard" key={m.id} draggable
+                    style={compact ? { padding: "8px 10px" } : undefined}
+                    onDragStart={() => setDragging(m)}
+                    onDragEnd={() => { setDragging(null); setOver(null); }}
+                    onClick={() => onOpen(m.id)}
+                  >
+                    {/* ── name row with quick-advance ── */}
+                    <div style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        {!compact && <div style={{ fontSize: 11, color: "var(--dim)" }}>{m.brand}</div>}
+                        <div style={{ fontSize: compact ? 12 : 13, fontWeight: 600,
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {compact ? `${m.brand} ${m.name}` : m.name}
+                        </div>
+                      </div>
+                      {st.next && (
+                        <button className="btn"
+                          title={st.ok ? `Move to ${st.next.label}` : st.reason}
+                          style={{ padding: "3px 7px", fontSize: 11, flexShrink: 0,
+                            opacity: st.ok ? 1 : 0.3,
+                            cursor: st.ok ? "pointer" : "not-allowed",
+                            borderColor: st.ok ? "var(--ok)" : undefined,
+                            color: st.ok ? "var(--ok)" : undefined }}
+                          onClick={(e) => { e.stopPropagation(); if (st.ok) onAdvance(m.id); }}>
+                          →
+                        </button>
+                      )}
                     </div>
+
+                    {/* ── meta row ── */}
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center",
+                      marginTop: compact ? 4 : 8, fontSize: 11 }}>
+                      {m.isLate && <Tag tone="bad">+{m.worstDelay}d</Tag>}
+                      {m.daysToLaunch != null && m.daysToLaunch >= 0 && m.daysToLaunch <= 30 && !m.isLate && (
+                        <Tag tone="warn">{m.daysToLaunch}d to launch</Tag>
+                      )}
+                      {!compact && <span style={{ color: "var(--dim)" }}>{showDate(m.launch)}</span>}
+                      {!compact && allSkus(m).length > 0 && (
+                        <span style={{ color: "var(--dim)" }}>· {allSkus(m).length} SKU</span>
+                      )}
+                      {compact && allSkus(m).length > 0 && (
+                        <span style={{ color: "var(--dim)" }}>{allSkus(m).length} SKU</span>
+                      )}
+                    </div>
+
+                    {/* ── blocked reason, full mode only ── */}
+                    {!compact && !st.ok && st.reason && st.next && (
+                      <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 5,
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {st.reason}
+                      </div>
+                    )}
                   </div>
-                  <div style={{ marginTop: 9 }}><Meter value={m.progress} tone={m.isLate ? "bad" : m.stage === "live" ? "ok" : undefined} /></div>
-                  <div className="row" style={{ marginTop: 7, fontSize: 11 }}>
-                    <span className="n" style={{ color: "var(--dim)" }}>{showDate(m.launch)}</span>
-                    {m.isLate && <span style={{ marginLeft: "auto", color: "var(--bad)" }}>{m.worstDelay}d late</span>}
-                  </div>
+                );
+              })}
+              {inThisStage.length === 0 && (
+                <div style={{ fontSize: 11, color: "var(--dim)", padding: "10px 4px", textAlign: "center" }}>
+                  {anyFilter && totalHere > 0 ? `${totalHere} hidden by filters` : "—"}
                 </div>
-              ))}
-              {!inThisStage.length && <div className="empty">Drop here</div>}
+              )}
             </div>
           </div>
         );
@@ -677,34 +919,118 @@ function Board({ models, onOpen, onMove, onAdd }) {
 
 /* ── 9. TABLE VIEW ─────────────────────────────────────────────── */
 
-function Table({ models, onOpen }) {
-  const sorted = [...models].sort((a, b) => new Date(a.launch) - new Date(b.launch));
+function Table({ models, allModels, onOpen, onAdvance, role, filters }) {
+  const [sortKey, setSortKey] = useState("urgency");
+  const [asc, setAsc]         = useState(true);
+
+  const flip = (key) => {
+    if (sortKey === key) setAsc((a) => !a);
+    else { setSortKey(key); setAsc(true); }
+  };
+
+  const sorted = useMemo(() => {
+    const list = [...models];
+    const dir = asc ? 1 : -1;
+    const cmp = {
+      urgency: byUrgency,
+      phone:   (a, b) => `${a.brand} ${a.name}`.localeCompare(`${b.brand} ${b.name}`),
+      segment: (a, b) => a.segment.localeCompare(b.segment),
+      launch:  (a, b) => new Date(a.launch) - new Date(b.launch),
+      stage:   (a, b) => a.index - b.index,
+      units:   (a, b) => a.units - b.units,
+    }[sortKey] || byUrgency;
+    return list.sort((a, b) => cmp(a, b) * dir);
+  }, [models, sortKey, asc]);
+
+  const Th = ({ label, sk, align }) => (
+    <th onClick={() => flip(sk)}
+      style={{ cursor: "pointer", userSelect: "none", textAlign: align, whiteSpace: "nowrap" }}
+      title={`Sort by ${label.toLowerCase()}`}>
+      {label}
+      <span style={{ opacity: sortKey === sk ? 0.9 : 0.22, marginLeft: 4, fontSize: 10 }}>
+        {sortKey === sk ? (asc ? "▲" : "▼") : "▲"}
+      </span>
+    </th>
+  );
+
+  const anyFilter = filters.q || filters.needsAction || filters.lateOnly || filters.soonOnly || filters.brand;
+
   return (
     <div className="card" style={{ padding: 0, overflowX: "auto" }}>
+      {anyFilter && (
+        <div style={{ padding: "9px 14px", fontSize: 11, color: "var(--dim)",
+          borderBottom: "1px solid var(--line)" }}>
+          Showing {sorted.length} of {allModels.length} phones
+        </div>
+      )}
       <table>
         <thead>
           <tr>
-            <th>Phone</th><th>Segment</th><th>Launch</th><th>Stage</th><th>Units</th><th>Status</th>
+            <Th label="Phone"   sk="phone" />
+            <Th label="Segment" sk="segment" />
+            <Th label="Launch"  sk="launch" />
+            <Th label="Stage"   sk="stage" />
+            <Th label="Units"   sk="units" />
+            <Th label="Status"  sk="urgency" />
+            <th style={{ width: 60, textAlign: "center" }}>Move</th>
           </tr>
         </thead>
         <tbody>
-          {sorted.map((m) => (
-            <tr key={m.id} onClick={() => onOpen(m.id)} tabIndex={0}
-                onKeyDown={(e) => e.key === "Enter" && onOpen(m.id)}>
-              <td>
-                <div style={{ fontWeight: 570 }}>{m.brand} {m.name}</div>
-                <div className="n" style={{ fontSize: 11, color: "var(--dim)" }}>{m.po || "no PO yet"}</div>
-              </td>
-              <td style={{ color: "var(--dim)", fontSize: 12 }}>{m.segment}</td>
-              <td className="n" style={{ fontSize: 12 }}>{showDate(m.launch)}</td>
-              <td style={{ fontSize: 12 }}>{STAGES[m.index].label}</td>
-              <td className="n" style={{ fontSize: 12 }}>{qty(m.units)}</td>
-              <td>{m.isLate ? <Tag tone="bad">{m.worstDelay}d late</Tag> : <Tag tone="ok">on time</Tag>}</td>
-            </tr>
-          ))}
+          {sorted.map((m) => {
+            const st = advanceStatus(m, role);
+            return (
+              <tr key={m.id} onClick={() => onOpen(m.id)} tabIndex={0}
+                  onKeyDown={(e) => e.key === "Enter" && onOpen(m.id)}>
+                <td>
+                  <div style={{ fontWeight: 570 }}>{m.brand} {m.name}</div>
+                  <div className="n" style={{ fontSize: 11, color: "var(--dim)" }}>
+                    {m.po || "no PO yet"}
+                    {allSkus(m).length > 0 && ` · ${allSkus(m).length} SKU`}
+                  </div>
+                </td>
+                <td style={{ color: "var(--dim)", fontSize: 12 }}>{m.segment}</td>
+                <td className="n" style={{ fontSize: 12 }}>
+                  {showDate(m.launch)}
+                  {m.daysToLaunch != null && m.daysToLaunch >= 0 && m.daysToLaunch <= 30 && (
+                    <div style={{ fontSize: 10, color: "var(--warn)" }}>{m.daysToLaunch}d away</div>
+                  )}
+                </td>
+                <td style={{ fontSize: 12 }}>{STAGES[m.index].label}</td>
+                <td className="n" style={{ fontSize: 12 }}>{qty(m.units)}</td>
+                <td>
+                  {m.isLate
+                    ? <Tag tone="bad">{m.worstDelay}d late</Tag>
+                    : st.ok
+                      ? <Tag tone="ok">ready to move</Tag>
+                      : <Tag>on time</Tag>}
+                  {!st.ok && st.reason && st.next && (
+                    <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 3 }}>{st.reason}</div>
+                  )}
+                </td>
+                <td style={{ textAlign: "center" }}>
+                  {st.next && (
+                    <button className="btn"
+                      title={st.ok ? `Move to ${st.next.label}` : st.reason}
+                      style={{ padding: "3px 8px", fontSize: 11,
+                        opacity: st.ok ? 1 : 0.3,
+                        cursor: st.ok ? "pointer" : "not-allowed",
+                        borderColor: st.ok ? "var(--ok)" : undefined,
+                        color: st.ok ? "var(--ok)" : undefined }}
+                      onClick={(e) => { e.stopPropagation(); if (st.ok) onAdvance(m.id); }}>
+                      →
+                    </button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
           {!sorted.length && (
-            <tr><td colSpan={8} style={{ textAlign: "center", padding: 36, color: "var(--dim)" }}>
-              No phones yet. Add the first one.
+            <tr><td colSpan={7} style={{ textAlign: "center", padding: 36, color: "var(--dim)" }}>
+              {allModels.length === 0
+                ? "No phones yet. Add the first one."
+                : filters.needsAction
+                  ? "Nothing is waiting on your role right now."
+                  : "No phones match your filters."}
             </td></tr>
           )}
         </tbody>
@@ -1639,64 +1965,18 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
             </button>
           )}
           {!isLast && (() => {
-            const next = STAGES[model.index + 1];
-            /* Role gate: can this role advance to the next stage? */
-            if (role && !ROLE_CAN_ADVANCE_TO[role]?.includes(next.key)) {
-              return (
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <button className="btn" style={{ opacity: 0.35, cursor: "not-allowed" }}>
-                    Move to {next.label} →
-                  </button>
-                  <span style={{ fontSize: 11, color: "var(--dim)" }}>
-                    {ROLES.find(r => r.key === role)?.label} cannot advance to {next.label}
-                  </span>
-                </div>
-              );
-            }
-            /* Gate: Planned → Ordered — every cover must have a SKU */
-            if (model.stage === "planned") {
-              const missingSkus = allSkus(model).filter((r) => !r.sku?.trim());
-              const noCovers    = allSkus(model).length === 0;
-              const blocked     = noCovers || missingSkus.length > 0;
-              return (
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <button className="btn" data-primary="1"
-                    style={{ opacity: blocked ? 0.4 : 1, cursor: blocked ? "not-allowed" : undefined }}
-                    onClick={() => !blocked && onAdvance(model.id)}>
-                    Move to {next.label} →
-                  </button>
-                  {noCovers && <span style={{ fontSize: 11, color: "var(--bad)" }}>Add SKUs in the Planned stage first</span>}
-                  {!noCovers && missingSkus.length > 0 && (
-                    <span style={{ fontSize: 11, color: "var(--bad)" }}>
-                      {missingSkus.length} SKU{missingSkus.length > 1 ? "s" : ""} still missing a code
-                    </span>
-                  )}
-                </div>
-              );
-            }
-            /* Gate: Received → Live — every cover must be confirmed */
-            if (model.stage === "received") {
-              const unconfirmed = allSkus(model).filter((r) => !isConfirmed(r));
-              const blocked     = unconfirmed.length > 0;
-              return (
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <button className="btn" data-primary="1"
-                    style={{ opacity: blocked ? 0.4 : 1, cursor: blocked ? "not-allowed" : undefined }}
-                    onClick={() => !blocked && onAdvance(model.id)}>
-                    Move to {next.label} →
-                  </button>
-                  {blocked && (
-                    <span style={{ fontSize: 11, color: "var(--bad)" }}>
-                      Confirm all covers received or not before going live
-                    </span>
-                  )}
-                </div>
-              );
-            }
+            const st = advanceStatus(model, role);
             return (
-              <button className="btn" data-primary="1" onClick={() => onAdvance(model.id)}>
-                Move to {next.label} →
-              </button>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <button className="btn" data-primary={st.ok ? "1" : undefined}
+                  style={{ opacity: st.ok ? 1 : 0.4, cursor: st.ok ? undefined : "not-allowed" }}
+                  onClick={() => st.ok && onAdvance(model.id)}>
+                  Move to {st.next.label} →
+                </button>
+                {!st.ok && st.reason && (
+                  <span style={{ fontSize: 11, color: "var(--bad)" }}>{st.reason}</span>
+                )}
+              </div>
             );
           })()}
           <button className="btn" onClick={onClose} style={{ marginLeft: "auto" }}>Close</button>
@@ -2571,6 +2851,8 @@ export default function App() {
   const [theme, setTheme]     = useState("dark");
   const [toast, setToast]     = useState(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [filters, setFilters] = useState(EMPTY_FILTERS);
+  const [compact, setCompact] = useState(false);
 
   /* ── load data from Supabase on mount & after login ── */
   const loadFromDB = async () => {
@@ -2606,6 +2888,12 @@ export default function App() {
 
   /* derive everything, every render — never stored, never stale */
   const models = useMemo(() => phones.map(derive), [phones]);
+
+  /* filtered + role-aware view of the phone list */
+  const visible = useMemo(
+    () => models.filter((mm) => passesFilters(mm, filters, role)),
+    [models, filters, role]
+  );
   const open = openId ? models.find((m) => m.id === openId) : null;
 
   /* move a phone to a stage and record the date it happened */
@@ -2855,9 +3143,22 @@ export default function App() {
           </div>
         </div>
 
+        {/* Search + filters — shown on Board and List only */}
+        {["board","table"].includes(view) && models.length > 0 && (
+          <FilterBar
+            filters={filters} setFilters={setFilters}
+            models={models} role={role}
+            compact={compact} setCompact={setCompact}
+            showDensity={view === "board"}
+          />
+        )}
+
         {view === "dashboard" && <Dashboard models={models} onOpen={setOpenId} onAdd={() => setAdding(true)} />}
-        {view === "board"     && <Board models={models} onOpen={setOpenId} onMove={moveTo} onAdd={() => setAdding(true)} />}
-        {view === "table"     && <Table models={models} onOpen={setOpenId} />}
+        {view === "board"     && <Board models={visible} allModels={models} onOpen={setOpenId} onMove={moveTo}
+                                  onAdd={() => setAdding(true)} onAdvance={advance} role={role}
+                                  compact={compact} filters={filters} />}
+        {view === "table"     && <Table models={visible} allModels={models} onOpen={setOpenId}
+                                  onAdvance={advance} role={role} filters={filters} />}
         {view === "reports"   && <Reports models={models} />}
       </div>
 
