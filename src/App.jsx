@@ -307,6 +307,101 @@ const CAN = {
   reset:       (r) => r === "admin",
 };
 
+
+/* ── DATABASE LAYER ──────────────────────────────────────────────
+   Supabase REST API called directly — no npm package required.
+   URL and anon key are stored in localStorage and managed through
+   the DB Setup screen (Admin only).                              */
+
+const DB_CONFIG_KEY = "proc_tracker_sb";
+
+function dbGetConfig() {
+  try { return JSON.parse(localStorage.getItem(DB_CONFIG_KEY) || "null"); }
+  catch { return null; }
+}
+function dbSaveConfig(url, key) {
+  localStorage.setItem(DB_CONFIG_KEY, JSON.stringify({ url: url.trim().replace(/\/$/, ""), key: key.trim() }));
+}
+function dbClearConfig() { localStorage.removeItem(DB_CONFIG_KEY); }
+
+function dbClient() {
+  const cfg = dbGetConfig();
+  if (!cfg?.url || !cfg?.key) return null;
+  const base = cfg.url + "/rest/v1";
+  const hdrs = {
+    "Content-Type":  "application/json",
+    "apikey":        cfg.key,
+    "Authorization": "Bearer " + cfg.key,
+    "Prefer":        "return=representation",
+  };
+  const req = async (method, path, body) => {
+    try {
+      const r = await fetch(base + path, { method, headers: hdrs, body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      const data = text ? JSON.parse(text) : null;
+      if (!r.ok) return { data: null, error: (data?.message || data?.hint || ("HTTP " + r.status)) };
+      return { data, error: null };
+    } catch(e) { return { data: null, error: e.message }; }
+  };
+  return {
+    get:    (p)    => req("GET",    p),
+    post:   (p, b) => req("POST",   p, b),
+    patch:  (p, b) => req("PATCH",  p, b),
+    del:    (p)    => req("DELETE", p),
+  };
+}
+
+/* phone row <-> app shape */
+const phoneToRow = (p) => ({
+  id: p.id, brand: p.brand, name: p.name, segment: p.segment,
+  launch: p.launch, stage: p.stage, po: p.po || null,
+  done: p.done || {}, skus: p.skus || [], sales_entries: p.salesEntries || [],
+});
+const rowToPhone = (r) => ({
+  id: r.id, brand: r.brand, name: r.name, segment: r.segment,
+  launch: r.launch, stage: r.stage, po: r.po,
+  done: r.done || {}, skus: r.skus || [], salesEntries: r.sales_entries || [],
+});
+
+/* user row <-> app shape (identical, just snake_case alias) */
+const userToRow = (u) => ({ id: u.id, name: u.name, role: u.role, pin: u.pin, avatar: u.avatar });
+
+async function dbPing() {
+  const c = dbClient(); if (!c) return { ok: false, error: "Not configured" };
+  const { error } = await c.get("/phones?limit=1");
+  return { ok: !error, error };
+}
+async function dbLoadPhones() {
+  const c = dbClient(); if (!c) return { data: null, error: "Not configured" };
+  const { data, error } = await c.get("/phones?order=id");
+  return { data: error ? null : (data || []).map(rowToPhone), error };
+}
+async function dbUpsertPhone(phone) {
+  const c = dbClient(); if (!c) return { error: "Not configured" };
+  return c.post("/phones?on_conflict=id", phoneToRow(phone));
+}
+async function dbDeletePhone(id) {
+  const c = dbClient(); if (!c) return { error: "Not configured" };
+  return c.del("/phones?id=eq." + id);
+}
+async function dbDeleteAllPhones() {
+  const c = dbClient(); if (!c) return { error: "Not configured" };
+  return c.del("/phones?id=gte.0");
+}
+async function dbLoadUsers() {
+  const c = dbClient(); if (!c) return { data: null, error: "Not configured" };
+  const { data, error } = await c.get("/users?order=created_at");
+  return { data: error ? null : data, error };
+}
+async function dbUpsertUser(user) {
+  const c = dbClient(); if (!c) return { error: "Not configured" };
+  return c.post("/users?on_conflict=id", userToRow(user));
+}
+async function dbDeleteUser(id) {
+  const c = dbClient(); if (!c) return { error: "Not configured" };
+  return c.del("/users?id=eq." + id);
+}
+
 /* ── 6. STYLES ───────────────────────────────────────────────────
    All colours are CSS variables set on .app. Change them in one
    place and the whole thing retheme.                               */
@@ -2253,6 +2348,96 @@ function UserManager({ users, onSave, onClose }) {
 }
 
 
+
+/* ── DB SETUP SCREEN — Admin only ───────────────────────────────
+   Shown when the app is not yet connected to a Supabase project.
+   Admin pastes the URL and anon key from the Supabase dashboard. */
+
+function DBSetupScreen({ onDone, onSkip }) {
+  const [url, setUrl]     = useState(dbGetConfig()?.url || "");
+  const [key, setKey]     = useState(dbGetConfig()?.key || "");
+  const [status, setStatus] = useState("idle");   // idle | testing | ok | error
+  const [errMsg, setErrMsg] = useState("");
+
+  const test = async () => {
+    if (!url.trim() || !key.trim()) return;
+    setStatus("testing"); setErrMsg("");
+    dbSaveConfig(url, key);
+    const { ok, error } = await dbPing();
+    if (ok) { setStatus("ok"); }
+    else { setStatus("error"); setErrMsg(error || "Could not reach Supabase. Check URL and key."); dbClearConfig(); }
+  };
+
+  const save = () => { dbSaveConfig(url, key); onDone(); };
+
+  return (
+    <div className="app" data-theme="dark" style={{ minHeight: "100vh", display: "flex",
+      flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+      <style>{CSS}</style>
+      <div style={{ width: "min(520px, 94vw)", display: "flex", flexDirection: "column", gap: 20 }}>
+        <div style={{ textAlign: "center" }}>
+          <Package size={28} style={{ color: "var(--accent)", marginBottom: 8 }} />
+          <h1 style={{ margin: "0 0 6px", fontSize: 22 }}>Connect to Supabase</h1>
+          <div className="sub" style={{ lineHeight: 1.6 }}>
+            Paste your project URL and anon key from<br />
+            <strong>Supabase → Project Settings → API</strong>
+          </div>
+        </div>
+
+        <div className="card" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <Field label="Project URL" hint="Looks like: https://xxxx.supabase.co">
+            <input value={url} placeholder="https://your-project.supabase.co"
+              style={{ fontFamily: "var(--mono)", fontSize: 12 }}
+              onChange={(e) => { setUrl(e.target.value); setStatus("idle"); }} />
+          </Field>
+          <Field label="Anon / Public key" hint="Starts with eyJ...">
+            <input type="password" value={key} placeholder="eyJhbGci..."
+              style={{ fontFamily: "var(--mono)", fontSize: 12 }}
+              onChange={(e) => { setKey(e.target.value); setStatus("idle"); }} />
+          </Field>
+
+          {status === "ok" && (
+            <div style={{ fontSize: 12, color: "var(--ok)", fontWeight: 600 }}>
+              ✓ Connected successfully
+            </div>
+          )}
+          {status === "error" && (
+            <div style={{ fontSize: 12, color: "var(--bad)" }}>{errMsg}</div>
+          )}
+          {status === "testing" && (
+            <div style={{ fontSize: 12, color: "var(--dim)" }}>Testing connection…</div>
+          )}
+
+          <div style={{ display: "flex", gap: 10 }}>
+            <button className="btn" onClick={test}
+              style={{ opacity: url.trim() && key.trim() ? 1 : 0.4 }}>
+              Test connection
+            </button>
+            {status === "ok" && (
+              <button className="btn" data-primary="1" onClick={save}>
+                Save and continue →
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="card" style={{ fontSize: 12, color: "var(--dim)", lineHeight: 1.7 }}>
+          <strong style={{ color: "var(--text)" }}>Setup steps:</strong><br />
+          1. Create a free Supabase project at <strong>supabase.com</strong><br />
+          2. Run <strong>schema.sql</strong> in the SQL Editor<br />
+          3. Go to <strong>Settings → API</strong> and copy the Project URL and anon key<br />
+          4. Paste both above and click Test connection<br />
+          <br />
+          <button className="btn" style={{ fontSize: 11 }} onClick={onSkip}>
+            Skip — use local memory only (data won't be saved)
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 /* ── LOGIN SCREEN ────────────────────────────────────────────────
    Shown when no session is active. Pick a user, enter PIN.
    Admin can also reach User Management from the nav bar.          */
@@ -2363,25 +2548,59 @@ function LoginScreen({ users, onLogin, theme, onTheme }) {
 
 
 export default function App() {
+  /* ── DB config state ── */
+  const [dbReady, setDbReady]   = useState(() => !!dbGetConfig());
+  const [dbOnline, setDbOnline] = useState(false);
+  const [dbError, setDbError]   = useState("");
+  const [showDbSetup, setShowDbSetup] = useState(false);
+
   /* ── session state ── */
   const [users, setUsers]     = useState(DEFAULT_USERS);
-  const [session, setSession] = useState(null);   // null = logged out
+  const [session, setSession] = useState(null);
   const [manageUsers, setManageUsers] = useState(false);
 
   const role = session?.role ?? "none";
   const currentUser = session;
 
-  const login  = (user) => setSession(user);
-  const logout = () => { setSession(null); setOpenId(null); setAdding(false); };
-
   /* ── app state ── */
   const [phones, setPhones] = useState(EMPTY);
-  const [openId, setOpenId] = useState(null);
-  const [adding, setAdding] = useState(false);
-  const [view, setView] = useState("dashboard");
-  const [theme, setTheme] = useState("dark");
-  const [toast, setToast] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [openId, setOpenId]   = useState(null);
+  const [adding, setAdding]   = useState(false);
+  const [view, setView]       = useState("dashboard");
+  const [theme, setTheme]     = useState("dark");
+  const [toast, setToast]     = useState(null);
   const [confirmReset, setConfirmReset] = useState(false);
+
+  /* ── load data from Supabase on mount & after login ── */
+  const loadFromDB = async () => {
+    if (!dbGetConfig()) return;
+    setLoading(true);
+    const [up, ph] = await Promise.all([dbLoadUsers(), dbLoadPhones()]);
+    if (up.error || ph.error) {
+      setDbOnline(false); setDbError(up.error || ph.error);
+    } else {
+      setDbOnline(true); setDbError("");
+      if (up.data?.length) setUsers(up.data);
+      if (ph.data)         setPhones(ph.data);
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { loadFromDB(); }, []);   // on mount
+
+  /* ── write-through helper: update local state + persist ── */
+  const persist = async (updatedPhone) => {
+    if (dbOnline) {
+      const { error } = await dbUpsertPhone(updatedPhone);
+      if (error) say("⚠ DB save failed: " + error);
+    }
+  };
+
+  const login = (user) => {
+    setSession(user);
+  };
+  const logout = () => { setSession(null); setOpenId(null); setAdding(false); };
 
   const say = (text) => { setToast(text); setTimeout(() => setToast((t) => (t === text ? null : t)), 2500); };
 
@@ -2390,13 +2609,17 @@ export default function App() {
   const open = openId ? models.find((m) => m.id === openId) : null;
 
   /* move a phone to a stage and record the date it happened */
-  const moveTo = (id, stageKey) => setPhones((list) => list.map((p) => {
-    if (p.id !== id) return p;
-    const done = { ...p.done };
-    /* mark every stage up to the new one as done */
-    STAGES.slice(0, stageIndex(stageKey) + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
-    return { ...p, stage: stageKey, done };
-  }));
+  const moveTo = (id, stageKey) => setPhones((list) => {
+    const next = list.map((p) => {
+      if (p.id !== id) return p;
+      const done = { ...p.done };
+      STAGES.slice(0, stageIndex(stageKey) + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
+      return { ...p, stage: stageKey, done };
+    });
+    const updated = next.find(p => p.id === id);
+    if (updated) persist(updated);
+    return next;
+  });
 
   const advance = (id) => {
     const m = models.find((x) => x.id === id);
@@ -2409,74 +2632,105 @@ export default function App() {
     const prev = STAGES[m.index - 1];
     if (!prev) return;
     /* moving back: strip the current stage's done date so the timeline is honest */
-    setPhones((list) => list.map((p) => {
-      if (p.id !== id) return p;
-      const done = { ...p.done };
-      delete done[m.stage];
-      return { ...p, stage: prev.key, done };
-    }));
+    setPhones((list) => {
+      const next = list.map((p) => {
+        if (p.id !== id) return p;
+        const done = { ...p.done };
+        delete done[m.stage];
+        return { ...p, stage: prev.key, done };
+      });
+      const updated = next.find(p => p.id === id);
+      if (updated) persist(updated);
+      return next;
+    });
     say(`${m.name} moved back to ${prev.label}`);
   };
 
   /* save edited phone details from ResearchEditor */
   const saveResearch = (id, edits) => {
-    setPhones((list) => list.map((p) => p.id !== id ? p : { ...p, ...edits }));
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : { ...p, ...edits });
+      const u = next.find(p => p.id === id); if (u) persist(u);
+      return next;
+    });
     say("Phone details updated");
   };
 
   /* save covers array from PlannedSKUEditor */
   const saveSKU = (id, skus) => {
-    setPhones((list) => list.map((p) => p.id !== id ? p : { ...p, skus }));
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : { ...p, skus });
+      const u = next.find(p => p.id === id); if (u) persist(u);
+      return next;
+    });
     say("SKUs saved");
   };
 
   /* update STP file status from ProductionSTP */
   /* STP status is set per SKU — rows is a map of rid -> status */
   const updateSTP = (id, statusByRid) => {
-    setPhones((list) => list.map((p) => p.id !== id ? p : {
-      ...p,
-      skus: p.skus.map((r) => statusByRid[r.rid] ? { ...r, stpStatus: statusByRid[r.rid] } : r),
-    }));
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : {
+        ...p, skus: p.skus.map((r) => statusByRid[r.rid] ? { ...r, stpStatus: statusByRid[r.rid] } : r),
+      });
+      const u = next.find(p => p.id === id); if (u) persist(u);
+      return next;
+    });
     say("STP status saved");
   };
 
   /* listingsByRid = { rid: { Flipkart: "Live", ... } } */
   const saveListings = (id, listingsByRid) => {
-    setPhones((list) => list.map((p) => p.id !== id ? p : {
-      ...p,
-      skus: p.skus.map((r) => listingsByRid[r.rid]
-        ? { ...r, listings: { ...r.listings, ...listingsByRid[r.rid] } } : r),
-    }));
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : {
+        ...p, skus: p.skus.map((r) => listingsByRid[r.rid]
+          ? { ...r, listings: { ...r.listings, ...listingsByRid[r.rid] } } : r),
+      });
+      const u = next.find(p => p.id === id); if (u) persist(u);
+      return next;
+    });
     say("Listing status saved");
   };
 
   /* PO number is typed by the buyer, never invented by the app */
   const savePO = (id, po) => {
-    setPhones((list) => list.map((p) => p.id !== id ? p : { ...p, po: po.trim() }));
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : { ...p, po: po.trim() });
+      const u = next.find(p => p.id === id); if (u) persist(u);
+      return next;
+    });
     say(po.trim() ? "PO number saved" : "PO number cleared");
   };
 
   /* save goods receipt rows from ReceivedChecker */
   const saveReceipt = (id, receiptRows) => {
-    setPhones((list) => list.map((p) => {
-      if (p.id !== id) return p;
-      return { ...p, skus: p.skus.map((row) => {
-        const r = receiptRows.find((rr) => rr.rid === row.rid);
-        return r ? { ...row, receivedQty: r.received, receiptState: r.state } : row;
-      }) };
-    }));
+    setPhones((list) => {
+      const next = list.map((p) => {
+        if (p.id !== id) return p;
+        return { ...p, skus: p.skus.map((row) => {
+          const r = receiptRows.find((rr) => rr.rid === row.rid);
+          return r ? { ...row, receivedQty: r.received, receiptState: r.state } : row;
+        }) };
+      });
+      const u = next.find(p => p.id === id); if (u) persist(u);
+      return next;
+    });
     say("Receipt saved");
   };
 
   const logSale = (id, entry) => {
-    setPhones((list) => list.map((p) => p.id !== id ? p : {
-      ...p,
-      salesEntries: [...(p.salesEntries || []), entry],
-    }));
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : {
+        ...p, salesEntries: [...(p.salesEntries || []), entry],
+      });
+      const u = next.find(p => p.id === id); if (u) persist(u);
+      return next;
+    });
     say("Sale logged");
   };
 
-  const resetAll = () => {
+  const resetAll = async () => {
+    if (dbOnline) await dbDeleteAllPhones();
     setPhones([]);
     setOpenId(null);
     setAdding(false);
@@ -2486,11 +2740,23 @@ export default function App() {
 
   const addPhone = (data) => {
     const id = Math.max(0, ...phones.map((p) => p.id)) + 1;
-    setPhones((list) => [...list, { ...data, id }]);
+    const newPhone = { ...data, id };
+    setPhones((list) => [...list, newPhone]);
+    if (dbOnline) dbUpsertPhone(newPhone).then(({ error }) => {
+      if (error) say("⚠ DB save failed: " + error);
+    });
     setAdding(false);
     setOpenId(id);
     say(`${data.brand} ${data.name} added and tracking`);
   };
+
+  /* ── DB setup flow: Admin must configure Supabase first ── */
+  if (showDbSetup && CAN.reset(role)) return (
+    <DBSetupScreen
+      onDone={() => { setShowDbSetup(false); setDbReady(true); loadFromDB(); }}
+      onSkip={() => setShowDbSetup(false)}
+    />
+  );
 
   /* ── show login screen when no session ── */
   if (!session) return (
@@ -2526,6 +2792,21 @@ export default function App() {
             <button className="btn" data-on={view === "reports" ? "1" : "0"} onClick={() => setView("reports")}>
               <FileText size={14} />Reports
             </button>
+            {/* DB status indicator */}
+            <div title={dbOnline ? "Database connected" : dbError || "No database configured"}
+              style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11,
+                color: dbOnline ? "var(--ok)" : "var(--warn)" }}>
+              <div style={{ width: 8, height: 8, borderRadius: "50%",
+                background: dbOnline ? "var(--ok)" : "var(--warn)" }} />
+              {dbOnline ? "DB live" : "Local only"}
+              {CAN.reset(role) && (
+                <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
+                  onClick={() => setShowDbSetup(true)} title="Configure database">
+                  ⚙
+                </button>
+              )}
+            </div>
+
             {/* Logged-in user badge */}
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <div style={{
@@ -2608,13 +2889,24 @@ export default function App() {
           </div>
         </>
       )}
+      {loading && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)",
+          zIndex: 80, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div className="card" style={{ padding: "24px 36px", fontSize: 14 }}>
+            Loading from database…
+          </div>
+        </div>
+      )}
       {manageUsers && CAN.manageUsers(role) && (
         <UserManager
           users={users}
-          onSave={(updated) => {
+          onSave={async (updated) => {
             setUsers(updated);
             const me = updated.find(u => u.id === session?.id);
             if (me) setSession(me);
+            if (dbOnline) {
+              await Promise.all(updated.map(dbUpsertUser));
+            }
             say("Users saved");
           }}
           onClose={() => setManageUsers(false)}
