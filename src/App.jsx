@@ -692,6 +692,20 @@ const CSS = `
 .app .kpi-label { font-size: 11px; color: var(--dim); letter-spacing: .03em; text-transform: uppercase; font-weight: 600; }
 .app .kpi-value { font-size: 30px; font-weight: 680; font-family: var(--mono); line-height: 1; }
 .app .kpi-sub   { font-size: 11px; color: var(--dim); line-height: 1.4; }
+.app .kpi[data-clickable] { cursor: pointer; transition: transform .12s ease, border-color .12s ease; }
+.app .kpi[data-clickable]:hover { transform: translateY(-2px); border-color: var(--accent); }
+.app .kpi[data-clickable]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.app .kpi-go { position: absolute; right: 12px; bottom: 9px; font-size: 13px;
+  color: var(--accent); opacity: 0; transition: opacity .12s ease; }
+.app .kpi[data-clickable]:hover .kpi-go { opacity: 1; }
+.app .funnel-row[data-clickable] { cursor: pointer; border-radius: 6px; }
+.app .funnel-row[data-clickable]:hover { background: var(--bg); }
+.app .mini-bar { background: var(--line); border-radius: 4px; height: 8px; overflow: hidden; }
+.app .mini-bar > div { height: 100%; border-radius: 4px; transition: width .3s ease; }
+.app .todo-row { display: flex; align-items: center; gap: 10px; padding: 9px 11px;
+  border: 1px solid var(--line); border-radius: 9px; cursor: pointer;
+  transition: border-color .12s ease, background .12s ease; }
+.app .todo-row:hover { border-color: var(--accent); background: var(--bg); }
 .app .kpi[data-tone="ok"]   { border-color: color-mix(in srgb, var(--ok)   40%, var(--line)); }
 .app .kpi[data-tone="ok"]   .kpi-value { color: var(--ok); }
 .app .kpi[data-tone="warn"] { border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
@@ -2239,25 +2253,32 @@ function productionReport(models, fmt) {
 
 
 /* ── KPI CARD ─────────────────────────────────────────────────── */
-function KPI({ label, value, sub, tone, onCSV, onXLS }) {
+function KPI({ label, value, sub, tone, onCSV, onXLS, onClick, hint }) {
+  const go = !!onClick;
   return (
-    <div className="kpi" data-tone={tone}>
+    <div className="kpi" data-tone={tone} data-clickable={go ? "1" : undefined}
+      onClick={go ? onClick : undefined}
+      title={go ? (hint || `Show ${label.toLowerCase()}`) : undefined}
+      role={go ? "button" : undefined} tabIndex={go ? 0 : undefined}
+      onKeyDown={go ? (e) => e.key === "Enter" && onClick() : undefined}>
       {(onCSV || onXLS) && (
         <div className="kpi-dl">
-          {onCSV && <button className="btn" onClick={onCSV} title="Download CSV">CSV</button>}
-          {onXLS && <button className="btn" onClick={onXLS} title="Download Excel">XLS</button>}
+          {onCSV && <button className="btn" onClick={(e) => { e.stopPropagation(); onCSV(); }} title="Download CSV">CSV</button>}
+          {onXLS && <button className="btn" onClick={(e) => { e.stopPropagation(); onXLS(); }} title="Download Excel">XLS</button>}
         </div>
       )}
       <div className="kpi-label">{label}</div>
       <div className="kpi-value">{value}</div>
       {sub && <div className="kpi-sub">{sub}</div>}
+      {go && <div className="kpi-go">→</div>}
     </div>
   );
 }
 
 
 /* ── DASHBOARD ─────────────────────────────────────────────────── */
-function Dashboard({ models, onOpen, onAdd }) {
+function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
+  const go = onNavigate || (() => {});
   const byStage   = (k) => models.filter((m) => m.stage === k);
   const late      = models.filter((m) => m.isLate);
   const live      = byStage("live");
@@ -2267,161 +2288,286 @@ function Dashboard({ models, onOpen, onAdd }) {
   const prod      = byStage("production");
   const received  = byStage("received");
 
-  const totalUnits    = models.reduce((s, m) => s + m.units, 0);
-  const liveUnits     = live.reduce((s, m) => s + m.units, 0);
-  const prodUnits     = prod.reduce((s, m) => s + m.units, 0);
-  const stpNotSent    = prod.filter((m) => allSkus(m).some((r) => !r.stpStatus || r.stpStatus === "Not Sent")).length;
-  const stpDone       = prod.filter((m) => allSkus(m).length && allSkus(m).every((r) => r.stpStatus === "Completed")).length;
-  const noCovers      = planned.filter((m) => allSkus(m).length === 0).length;
-  const missingSkus   = planned.filter((m) => allSkus(m).some((r) => !r.sku?.trim())).length;
-  const unconfRec     = received.filter((m) => allSkus(m).some((r) => !isConfirmed(r))).length;
-  const listable      = models.filter((m) => ["received","live"].includes(m.stage) && allSkus(m).length);
-  const fullyListed   = listable.filter((m) => allSkus(m).every(isFullyListed)).length;
-  const listBlocked   = listable.filter((m) => allSkus(m).some((r) => blockedCount(r) > 0)).length;
-  const launching14   = models.filter((m) => m.stage !== "live" && m.daysToLaunch >= 0 && m.daysToLaunch <= 14);
+  const totalUnits  = models.reduce((s, m) => s + m.units, 0);
+  const liveUnits   = live.reduce((s, m) => s + m.units, 0);
+  const stpNotSent  = prod.filter((m) => allSkus(m).some((r) => !r.stpStatus || r.stpStatus === "Not Sent")).length;
+  const stpDone     = prod.filter((m) => allSkus(m).length && allSkus(m).every((r) => r.stpStatus === "Completed")).length;
+  const noSkus      = planned.filter((m) => allSkus(m).length === 0).length;
+  const missingSkus = planned.filter((m) => allSkus(m).some((r) => !r.sku?.trim())).length;
+  const unconfRec   = received.filter((m) => allSkus(m).some((r) => !isConfirmed(r))).length;
+  const listable    = models.filter((m) => ["received","live"].includes(m.stage) && allSkus(m).length);
+  const fullyListed = listable.filter((m) => allSkus(m).every(isFullyListed)).length;
+  const listBlocked = listable.filter((m) => allSkus(m).some((r) => blockedCount(r) > 0)).length;
+  const launching14 = models.filter((m) => m.stage !== "live" && m.daysToLaunch >= 0 && m.daysToLaunch <= 14);
+  const soldUnits   = live.reduce((s, m) => s + m.sales.total, 0);
+  const revenue     = live.reduce((s, m) => s + m.sales.revenue, 0);
+  const noPO        = ordered.filter((m) => !m.po).length;
 
-  /* funnel max for % bar width */
-  const funnelMax = Math.max(1, models.length);
+  const funnelMax   = Math.max(1, ...STAGES.map((st) => byStage(st.key).length));
+  const problems    = models.flatMap(problemsOf);
+  const bad         = problems.filter((p) => p.type === "bad");
+  const warn        = problems.filter((p) => p.type !== "bad");
+  const actionable  = models.filter((m) => advanceStatus(m, role).ok);
+  const pendingSkus = listingQueue(models);
 
-  const problems = models.flatMap(problemsOf);
+  /* The to-do strip. Only rows with something in them are shown, so an
+     empty dashboard says "on track" rather than listing eight zeroes. */
+  const todos = [
+    { n: actionable.length,        label: "ready for you to move forward",      tone: "ok",   act: () => go("board",  { needsAction: true }) },
+    { n: late.length,              label: "running behind schedule",            tone: "bad",  act: () => go("table",  { lateOnly: true }) },
+    { n: launching14.length,       label: "launching within 14 days",           tone: "warn", act: () => go("table",  { soonOnly: true }) },
+    { n: missingSkus + noSkus,     label: "waiting on SKU codes",               tone: "warn", act: () => go("board",  {}) },
+    { n: noPO,                     label: "ordered with no PO number",          tone: "warn", act: () => go("orders", {}) },
+    { n: stpNotSent,               label: "STP file not sent yet",              tone: "warn", act: () => go("board",  {}) },
+    { n: unconfRec,                label: "delivery not confirmed",             tone: "warn", act: () => go("orders", {}) },
+    { n: pendingSkus.length,       label: "SKUs waiting on marketplace listing", tone: "warn", act: () => go("listing", {}) },
+  ].filter((t) => t.n > 0);
+
+  const toneColor = (t) => t === "bad" ? "var(--bad)" : t === "warn" ? "var(--warn)" : "var(--ok)";
+
+  if (models.length === 0) return (
+    <div className="card" style={{ textAlign: "center", padding: "48px 24px" }}>
+      <div style={{ fontSize: 32, marginBottom: 12 }}>📱</div>
+      <div style={{ fontSize: 17, fontWeight: 640, marginBottom: 8 }}>No phones tracked yet</div>
+      <div style={{ fontSize: 13, color: "var(--dim)", marginBottom: 20, lineHeight: 1.6,
+        maxWidth: 360, marginLeft: "auto", marginRight: "auto" }}>
+        Click <strong>Add phone</strong> to start tracking your first new model.
+        Every phone moves through Research → Planned → Ordered → Production → Received → Live.
+      </div>
+      <button className="btn" data-primary="1" onClick={onAdd}>
+        <Plus size={14} />Add your first phone
+      </button>
+    </div>
+  );
 
   return (
     <div>
-      {/* ── empty state ── */}
-      {models.length === 0 && (
-        <div className="card" style={{ textAlign: "center", padding: "48px 24px", marginBottom: 20 }}>
-          <div style={{ fontSize: 32, marginBottom: 12 }}>📱</div>
-          <div style={{ fontSize: 17, fontWeight: 640, marginBottom: 8 }}>No phones tracked yet</div>
-          <div style={{ fontSize: 13, color: "var(--dim)", marginBottom: 20, lineHeight: 1.6, maxWidth: 360, margin: "0 auto 20px" }}>
-            Click <strong>Add phone</strong> to start tracking your first new model.
-            Every phone moves through Research → Planned → Ordered → Production → Received → Live.
+      {/* ══ WHAT NEEDS DOING ══ */}
+      <h2>What needs doing</h2>
+      <div className="card" style={{ marginBottom: 20 }}>
+        {todos.length === 0 ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13 }}>
+            <CheckCircle2 size={16} style={{ color: "var(--ok)" }} />
+            Everything is on track — nothing is blocked, late, or waiting.
           </div>
-          <button className="btn" data-primary="1" onClick={onAdd}>
-            <Plus size={14} />Add your first phone
-          </button>
-        </div>
-      )}
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(250px, 1fr))", gap: 9 }}>
+            {todos.map((t, i) => (
+              <div className="todo-row" key={i} onClick={t.act} role="button" tabIndex={0}
+                onKeyDown={(e) => e.key === "Enter" && t.act()}>
+                <span className="n" style={{ fontSize: 19, fontWeight: 700, color: toneColor(t.tone),
+                  minWidth: 30, textAlign: "right" }}>{t.n}</span>
+                <span style={{ fontSize: 12, flex: 1, lineHeight: 1.35 }}>{t.label}</span>
+                <span style={{ color: "var(--dim)", fontSize: 13 }}>→</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
-      {/* ── 10 KPI cards ── */}
-      {models.length > 0 && <div style={{ marginBottom: 6 }}>
-        <h2>Key numbers</h2>
-      </div>}
-      {models.length > 0 && <div className="kpi-grid">
-        <KPI label="Phones tracked"   value={models.length}   sub="across all stages" />
-        <KPI label="Research"         value={research.length} sub={research.length ? research.map(m=>m.name).join(", ").slice(0,40) : "None yet"} />
-        <KPI label="Planned"          value={planned.length}
-          tone={noCovers > 0 ? "warn" : planned.length > 0 ? "ok" : undefined}
-          sub={noCovers > 0 ? `${noCovers} need covers added` : missingSkus > 0 ? `${missingSkus} missing SKU` : planned.length > 0 ? "All have SKUs" : "None yet"}
+      {/* ══ KPI CARDS ══ */}
+      <h2>Key numbers</h2>
+      <div className="kpi-grid">
+        <KPI label="Phones tracked" value={models.length} sub="across all stages"
+          onClick={() => go("table", {})} hint="Open the full list" />
+
+        <KPI label="Research" value={research.length}
+          sub={research.length ? research.map(m=>m.name).join(", ").slice(0,40) : "None yet"}
+          onClick={() => go("board", {})} />
+
+        <KPI label="Planned" value={planned.length}
+          tone={noSkus > 0 || missingSkus > 0 ? "warn" : planned.length ? "ok" : undefined}
+          sub={noSkus > 0 ? `${noSkus} need SKUs added`
+             : missingSkus > 0 ? `${missingSkus} missing a code`
+             : planned.length ? "All have SKUs" : "None yet"}
+          onClick={() => go("board", {})}
           onCSV={planned.length ? () => plannedReport(models, "csv") : undefined}
           onXLS={planned.length ? () => plannedReport(models, "excel") : undefined} />
-        <KPI label="Ordered"          value={ordered.length}
-          tone={ordered.length > 0 ? "accent" : undefined}
-          sub={ordered.length ? `${ordered.reduce((s,m)=>s+allSkus(m).length,0)} SKUs on order` : "None yet"}
+
+        <KPI label="Ordered" value={ordered.length}
+          tone={noPO > 0 ? "warn" : ordered.length ? "accent" : undefined}
+          sub={noPO > 0 ? `${noPO} with no PO number`
+             : ordered.length ? `${ordered.reduce((s,m)=>s+allSkus(m).length,0)} SKUs on order` : "None yet"}
+          onClick={() => go("orders", {})} hint="Open purchase orders"
           onCSV={ordered.length ? () => orderedReport(models, "csv") : undefined}
           onXLS={ordered.length ? () => orderedReport(models, "excel") : undefined} />
-        <KPI label="In production"    value={prod.length}
-          tone={stpNotSent > 0 ? "warn" : prod.length > 0 ? "ok" : undefined}
+
+        <KPI label="In production" value={prod.length}
+          tone={stpNotSent > 0 ? "warn" : prod.length ? "ok" : undefined}
           sub={prod.length ? (stpNotSent > 0 ? `${stpNotSent} STP not sent` : `${stpDone}/${prod.length} STP done`) : "None yet"}
+          onClick={() => go("board", {})}
           onCSV={prod.length ? () => productionReport(models, "csv") : undefined}
           onXLS={prod.length ? () => productionReport(models, "excel") : undefined} />
-        <KPI label="Received"         value={received.length}
-          tone={unconfRec > 0 ? "warn" : received.length > 0 ? "ok" : undefined}
-          sub={received.length ? (unconfRec > 0 ? `${unconfRec} unconfirmed` : "All confirmed") : "None yet"} />
-        <KPI label="Live & selling"   value={live.length}  tone={live.length > 0 ? "ok" : undefined}
-          sub={live.length ? `${qty(liveUnits)} units in market` : "Nothing live yet"} />
-        <KPI label="Units sold"
-             value={qty(models.filter(m=>m.stage==="live").reduce((s,m)=>s+m.sales.total,0))}
-             sub={(() => {
-               const rev = models.filter(m=>m.stage==="live").reduce((s,m)=>s+m.sales.revenue,0);
-               return rev > 0 ? "₹"+Math.round(rev).toLocaleString("en-IN")+" revenue" : "Live phones only";
-             })()}
-             tone={models.some(m=>m.stage==="live"&&m.sales.total>0) ? "ok" : undefined} />
-        <KPI label="Fully listed"      value={fullyListed}
-             tone={listable.length && fullyListed === listable.length ? "ok" : listBlocked ? "bad" : undefined}
-             sub={listable.length
-               ? `of ${listable.length} ready${listBlocked ? ` · ${listBlocked} blocked` : ""}`
-               : "None ready yet"} />
-        <KPI label="Running late"     value={late.length}  tone={late.length > 0 ? "bad" : "ok"}
-          sub={late.length > 0 ? `${late.map(m=>m.name).join(", ").slice(0,40)}` : "All on time"} />
-        <KPI label="Launching ≤ 14d"  value={launching14.length}
-          tone={launching14.length > 0 ? "warn" : undefined}
-          sub={launching14.length ? launching14.map(m=>`${m.name} in ${m.daysToLaunch}d`).join(", ").slice(0,50) : "None urgent"} />
-        <KPI label="Units in pipeline" value={qty(totalUnits)} tone="accent"
-          sub={liveUnits ? `${qty(liveUnits)} live · ${qty(totalUnits - liveUnits)} in pipeline` : "No live yet"} />
-      </div>}
 
-      {/* ── pipeline funnel ── */}
-      {models.length > 0 && <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 20 }}>
+        <KPI label="Received" value={received.length}
+          tone={unconfRec > 0 ? "warn" : received.length ? "ok" : undefined}
+          sub={received.length ? (unconfRec > 0 ? `${unconfRec} unconfirmed` : "All confirmed") : "None yet"}
+          onClick={() => go("orders", {})} hint="Open receiving" />
+
+        <KPI label="Live & selling" value={live.length} tone={live.length ? "ok" : undefined}
+          sub={live.length ? `${qty(liveUnits)} units in market` : "Nothing live yet"}
+          onClick={() => go("board", {})} />
+
+        <KPI label="Units sold" value={qty(soldUnits)}
+          tone={soldUnits > 0 ? "ok" : undefined}
+          sub={revenue > 0 ? "₹" + Math.round(revenue).toLocaleString("en-IN") + " revenue" : "Live phones only"}
+          onClick={() => go("reports", {})} hint="Open the sales report" />
+
+        <KPI label="Fully listed" value={fullyListed}
+          tone={listable.length && fullyListed === listable.length ? "ok" : listBlocked ? "bad" : "warn"}
+          sub={listable.length
+            ? `of ${listable.length} ready${listBlocked ? ` · ${listBlocked} blocked` : ""}`
+            : "None ready yet"}
+          onClick={() => go("listing", {})} hint="Open the listing queue" />
+
+        <KPI label="Running late" value={late.length} tone={late.length ? "bad" : "ok"}
+          sub={late.length ? late.map(m=>m.name).join(", ").slice(0,40) : "All on time"}
+          onClick={() => go("table", { lateOnly: true })} hint="Show only late models" />
+
+        <KPI label="Launching in 14d" value={launching14.length}
+          tone={launching14.length ? "warn" : undefined}
+          sub={launching14.length ? launching14.map(m=>`${m.name} in ${m.daysToLaunch}d`).join(", ").slice(0,50) : "None urgent"}
+          onClick={() => go("table", { soonOnly: true })} hint="Show upcoming launches" />
+
+        <KPI label="Units in pipeline" value={qty(totalUnits)} tone="accent"
+          sub={liveUnits ? `${qty(liveUnits)} live · ${qty(totalUnits - liveUnits)} still coming` : "Nothing live yet"}
+          onClick={() => go("reports", {})} />
+      </div>
+
+      {/* ══ PIPELINE · MARKETPLACE · SEGMENT ══ */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+        gap: 14, marginBottom: 20 }}>
+
         <div className="card">
-          <h2>Pipeline funnel</h2>
+          <h2>Pipeline — click a stage</h2>
           <div className="funnel">
             {STAGES.map((st) => {
-              const n = byStage(st.key).length;
+              const list     = byStage(st.key);
+              const units    = list.reduce((t, m) => t + m.units, 0);
+              const lateHere = list.filter((m) => m.isLate).length;
               return (
-                <div className="funnel-row" key={st.key}>
+                <div className="funnel-row" key={st.key} data-clickable="1" role="button" tabIndex={0}
+                  title={`${list.length} at ${st.label}${units ? ` · ${qty(units)} units` : ""}${lateHere ? ` · ${lateHere} late` : ""}`}
+                  onClick={() => go("board", {})}
+                  onKeyDown={(e) => e.key === "Enter" && go("board", {})}>
                   <span style={{ color: "var(--dim)", fontSize: 12 }}>{st.label}</span>
                   <div style={{ background: "var(--line)", borderRadius: 4, height: 18, overflow: "hidden" }}>
-                    <div className="funnel-bar" style={{ width: n ? (n / funnelMax) * 100 + "%" : "0%" }} />
+                    <div className="funnel-bar"
+                      style={{ width: list.length ? (list.length / funnelMax) * 100 + "%" : "0%",
+                        background: lateHere ? "var(--bad)" : undefined }} />
                   </div>
-                  <span className="funnel-n">{n}</span>
+                  <span className="funnel-n">{list.length}</span>
                 </div>
               );
             })}
           </div>
+          <div style={{ fontSize: 11, color: "var(--dim)", marginTop: 10, lineHeight: 1.5 }}>
+            Red bars contain late models. {qty(totalUnits)} units across the pipeline.
+          </div>
         </div>
 
-        {/* ── segment breakdown ── */}
+        <div className="card">
+          <h2>Marketplace listing</h2>
+          {listable.length === 0 ? (
+            <div style={{ fontSize: 13, color: "var(--dim)" }}>
+              Nothing in the warehouse yet — listing starts once stock arrives.
+            </div>
+          ) : (
+            <>
+              <div style={{ display: "flex", flexDirection: "column", gap: 11 }}>
+                {MARKETPLACES.map((mp) => {
+                  const allR    = listable.flatMap(allSkus);
+                  const liveN   = allR.filter((r) => r.listings?.[mp] === "Live").length;
+                  const blocked = allR.filter((r) => r.listings?.[mp] === "Blocked").length;
+                  const pct     = allR.length ? Math.round((liveN / allR.length) * 100) : 0;
+                  return (
+                    <div key={mp}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                        <span>{mp}{blocked > 0 && <span style={{ color: "var(--bad)" }}> · {blocked} blocked</span>}</span>
+                        <span className="n" style={{ color: "var(--dim)" }}>{liveN}/{allR.length}</span>
+                      </div>
+                      <div className="mini-bar">
+                        <div style={{ width: pct + "%",
+                          background: pct === 100 ? "var(--ok)" : blocked ? "var(--bad)" : "var(--accent)" }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <button className="btn" style={{ marginTop: 14, fontSize: 11, padding: "5px 10px" }}
+                onClick={() => go("listing", {})}>
+                Open listing queue{pendingSkus.length ? ` · ${pendingSkus.length} pending` : ""}
+              </button>
+            </>
+          )}
+        </div>
+
         <div className="card">
           <h2>By segment</h2>
           <div className="funnel">
             {["Budget", "Mid Range", "Premium", "Flagship"].map((seg) => {
-              const n = models.filter((m) => m.segment === seg).length;
+              const list   = models.filter((m) => m.segment === seg);
+              const segMax = Math.max(1, ...["Budget","Mid Range","Premium","Flagship"]
+                .map((x) => models.filter((m) => m.segment === x).length));
               return (
-                <div className="funnel-row" key={seg}>
+                <div className="funnel-row" key={seg} data-clickable="1" role="button" tabIndex={0}
+                  title={`${list.length} ${seg} phones`}
+                  onClick={() => go("table", {})}
+                  onKeyDown={(e) => e.key === "Enter" && go("table", {})}>
                   <span style={{ color: "var(--dim)", fontSize: 12 }}>{seg}</span>
                   <div style={{ background: "var(--line)", borderRadius: 4, height: 18, overflow: "hidden" }}>
-                    <div className="funnel-bar" style={{ width: n ? (n / funnelMax) * 100 + "%" : "0%", background: "var(--ok)" }} />
+                    <div className="funnel-bar" style={{ width: list.length ? (list.length / segMax) * 100 + "%" : "0%" }} />
                   </div>
-                  <span className="funnel-n">{n}</span>
+                  <span className="funnel-n">{list.length}</span>
                 </div>
               );
             })}
           </div>
         </div>
-      </div>}
+      </div>
 
-      {/* ── alerts ── */}
-      {models.length > 0 && problems.length > 0 && (
-        <div className="card">
-          <h2>Needs attention — {problems.length} item{problems.length !== 1 ? "s" : ""}</h2>
-          <div style={{ display: "grid", gap: 8 }}>
-            {problems.map((p, i) => (
-              <div key={i} className="row" style={{ cursor: "pointer", padding: "6px 0",
-                borderBottom: i < problems.length - 1 ? "1px solid var(--line)" : "none" }}
-                onClick={() => onOpen(p.model.id)}>
-                <AlertTriangle size={14}
-                  style={{ color: p.type === "bad" ? "var(--bad)" : "var(--warn)", flex: "0 0 14px" }} />
-                <span style={{ fontWeight: 570, fontSize: 13 }}>{p.model.brand} {p.model.name}</span>
-                <Tag tone={p.type}>{STAGES[p.model.index].label}</Tag>
-                <span style={{ color: "var(--dim)", fontSize: 13 }}>— {p.text}</span>
+      {/* ══ ALERTS ══ */}
+      {problems.length > 0 && (
+        <div>
+          <h2>
+            Needs attention — {problems.length}
+            {bad.length > 0 && <span style={{ color: "var(--bad)", fontWeight: 500, fontSize: 13 }}> · {bad.length} urgent</span>}
+          </h2>
+          <div className="card" style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+            {[...bad, ...warn].slice(0, 25).map((p, i) => (
+              <div key={i} className="todo-row" onClick={() => onOpen(p.model.id)}
+                role="button" tabIndex={0}
+                onKeyDown={(e) => e.key === "Enter" && onOpen(p.model.id)}>
+                <AlertTriangle size={13} style={{ color: p.type === "bad" ? "var(--bad)" : "var(--warn)", flexShrink: 0 }} />
+                <span style={{ fontSize: 12, fontWeight: 600, minWidth: 0,
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {p.model.brand} {p.model.name}
+                </span>
+                <span style={{ fontSize: 12, color: "var(--dim)", flex: 1, minWidth: 0,
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {p.text}
+                </span>
+                <Tag>{STAGES[p.model.index].label}</Tag>
               </div>
             ))}
+            {problems.length > 25 && (
+              <div style={{ fontSize: 11, color: "var(--dim)", textAlign: "center", paddingTop: 4 }}>
+                + {problems.length - 25} more
+              </div>
+            )}
           </div>
         </div>
       )}
-      {models.length > 0 && problems.length === 0 && (
-        <div className="card" style={{ borderColor: "color-mix(in srgb, var(--ok) 40%, var(--line))" }}>
-          <div style={{ display: "flex", gap: 10, alignItems: "center", fontSize: 13 }}>
-            <CheckCircle2 size={16} style={{ color: "var(--ok)" }} />
-            <span>Everything is on track. No alerts to show.</span>
-          </div>
+
+      {problems.length === 0 && (
+        <div className="card" style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13 }}>
+          <CheckCircle2 size={16} style={{ color: "var(--ok)" }} />
+          No alerts — every model is on schedule and unblocked.
         </div>
       )}
     </div>
   );
 }
-
-
 
 
 
@@ -3513,6 +3659,13 @@ export default function App() {
   /* how many SKUs the catalog team still owes — drives the nav badge */
   const pendingListings = useMemo(() => listingQueue(models).length, [models]);
 
+  /* Dashboard click-through: jump to a view with filters pre-applied */
+  const navigate = (nextView, filterPatch) => {
+    setFilters({ ...EMPTY_FILTERS, ...(filterPatch || {}) });
+    setView(nextView);
+    setOpenId(null);
+  };
+
   const visible = useMemo(
     () => models.filter((mm) => passesFilters(mm, filters, role)),
     [models, filters, role]
@@ -3829,7 +3982,8 @@ export default function App() {
           />
         )}
 
-        {view === "dashboard" && <Dashboard models={models} onOpen={setOpenId} onAdd={() => setAdding(true)} />}
+        {view === "dashboard" && <Dashboard models={models} onOpen={setOpenId} onAdd={() => setAdding(true)}
+                                  onNavigate={navigate} role={role} />}
         {view === "board"     && <Board models={visible} allModels={models} onOpen={setOpenId} onMove={moveTo}
                                   onAdd={() => setAdding(true)} onAdvance={advance} role={role}
                                   compact={compact} filters={filters} />}
