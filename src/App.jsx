@@ -244,6 +244,13 @@ function problemsOf(model) {
   if (model.stage === "live" && allSkus(model).some((r) => !isFullyListed(r)))
     push("warn", `Live but not fully listed — ${allSkus(model).filter((r) => !isFullyListed(r)).length} SKU(s) incomplete`);
 
+  /* Sitting in the warehouse waiting on the catalog team */
+  if (model.stage === "received") {
+    const pending = pendingMarketplaces(model);
+    if (pending.length && allSkus(model).every(isConfirmed))
+      push("warn", `Waiting on catalog — not live on ${pending.join(", ")}`);
+  }
+
   return ps;
 }
 
@@ -324,8 +331,31 @@ function gateBlock(model) {
   if (model.stage === "received") {
     const unconf = allSkus(model).filter((r) => !isConfirmed(r));
     if (unconf.length) return `${unconf.length} SKU${unconf.length > 1 ? "s" : ""} not confirmed`;
+    /* Catalog gate: nothing goes Live until every SKU is live on every
+       marketplace. The message names the platforms still outstanding. */
+    const pending = pendingMarketplaces(model);
+    if (pending.length) return `Not live on ${pending.join(", ")}`;
   }
   return null;
+}
+
+/* Which marketplaces still have at least one SKU not Live */
+function pendingMarketplaces(model) {
+  return MARKETPLACES.filter((mp) =>
+    allSkus(model).some((r) => r.listings?.[mp] !== "Live"));
+}
+
+/* Flat list of every SKU still waiting on the catalog team,
+   with the marketplaces each one is missing. Drives the queue + badge. */
+function listingQueue(models) {
+  const rows = [];
+  models.filter((m) => ["received", "live"].includes(m.stage)).forEach((m) => {
+    allSkus(m).forEach((r) => {
+      const missing = MARKETPLACES.filter((mp) => r.listings?.[mp] !== "Live");
+      if (missing.length) rows.push({ model: m, sku: r, missing });
+    });
+  });
+  return rows;
 }
 
 function advanceStatus(model, role) {
@@ -2393,6 +2423,333 @@ function Dashboard({ models, onOpen, onAdd }) {
 
 
 
+
+
+/* ── CATALOG LISTING QUEUE ───────────────────────────────────────
+   Everything the catalog team still has to do, SKU by SKU, with the
+   exact marketplaces each SKU is missing. Nothing reaches Live until
+   this queue is clear for that model.
+   ─────────────────────────────────────────────────────────────── */
+
+function CatalogQueue({ models, onSetListing, onOpen, canEdit }) {
+  const [filterMp, setFilterMp] = useState("");   // "" = all marketplaces
+  const queue = listingQueue(models);
+
+  const shown = filterMp
+    ? queue.filter((row) => row.missing.includes(filterMp))
+    : queue;
+
+  /* per-marketplace outstanding counts */
+  const perMp = Object.fromEntries(MARKETPLACES.map((mp) =>
+    [mp, queue.filter((r) => r.missing.includes(mp)).length]));
+
+  /* group the queue by model for display */
+  const byModel = {};
+  shown.forEach((row) => { (byModel[row.model.id] ||= { model: row.model, rows: [] }).rows.push(row); });
+  const groups = Object.values(byModel).sort((a, b) => byUrgency(a.model, b.model));
+
+  const setOne = (model, sku, mp, value) =>
+    onSetListing(model.id, { [sku.rid]: { ...sku.listings, [mp]: value } });
+
+  const goLiveAll = (model, rows) => {
+    const patch = {};
+    rows.forEach(({ sku }) => {
+      patch[sku.rid] = Object.fromEntries(MARKETPLACES.map((mp) => [mp, "Live"]));
+    });
+    onSetListing(model.id, patch);
+  };
+
+  const goLiveMarketplace = (mp) => {
+    /* mark this one marketplace live across every outstanding SKU */
+    const byM = {};
+    queue.filter((r) => r.missing.includes(mp)).forEach(({ model, sku }) => {
+      (byM[model.id] ||= {})[sku.rid] = { ...sku.listings, [mp]: "Live" };
+    });
+    Object.entries(byM).forEach(([id, patch]) => onSetListing(+id, patch));
+  };
+
+  const exportQueue = (fmt) => {
+    const headers = ["Brand", "Model", "SKU", "Material", ...MARKETPLACES, "Missing on"];
+    const rows = queue.map(({ model, sku, missing }) => [
+      model.brand, model.name, sku.sku || "", sku.material || "",
+      ...MARKETPLACES.map((mp) => sku.listings?.[mp] || "Not listed"),
+      missing.join(" / "),
+    ]);
+    downloadReport("Catalog_pending_listing", headers, rows, fmt);
+  };
+
+  if (!queue.length) return (
+    <div>
+      <h2>Listing queue</h2>
+      <div className="card" style={{ textAlign: "center", padding: "40px 24px" }}>
+        <div style={{ fontSize: 28, marginBottom: 10 }}>✓</div>
+        <div style={{ fontSize: 15, fontWeight: 620, marginBottom: 6 }}>Nothing pending</div>
+        <div style={{ fontSize: 13, color: "var(--dim)" }}>
+          Every SKU in the warehouse is live on all {MARKETPLACES.length} marketplaces.
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      <h2>Listing queue — {queue.length} SKU{queue.length > 1 ? "s" : ""} pending</h2>
+      <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
+        These SKUs are in the warehouse but not yet live everywhere.
+        A model can't move to Live until its rows here are clear.
+      </div>
+
+      {/* marketplace filter + bulk actions */}
+      <div className="card" style={{ marginBottom: 14, display: "flex", gap: 8,
+        flexWrap: "wrap", alignItems: "center" }}>
+        <button className="btn" data-on={filterMp === "" ? "1" : "0"}
+          style={{ fontSize: 11, padding: "5px 10px" }}
+          onClick={() => setFilterMp("")}>
+          All <span style={{ opacity: 0.7, marginLeft: 3 }}>{queue.length}</span>
+        </button>
+        {MARKETPLACES.map((mp) => (
+          <button key={mp} className="btn" data-on={filterMp === mp ? "1" : "0"}
+            style={{ fontSize: 11, padding: "5px 10px",
+              opacity: perMp[mp] ? 1 : 0.45 }}
+            onClick={() => setFilterMp(filterMp === mp ? "" : mp)}>
+            {mp} <span style={{ opacity: 0.7, marginLeft: 3 }}>{perMp[mp]}</span>
+          </button>
+        ))}
+        <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+          {canEdit && filterMp && perMp[filterMp] > 0 && (
+            <button className="btn" style={{ fontSize: 11, padding: "5px 10px", color: "var(--ok)" }}
+              onClick={() => goLiveMarketplace(filterMp)}>
+              Mark all {perMp[filterMp]} live on {filterMp}
+            </button>
+          )}
+          <button className="btn" style={{ fontSize: 11, padding: "5px 10px" }}
+            onClick={() => exportQueue("csv")}>↓ CSV</button>
+          <button className="btn" style={{ fontSize: 11, padding: "5px 10px" }}
+            onClick={() => exportQueue("excel")}>↓ Excel</button>
+        </span>
+      </div>
+
+      {/* one card per model */}
+      {groups.map(({ model, rows }) => (
+        <div className="card" key={model.id} style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+            <span style={{ fontWeight: 620, fontSize: 14, cursor: "pointer" }}
+              onClick={() => onOpen(model.id)}>
+              {model.brand} {model.name}
+            </span>
+            <Tag>{rows.length} SKU{rows.length > 1 ? "s" : ""} pending</Tag>
+            {model.isLate && <Tag tone="bad">{model.worstDelay}d late</Tag>}
+            {model.daysToLaunch != null && model.daysToLaunch >= 0 && model.daysToLaunch <= 14 && (
+              <Tag tone="warn">launches in {model.daysToLaunch}d</Tag>
+            )}
+            {canEdit && (
+              <button className="btn" style={{ marginLeft: "auto", fontSize: 11,
+                padding: "4px 9px", color: "var(--ok)" }}
+                onClick={() => goLiveAll(model, rows)}>
+                Mark all live
+              </button>
+            )}
+          </div>
+
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr>
+                <th style={{ minWidth: 150 }}>SKU</th>
+                <th style={{ minWidth: 120 }}>Material</th>
+                {MARKETPLACES.map((mp) => (
+                  <th key={mp} style={{ textAlign: "center", minWidth: 92 }}>{mp}</th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {rows.map(({ sku }) => (
+                  <tr key={sku.rid} style={{ cursor: "default" }}>
+                    <td className="n" style={{ fontWeight: 550, fontSize: 12 }}>{sku.sku || "—"}</td>
+                    <td style={{ color: "var(--dim)", fontSize: 12 }}>{sku.material || "—"}</td>
+                    {MARKETPLACES.map((mp) => {
+                      const st = sku.listings?.[mp] || "Not listed";
+                      const live = st === "Live";
+                      return (
+                        <td key={mp} style={{ textAlign: "center", padding: "6px 4px" }}>
+                          <button className="btn"
+                            disabled={!canEdit}
+                            title={canEdit ? `Set ${mp} to ${live ? "Not listed" : "Live"}` : st}
+                            style={{ fontSize: 10, padding: "3px 7px", width: "100%",
+                              cursor: canEdit ? "pointer" : "default",
+                              color: live ? "var(--ok)" : st === "Blocked" ? "var(--bad)"
+                                   : st === "In progress" ? "var(--warn)" : "var(--dim)",
+                              borderColor: live ? "var(--ok)" : st === "Blocked" ? "var(--bad)" : undefined }}
+                            onClick={() => canEdit && setOne(model, sku, mp, live ? "Not listed" : "Live")}>
+                            {live ? "Live" : st === "In progress" ? "WIP" : st === "Blocked" ? "Blocked" : "—"}
+                          </button>
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+/* ── BULK RECEIVE, PO BY PO ──────────────────────────────────────
+   When a shipment lands you check it against the PO. Models that
+   arrived get marked received in one action. Models that didn't
+   arrive go back to Ordered with their PO cleared, so they show up
+   again in the PO builder for the next order.
+   ─────────────────────────────────────────────────────────────── */
+
+function BulkReceive({ models, onReceive, canReceive }) {
+  const [openPO, setOpenPO] = useState(null);
+  const [marks, setMarks]   = useState({});   // { modelId: "got" | "missing" }
+
+  /* Only models actually out with a supplier can be received */
+  const inFlight = models.filter((m) =>
+    m.po && ["ordered", "production"].includes(m.stage));
+
+  const groups = {};
+  inFlight.forEach((m) => { (groups[m.po] ||= []).push(m); });
+  const poNumbers = Object.keys(groups).sort();
+
+  const mark = (id, val) => setMarks((s) => ({ ...s, [id]: s[id] === val ? undefined : val }));
+
+  const markAll = (list, val) =>
+    setMarks((s) => ({ ...s, ...Object.fromEntries(list.map((m) => [m.id, val])) }));
+
+  const apply = (po) => {
+    const list = groups[po] || [];
+    const got     = list.filter((m) => marks[m.id] === "got").map((m) => m.id);
+    const missing = list.filter((m) => marks[m.id] === "missing").map((m) => m.id);
+    if (!got.length && !missing.length) return;
+    onReceive(got, missing);
+    setMarks((s) => {
+      const next = { ...s };
+      [...got, ...missing].forEach((id) => delete next[id]);
+      return next;
+    });
+  };
+
+  if (!poNumbers.length) return (
+    <div>
+      <h2>Receive against a PO</h2>
+      <div className="card" style={{ fontSize: 13, color: "var(--dim)" }}>
+        Nothing is out with a supplier right now. Models appear here once they have
+        a PO and are at Ordered or Production.
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      <h2>Receive against a PO — {poNumbers.length} open</h2>
+      <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 10, lineHeight: 1.5 }}>
+        Tick what arrived. Anything marked <strong>not received</strong> goes back to Ordered
+        with its PO cleared, ready to be put on the next purchase order.
+      </div>
+
+      {poNumbers.map((po) => {
+        const list  = groups[po];
+        const open  = openPO === po;
+        const got     = list.filter((m) => marks[m.id] === "got").length;
+        const missing = list.filter((m) => marks[m.id] === "missing").length;
+        const decided = got + missing;
+        const units = list.flatMap(allSkus).reduce((t, r) => t + (r.units || 0), 0);
+
+        return (
+          <div className="card" key={po} style={{ marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", cursor: "pointer" }}
+              onClick={() => setOpenPO(open ? null : po)}>
+              <span style={{ fontSize: 12, color: "var(--dim)" }}>{open ? "▾" : "▸"}</span>
+              <span className="n" style={{ fontWeight: 640, fontSize: 14 }}>{po}</span>
+              <Tag>{list.length} model{list.length > 1 ? "s" : ""}</Tag>
+              <Tag>{qty(units)} units</Tag>
+              {decided > 0 && (
+                <Tag tone={missing ? "warn" : "ok"}>
+                  {got} received{missing ? ` · ${missing} missing` : ""}
+                </Tag>
+              )}
+            </div>
+
+            {open && (
+              <div style={{ marginTop: 12 }}>
+                {canReceive && (
+                  <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                    <button className="btn" style={{ fontSize: 11, padding: "4px 9px", color: "var(--ok)" }}
+                      onClick={() => markAll(list, "got")}>All arrived</button>
+                    <button className="btn" style={{ fontSize: 11, padding: "4px 9px", color: "var(--bad)" }}
+                      onClick={() => markAll(list, "missing")}>None arrived</button>
+                  </div>
+                )}
+
+                <div style={{ overflowX: "auto" }}>
+                  <table>
+                    <thead><tr>
+                      <th>Model</th><th>Stage</th><th>SKUs</th><th>Units</th>
+                      {canReceive && <th style={{ width: 170, textAlign: "center" }}>Arrived?</th>}
+                    </tr></thead>
+                    <tbody>
+                      {list.sort(byUrgency).map((m) => (
+                        <tr key={m.id} style={{ cursor: "default" }}>
+                          <td>
+                            <div style={{ fontWeight: 570 }}>{m.brand} {m.name}</div>
+                            {m.isLate && <div style={{ fontSize: 10, color: "var(--bad)" }}>{m.worstDelay}d late</div>}
+                          </td>
+                          <td style={{ fontSize: 12 }}>{STAGES[m.index].label}</td>
+                          <td className="n">{allSkus(m).length}</td>
+                          <td className="n">{qty(m.units)}</td>
+                          {canReceive && (
+                            <td style={{ textAlign: "center", whiteSpace: "nowrap" }}>
+                              <button className="btn" title="Received in full"
+                                style={{ padding: "3px 9px", fontSize: 11,
+                                  borderColor: marks[m.id] === "got" ? "var(--ok)" : undefined,
+                                  color: marks[m.id] === "got" ? "var(--ok)" : undefined,
+                                  background: marks[m.id] === "got" ? "var(--card)" : undefined }}
+                                onClick={() => mark(m.id, "got")}>
+                                ✓ Received
+                              </button>
+                              <button className="btn" title="Did not arrive — send back to Ordered"
+                                style={{ padding: "3px 9px", fontSize: 11, marginLeft: 5,
+                                  borderColor: marks[m.id] === "missing" ? "var(--bad)" : undefined,
+                                  color: marks[m.id] === "missing" ? "var(--bad)" : undefined }}
+                                onClick={() => mark(m.id, "missing")}>
+                                ✕ Not yet
+                              </button>
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {canReceive && (
+                  <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 12, flexWrap: "wrap" }}>
+                    <button className="btn" data-primary="1"
+                      style={{ opacity: decided ? 1 : 0.4 }}
+                      onClick={() => apply(po)}>
+                      Apply to {decided} model{decided === 1 ? "" : "s"}
+                    </button>
+                    {missing > 0 && (
+                      <span style={{ fontSize: 11, color: "var(--warn)" }}>
+                        {missing} will return to Ordered for a new PO
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+
 /* ── PURCHASE ORDERS ─────────────────────────────────────────────
    One PO usually covers several phone models at once. This view
    lets you tick the models going onto a PO, assign the number to
@@ -3153,6 +3510,9 @@ export default function App() {
   const models = useMemo(() => phones.map(derive), [phones]);
 
   /* filtered + role-aware view of the phone list */
+  /* how many SKUs the catalog team still owes — drives the nav badge */
+  const pendingListings = useMemo(() => listingQueue(models).length, [models]);
+
   const visible = useMemo(
     () => models.filter((mm) => passesFilters(mm, filters, role)),
     [models, filters, role]
@@ -3244,6 +3604,37 @@ export default function App() {
   };
 
   /* PO number is typed by the buyer, never invented by the app */
+  /* Bulk receive against a PO.
+       got     → every SKU marked received in full, stage moves to Received
+       missing → PO cleared and stage returns to Ordered so the model
+                 reappears in the PO builder for the next order        */
+  const bulkReceive = (gotIds, missingIds) => {
+    setPhones((list) => {
+      const next = list.map((p) => {
+        if (gotIds.includes(p.id)) {
+          const done = { ...p.done };
+          STAGES.slice(0, stageIndex("received") + 1).forEach((st) => { done[st.key] ||= iso(TODAY); });
+          return {
+            ...p, stage: "received", done,
+            skus: p.skus.map((r) => ({ ...r, receivedQty: r.units, receiptState: "full" })),
+          };
+        }
+        if (missingIds.includes(p.id)) {
+          const done = { ...p.done };
+          delete done.production; delete done.received;   // those stages didn't happen
+          return { ...p, stage: "ordered", po: null, done };
+        }
+        return p;
+      });
+      next.filter((p) => [...gotIds, ...missingIds].includes(p.id)).forEach(persist);
+      return next;
+    });
+    const bits = [];
+    if (gotIds.length)     bits.push(`${gotIds.length} received`);
+    if (missingIds.length) bits.push(`${missingIds.length} back to Ordered for a new PO`);
+    say(bits.join(" · "));
+  };
+
   /* Assign one PO number to several models at once */
   const assignPO = (ids, po) => {
     setPhones((list) => {
@@ -3353,6 +3744,15 @@ export default function App() {
             <button className="btn" data-on={view === "orders" ? "1" : "0"} onClick={() => setView("orders")}>
               <Package size={14} />Orders
             </button>
+            <button className="btn" data-on={view === "listing" ? "1" : "0"} onClick={() => setView("listing")}>
+              <CheckCircle2 size={14} />Listing
+              {pendingListings > 0 && (
+                <span style={{ marginLeft: 5, background: "var(--warn)", color: "#000",
+                  borderRadius: 9, padding: "0 6px", fontSize: 10, fontWeight: 700 }}>
+                  {pendingListings}
+                </span>
+              )}
+            </button>
             <button className="btn" data-on={view === "reports" ? "1" : "0"} onClick={() => setView("reports")}>
               <FileText size={14} />Reports
             </button>
@@ -3435,8 +3835,16 @@ export default function App() {
                                   compact={compact} filters={filters} />}
         {view === "table"     && <Table models={visible} allModels={models} onOpen={setOpenId}
                                   onAdvance={advance} role={role} filters={filters} />}
-        {view === "orders"    && <POManager models={models} onAssign={assignPO}
-                                  onOpen={setOpenId} canEdit={CAN.savePO(role)} />}
+        {view === "orders"    && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+            <POManager models={models} onAssign={assignPO}
+              onOpen={setOpenId} canEdit={CAN.savePO(role)} />
+            <BulkReceive models={models} onReceive={bulkReceive}
+              canReceive={CAN.saveReceipt(role)} />
+          </div>
+        )}
+        {view === "listing"   && <CatalogQueue models={models} onSetListing={saveListings}
+                                  onOpen={setOpenId} canEdit={CAN.saveListing(role)} />}
         {view === "reports"   && <Reports models={models} />}
       </div>
 
