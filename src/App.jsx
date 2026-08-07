@@ -386,29 +386,66 @@ function dbSaveConfig(url, key) {
 }
 function dbClearConfig() { localStorage.removeItem(DB_CONFIG_KEY); }
 
+/* ── SESSION PERSISTENCE ─────────────────────────────────────────
+   The logged-in user is written to localStorage so a page refresh
+   doesn't kick you back to the login screen. Sessions expire after
+   12 hours so a shared machine doesn't stay signed in forever.   */
+
+const SESSION_KEY  = "proc_tracker_session";
+const SESSION_HRS  = 12;
+
+function loadSession() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+    if (!raw?.user || !raw?.at) return null;
+    const ageHrs = (Date.now() - raw.at) / 3600000;
+    if (ageHrs > SESSION_HRS) { localStorage.removeItem(SESSION_KEY); return null; }
+    return raw.user;
+  } catch { return null; }
+}
+function saveSession(user) {
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user, at: Date.now() })); }
+  catch { /* private browsing — session just won't persist */ }
+}
+function clearSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch {}
+}
+
 function dbClient() {
   const cfg = dbGetConfig();
   if (!cfg?.url || !cfg?.key) return null;
   const base = cfg.url + "/rest/v1";
-  const hdrs = {
+
+  /* Supabase REST upsert rules:
+     - POST to /<table>?on_conflict=<col>
+     - Prefer header must be EXACTLY "resolution=merge-duplicates"
+       (adding return=representation causes 409 on some Supabase versions)
+     - apikey + Authorization both required               */
+  const hdrs = (extra) => ({
     "Content-Type":  "application/json",
     "apikey":        cfg.key,
     "Authorization": "Bearer " + cfg.key,
-    "Prefer":        "return=representation",
-  };
-  const req = async (method, path, body) => {
+    ...(extra || {}),
+  });
+
+  const req = async (method, path, body, extra) => {
     try {
-      const r = await fetch(base + path, { method, headers: hdrs, body: body ? JSON.stringify(body) : undefined });
+      const r = await fetch(base + path, {
+        method,
+        headers: hdrs(extra),
+        body: body ? JSON.stringify(body) : undefined,
+      });
       const text = await r.text();
       const data = text ? JSON.parse(text) : null;
-      if (!r.ok) return { data: null, error: (data?.message || data?.hint || ("HTTP " + r.status)) };
+      if (!r.ok) return { data: null, error: data?.message || data?.hint || "HTTP " + r.status };
       return { data, error: null };
     } catch(e) { return { data: null, error: e.message }; }
   };
+
   return {
-    get:    (p)    => req("GET",    p),
-    post:   (p, b) => req("POST",   p, b),
-    patch:  (p, b) => req("PATCH",  p, b),
+    get:    (p)    => req("GET",    p, null, { "Prefer": "return=representation" }),
+    upsert: (p, b) => req("POST",   p, b,    { "Prefer": "resolution=merge-duplicates" }),
+    patch:  (p, b) => req("PATCH",  p, b,    { "Prefer": "return=representation" }),
     del:    (p)    => req("DELETE", p),
   };
 }
@@ -440,7 +477,7 @@ async function dbLoadPhones() {
 }
 async function dbUpsertPhone(phone) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
-  return c.post("/phones?on_conflict=id", phoneToRow(phone));
+  return c.upsert("/phones?on_conflict=id", phoneToRow(phone));
 }
 async function dbDeletePhone(id) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
@@ -448,7 +485,7 @@ async function dbDeletePhone(id) {
 }
 async function dbDeleteAllPhones() {
   const c = dbClient(); if (!c) return { error: "Not configured" };
-  return c.del("/phones?id=gte.0");
+  return c.del("/phones?id=gt.0");
 }
 async function dbLoadUsers() {
   const c = dbClient(); if (!c) return { data: null, error: "Not configured" };
@@ -457,7 +494,7 @@ async function dbLoadUsers() {
 }
 async function dbUpsertUser(user) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
-  return c.post("/users?on_conflict=id", userToRow(user));
+  return c.upsert("/users?on_conflict=id", userToRow(user));
 }
 async function dbDeleteUser(id) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
@@ -2836,7 +2873,7 @@ export default function App() {
 
   /* ── session state ── */
   const [users, setUsers]     = useState(DEFAULT_USERS);
-  const [session, setSession] = useState(null);
+  const [session, setSession] = useState(() => loadSession());
   const [manageUsers, setManageUsers] = useState(false);
 
   const role = session?.role ?? "none";
@@ -2863,7 +2900,19 @@ export default function App() {
       setDbOnline(false); setDbError(up.error || ph.error);
     } else {
       setDbOnline(true); setDbError("");
-      if (up.data?.length) setUsers(up.data);
+      if (up.data?.length) {
+        setUsers(up.data);
+        /* Re-validate a restored session against the live user list —
+           the account may have been renamed, re-roled or deleted while
+           this browser was closed.                                    */
+        setSession((cur) => {
+          if (!cur) return cur;
+          const fresh = up.data.find((u) => u.id === cur.id);
+          if (!fresh) { clearSession(); return null; }      // account removed
+          saveSession(fresh);
+          return fresh;                                     // pick up role/name changes
+        });
+      }
       if (ph.data)         setPhones(ph.data);
     }
     setLoading(false);
@@ -2880,9 +2929,13 @@ export default function App() {
   };
 
   const login = (user) => {
+    saveSession(user);
     setSession(user);
   };
-  const logout = () => { setSession(null); setOpenId(null); setAdding(false); };
+  const logout = () => {
+    clearSession();
+    setSession(null); setOpenId(null); setAdding(false);
+  };
 
   const say = (text) => { setToast(text); setTimeout(() => setToast((t) => (t === text ? null : t)), 2500); };
 
@@ -3204,7 +3257,7 @@ export default function App() {
           onSave={async (updated) => {
             setUsers(updated);
             const me = updated.find(u => u.id === session?.id);
-            if (me) setSession(me);
+            if (me) { setSession(me); saveSession(me); }
             if (dbOnline) {
               await Promise.all(updated.map(dbUpsertUser));
             }
