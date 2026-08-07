@@ -2392,6 +2392,216 @@ function Dashboard({ models, onOpen, onAdd }) {
 }
 
 
+
+/* ── PURCHASE ORDERS ─────────────────────────────────────────────
+   One PO usually covers several phone models at once. This view
+   lets you tick the models going onto a PO, assign the number to
+   all of them, and export a single combined SKU sheet for the
+   supplier. Existing POs are grouped so you can see what's on each.
+   ─────────────────────────────────────────────────────────────── */
+
+function POManager({ models, onAssign, onOpen, canEdit }) {
+  const [picked, setPicked]   = useState({});     // { modelId: true }
+  const [poNum, setPoNum]     = useState("");
+  const [expanded, setExpanded] = useState({});   // { poNumber: true }
+
+  /* Models that can go on a PO: at Ordered, or at Planned with all SKUs coded */
+  const eligible = models.filter((m) =>
+    m.stage === "ordered" || (m.stage === "planned" && !gateBlock(m)));
+
+  const unassigned = eligible.filter((m) => !m.po);
+  const chosen     = eligible.filter((m) => picked[m.id]);
+  const chosenSkus = chosen.flatMap(allSkus);
+  const chosenUnits = chosenSkus.reduce((t, r) => t + (r.units || 0), 0);
+
+  const toggle = (id) => setPicked((p) => ({ ...p, [id]: !p[id] }));
+  const pickAll = () => setPicked(Object.fromEntries(unassigned.map((m) => [m.id, true])));
+  const clearAll = () => setPicked({});
+
+  const assign = () => {
+    if (!poNum.trim() || !chosen.length) return;
+    onAssign(chosen.map((m) => m.id), poNum.trim());
+    setPicked({}); setPoNum("");
+  };
+
+  /* Group every model that already has a PO */
+  const groups = {};
+  models.filter((m) => m.po).forEach((m) => { (groups[m.po] ||= []).push(m); });
+  const poNumbers = Object.keys(groups).sort();
+
+  /* Export one PO as a combined SKU sheet */
+  const exportPO = (po, list, fmt) => {
+    const headers = ["PO Number", "Brand", "Model", "Launch Date", "SKU", "Material", "Units"];
+    const rows = list.flatMap((m) =>
+      allSkus(m).map((r) => [po, m.brand, m.name, m.launch, r.sku || "", r.material || "", r.units]));
+    downloadReport("PO_" + po.replace(/[^\w-]/g, "_"), headers, rows, fmt);
+  };
+
+  /* Export the draft selection before it's even assigned */
+  const exportDraft = (fmt) => {
+    const headers = ["PO Number", "Brand", "Model", "Launch Date", "SKU", "Material", "Units"];
+    const rows = chosen.flatMap((m) =>
+      allSkus(m).map((r) => [poNum || "DRAFT", m.brand, m.name, m.launch, r.sku || "", r.material || "", r.units]));
+    downloadReport("PO_draft", headers, rows, fmt);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+
+      {/* ── build a new PO ── */}
+      {canEdit && (
+        <div>
+          <h2>Create a purchase order</h2>
+          <div className="card">
+            {unassigned.length === 0 ? (
+              <div style={{ fontSize: 13, color: "var(--dim)" }}>
+                Every eligible model already has a PO number. Models appear here once they
+                reach Ordered, or at Planned with every SKU coded.
+              </div>
+            ) : (
+              <>
+                <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
+                  Tick the models going on this PO, type the number your supplier expects,
+                  and assign it to all of them at once.
+                </div>
+
+                <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                  <button className="btn" style={{ fontSize: 11, padding: "4px 9px" }} onClick={pickAll}>
+                    Select all {unassigned.length}
+                  </button>
+                  {chosen.length > 0 && (
+                    <button className="btn" style={{ fontSize: 11, padding: "4px 9px" }} onClick={clearAll}>
+                      Clear selection
+                    </button>
+                  )}
+                </div>
+
+                <div style={{ overflowX: "auto", marginBottom: 14, maxHeight: 320, overflowY: "auto" }}>
+                  <table>
+                    <thead><tr>
+                      <th style={{ width: 34 }}></th>
+                      <th>Model</th><th>Stage</th><th>Launch</th><th>SKUs</th><th>Units</th>
+                    </tr></thead>
+                    <tbody>
+                      {unassigned.sort(byUrgency).map((m) => (
+                        <tr key={m.id} style={{ cursor: "pointer" }} onClick={() => toggle(m.id)}>
+                          <td style={{ textAlign: "center" }}>
+                            {picked[m.id]
+                              ? <CheckCircle2 size={15} style={{ color: "var(--ok)" }} />
+                              : <Circle size={15} style={{ color: "var(--dim)" }} />}
+                          </td>
+                          <td>
+                            <div style={{ fontWeight: 570 }}>{m.brand} {m.name}</div>
+                            <div style={{ fontSize: 11, color: "var(--dim)" }}>{m.segment}</div>
+                          </td>
+                          <td style={{ fontSize: 12 }}>{STAGES[m.index].label}</td>
+                          <td className="n" style={{ fontSize: 12 }}>
+                            {showDate(m.launch)}
+                            {m.isLate && <div style={{ fontSize: 10, color: "var(--bad)" }}>{m.worstDelay}d late</div>}
+                          </td>
+                          <td className="n">{allSkus(m).length}</td>
+                          <td className="n">{qty(m.units)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* running total + assign */}
+                <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap",
+                  borderTop: "1px solid var(--line)", paddingTop: 14 }}>
+                  <div style={{ flex: 1, minWidth: 200 }}>
+                    <Field label="PO number"
+                      hint={chosen.length
+                        ? `${chosen.length} model${chosen.length > 1 ? "s" : ""} · ${chosenSkus.length} SKUs · ${qty(chosenUnits)} units`
+                        : "Select at least one model above"}>
+                      <input value={poNum} placeholder="PO-2026-001"
+                        style={{ fontFamily: "var(--mono)" }}
+                        onChange={(e) => setPoNum(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && assign()} />
+                    </Field>
+                  </div>
+                  <button className="btn" data-primary="1"
+                    style={{ opacity: poNum.trim() && chosen.length ? 1 : 0.4 }}
+                    onClick={assign}>
+                    Assign to {chosen.length || 0} model{chosen.length === 1 ? "" : "s"}
+                  </button>
+                  {chosen.length > 0 && (
+                    <>
+                      <button className="btn" onClick={() => exportDraft("csv")}>↓ CSV</button>
+                      <button className="btn" onClick={() => exportDraft("excel")}>↓ Excel</button>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── existing POs ── */}
+      <div>
+        <h2>Purchase orders — {poNumbers.length}</h2>
+        {poNumbers.length === 0 ? (
+          <div className="card" style={{ fontSize: 13, color: "var(--dim)" }}>
+            No purchase orders yet.
+          </div>
+        ) : poNumbers.map((po) => {
+          const list  = groups[po];
+          const skus  = list.flatMap(allSkus);
+          const units = skus.reduce((t, r) => t + (r.units || 0), 0);
+          const open  = expanded[po];
+          return (
+            <div className="card" key={po} style={{ marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap",
+                cursor: "pointer" }}
+                onClick={() => setExpanded((e) => ({ ...e, [po]: !e[po] }))}>
+                <span style={{ fontSize: 12, color: "var(--dim)" }}>{open ? "▾" : "▸"}</span>
+                <span className="n" style={{ fontWeight: 640, fontSize: 14 }}>{po}</span>
+                <Tag>{list.length} model{list.length > 1 ? "s" : ""}</Tag>
+                <Tag>{skus.length} SKUs</Tag>
+                <Tag tone="ok">{qty(units)} units</Tag>
+                <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                  <button className="btn" style={{ fontSize: 11, padding: "3px 8px" }}
+                    onClick={(e) => { e.stopPropagation(); exportPO(po, list, "csv"); }}>↓ CSV</button>
+                  <button className="btn" style={{ fontSize: 11, padding: "3px 8px" }}
+                    onClick={(e) => { e.stopPropagation(); exportPO(po, list, "excel"); }}>↓ Excel</button>
+                </span>
+              </div>
+
+              {open && (
+                <div style={{ marginTop: 12, overflowX: "auto" }}>
+                  <table>
+                    <thead><tr><th>Model</th><th>Stage</th><th>SKU</th><th>Material</th><th>Units</th></tr></thead>
+                    <tbody>
+                      {list.flatMap((m) =>
+                        allSkus(m).map((r, i) => (
+                          <tr key={r.rid} onClick={() => onOpen(m.id)}>
+                            <td style={{ fontWeight: i === 0 ? 570 : 400,
+                              color: i === 0 ? undefined : "var(--dim)" }}>
+                              {i === 0 ? `${m.brand} ${m.name}` : ""}
+                            </td>
+                            <td style={{ fontSize: 12, color: "var(--dim)" }}>
+                              {i === 0 ? STAGES[m.index].label : ""}
+                            </td>
+                            <td className="n" style={{ fontSize: 12 }}>{r.sku || "—"}</td>
+                            <td style={{ fontSize: 12, color: "var(--dim)" }}>{r.material || "—"}</td>
+                            <td className="n">{qty(r.units)}</td>
+                          </tr>
+                        )))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
 /* ── REPORTS ────────────────────────────────────────────────────── */
 
 /* Six reports. Each has a name, column headers, and a row builder. */
@@ -3034,6 +3244,16 @@ export default function App() {
   };
 
   /* PO number is typed by the buyer, never invented by the app */
+  /* Assign one PO number to several models at once */
+  const assignPO = (ids, po) => {
+    setPhones((list) => {
+      const next = list.map((p) => ids.includes(p.id) ? { ...p, po: po.trim() } : p);
+      next.filter((p) => ids.includes(p.id)).forEach(persist);
+      return next;
+    });
+    say(`${po} assigned to ${ids.length} model${ids.length === 1 ? "" : "s"}`);
+  };
+
   const savePO = (id, po) => {
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : { ...p, po: po.trim() });
@@ -3130,6 +3350,9 @@ export default function App() {
             <button className="btn" data-on={view === "table" ? "1" : "0"} onClick={() => setView("table")}>
               <List size={14} />List
             </button>
+            <button className="btn" data-on={view === "orders" ? "1" : "0"} onClick={() => setView("orders")}>
+              <Package size={14} />Orders
+            </button>
             <button className="btn" data-on={view === "reports" ? "1" : "0"} onClick={() => setView("reports")}>
               <FileText size={14} />Reports
             </button>
@@ -3212,6 +3435,8 @@ export default function App() {
                                   compact={compact} filters={filters} />}
         {view === "table"     && <Table models={visible} allModels={models} onOpen={setOpenId}
                                   onAdvance={advance} role={role} filters={filters} />}
+        {view === "orders"    && <POManager models={models} onAssign={assignPO}
+                                  onOpen={setOpenId} canEdit={CAN.savePO(role)} />}
         {view === "reports"   && <Reports models={models} />}
       </div>
 
