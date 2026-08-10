@@ -95,6 +95,80 @@ const skuRow = (sku = "", material = "", units = 0) => ({
   listings: Object.fromEntries(MARKETPLACES.map((mp) => [mp, "Not listed"])),
 });
 
+/* ── AUDIT TRAIL ─────────────────────────────────────────────────
+   Every write appends one line. Capped so a long-lived phone can't
+   grow unbounded in the JSONB column.                             */
+const AUDIT_CAP = 200;
+
+const auditEntry = (user, action) => ({
+  rid: Date.now() + Math.random(),
+  at:   new Date().toISOString(),
+  by:   user?.name?.split(" (")[0] || "Unknown",
+  role: user?.role || "none",
+  action,
+});
+
+const withAudit = (phone, user, action) => ({
+  ...phone,
+  audit: [...(phone.audit || []), auditEntry(user, action)].slice(-AUDIT_CAP),
+});
+
+const noteEntry = (user, text) => ({
+  rid: Date.now() + Math.random(),
+  at:  new Date().toISOString(),
+  by:  user?.name?.split(" (")[0] || "Unknown",
+  role: user?.role || "none",
+  text: text.trim(),
+});
+
+const ATTACHMENT_KINDS = ["PO document", "Invoice", "STP file", "QC photo", "Other"];
+
+const attachmentEntry = (user, label, url, kind) => ({
+  rid: Date.now() + Math.random(),
+  at:  new Date().toISOString(),
+  by:  user?.name?.split(" (")[0] || "Unknown",
+  label: label.trim(), url: url.trim(), kind,
+});
+
+/* Reorder when stock falls to this share of what was received */
+const REORDER_PCT = 20;
+
+/* ── STOCK ON HAND ───────────────────────────────────────────────
+   received − sold + returned. Sales entries may name a SKU; those
+   that don't are phone-level and only affect the phone total.    */
+
+function stockOfSku(model, sku) {
+  const entries = (model.salesEntries || []).filter((e) => e.skuRid === sku.rid);
+  const sold     = entries.reduce((t, e) => t + (e.units   || 0), 0);
+  const returned = entries.reduce((t, e) => t + (e.returns || 0), 0);
+  const received = sku.receivedQty ?? 0;
+  const onHand   = Math.max(0, received - sold + returned);
+  const pct      = received > 0 ? Math.round((onHand / received) * 100) : 0;
+  return { received, sold, returned, onHand, pct, low: received > 0 && pct <= REORDER_PCT };
+}
+
+function stockOfModel(model) {
+  const rows = allSkus(model).map((r) => ({ sku: r, ...stockOfSku(model, r) }));
+  const received = rows.reduce((t, x) => t + x.received, 0);
+  const onHand   = rows.reduce((t, x) => t + x.onHand,   0);
+  /* sales not tied to a SKU still reduce the model total */
+  const loose = (model.salesEntries || []).filter((e) => !e.skuRid);
+  const looseSold = loose.reduce((t, e) => t + (e.units || 0) - (e.returns || 0), 0);
+  const net = Math.max(0, onHand - looseSold);
+  return { rows, received, onHand: net,
+    pct: received > 0 ? Math.round((net / received) * 100) : 0,
+    lowRows: rows.filter((x) => x.low) };
+}
+
+/* Every SKU across the business that needs reordering */
+function reorderQueue(models) {
+  const out = [];
+  models.filter((m) => m.stage === "live" && !m.archived).forEach((m) => {
+    stockOfModel(m).rows.forEach((x) => { if (x.low) out.push({ model: m, ...x }); });
+  });
+  return out.sort((a, b) => a.pct - b.pct);
+}
+
 const LISTING_STATES = ["Not listed", "In progress", "Live", "Blocked"];
 const listingTone = (st) =>
   st === "Live" ? "ok" : st === "Blocked" ? "bad" : st === "In progress" ? "warn" : undefined;
@@ -119,7 +193,7 @@ const receiptLabel = (r) =>
    material and unit count — that's the whole structure.              */
 const allSkus = (model) => model.skus || [];
 
-/* Each sales entry: { rid, date, marketplace, units, revenue, returns, notes }
+/* Each sales entry: { rid, date, marketplace, skuRid, units, revenue, returns, notes }
    Accumulated on the phone — never overwritten, always appended.      */
 const SALE_MARKETPLACES = ["Flipkart", "Amazon", "Meesho", "Shopify"];
 
@@ -199,6 +273,8 @@ function derive(model) {
     worstDelay,
     isLate: worstDelay > 3,
     sales: salesSummary(model.salesEntries),
+    stock: stockOfModel(model),
+    archived: !!model.archived,
   };
 }
 
@@ -243,6 +319,13 @@ function problemsOf(model) {
 
   if (model.stage === "live" && allSkus(model).some((r) => !isFullyListed(r)))
     push("warn", `Live but not fully listed — ${allSkus(model).filter((r) => !isFullyListed(r)).length} SKU(s) incomplete`);
+
+  /* Stock running out on a live model */
+  if (model.stage === "live") {
+    const low = stockOfModel(model).lowRows;
+    if (low.length)
+      push("warn", `Low stock — ${low.length} SKU${low.length > 1 ? "s" : ""} at or below ${REORDER_PCT}%`);
+  }
 
   /* Sitting in the warehouse waiting on the catalog team */
   if (model.stage === "received") {
@@ -390,6 +473,9 @@ function byUrgency(a, b) {
 
 /* One place that decides whether a model survives the active filters */
 function passesFilters(model, f, role) {
+  /* archived models stay out of the way unless explicitly shown */
+  if (!f.showArchived && model.archived) return false;
+  if (f.showArchived && !model.archived) return false;
   if (!matchesSearch(model, f.q)) return false;
   if (f.needsAction && !advanceStatus(model, role).ok) return false;
   if (f.lateOnly && !model.isLate) return false;
@@ -398,7 +484,7 @@ function passesFilters(model, f, role) {
   return true;
 }
 
-const EMPTY_FILTERS = { q: "", needsAction: false, lateOnly: false, soonOnly: false, brand: "" };
+const EMPTY_FILTERS = { q: "", needsAction: false, lateOnly: false, soonOnly: false, brand: "", showArchived: false };
 
 /* ── DATABASE LAYER ──────────────────────────────────────────────
    Supabase REST API called directly — no npm package required.
@@ -485,11 +571,15 @@ const phoneToRow = (p) => ({
   id: p.id, brand: p.brand, name: p.name, segment: p.segment,
   launch: p.launch, stage: p.stage, po: p.po || null,
   done: p.done || {}, skus: p.skus || [], sales_entries: p.salesEntries || [],
+  notes: p.notes || [], attachments: p.attachments || [],
+  audit: p.audit || [], archived: !!p.archived,
 });
 const rowToPhone = (r) => ({
   id: r.id, brand: r.brand, name: r.name, segment: r.segment,
   launch: r.launch, stage: r.stage, po: r.po,
   done: r.done || {}, skus: r.skus || [], salesEntries: r.sales_entries || [],
+  notes: r.notes || [], attachments: r.attachments || [],
+  audit: r.audit || [], archived: !!r.archived,
 });
 
 /* user row <-> app shape (identical, just snake_case alias) */
@@ -829,6 +919,15 @@ function FilterBar({ filters, setFilters, models, role, compact, setCompact, sho
           Launching ≤30d
           <span style={{ opacity: 0.7, marginLeft: 3 }}>{soonCount}</span>
         </button>
+
+        {models.some((m) => m.archived) && (
+          <button className="btn" data-on={filters.showArchived ? "1" : "0"}
+            style={{ fontSize: 11, padding: "5px 10px" }}
+            onClick={() => set("showArchived", !filters.showArchived)}>
+            Archived
+            <span style={{ opacity: 0.7, marginLeft: 3 }}>{models.filter((m) => m.archived).length}</span>
+          </button>
+        )}
 
         {brands.length > 1 && (
           <select value={filters.brand} onChange={(e) => set("brand", e.target.value)}
@@ -1691,13 +1790,190 @@ function ListingEditor({ model, onSave }) {
 
 
 
+
+/* ── NOTES · ATTACHMENTS · HISTORY ───────────────────────────────
+   Shown at the bottom of every phone, at any stage.               */
+
+function ModelExtras({ model, onAddNote, onDeleteNote, onAddAttachment, onDeleteAttachment, canWrite }) {
+  const [tab, setTab]   = useState("notes");
+  const [text, setText] = useState("");
+  const [att, setAtt]   = useState({ label: "", url: "", kind: ATTACHMENT_KINDS[0] });
+
+  const notes = [...(model.notes || [])].reverse();
+  const atts  = [...(model.attachments || [])].reverse();
+  const audit = [...(model.audit || [])].reverse();
+
+  const when = (iso8601) => {
+    const d = new Date(iso8601);
+    const mins = Math.round((Date.now() - d) / 60000);
+    if (mins < 1)   return "just now";
+    if (mins < 60)  return `${mins}m ago`;
+    if (mins < 1440) return `${Math.round(mins/60)}h ago`;
+    return showDate(iso8601.slice(0,10));
+  };
+
+  const addAtt = () => {
+    if (!att.label.trim() || !att.url.trim()) return;
+    onAddAttachment(model.id, att.label, att.url, att.kind);
+    setAtt({ label: "", url: "", kind: ATTACHMENT_KINDS[0] });
+  };
+
+  const Tab = ({ id, label, count }) => (
+    <button className="btn" data-on={tab === id ? "1" : "0"}
+      style={{ fontSize: 11, padding: "5px 10px" }}
+      onClick={() => setTab(id)}>
+      {label}{count > 0 && <span style={{ opacity: 0.7, marginLeft: 4 }}>{count}</span>}
+    </button>
+  );
+
+  return (
+    <div>
+      <h2>Notes, files &amp; history</h2>
+      <div className="card">
+        <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+          <Tab id="notes"   label="Notes"   count={notes.length} />
+          <Tab id="files"   label="Files"   count={atts.length} />
+          <Tab id="history" label="History" count={audit.length} />
+        </div>
+
+        {/* ── NOTES ── */}
+        {tab === "notes" && (
+          <>
+            {canWrite && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                <textarea rows={2} value={text} placeholder="Add a note for the team…"
+                  style={{ resize: "vertical", fontSize: 13 }}
+                  onChange={(e) => setText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim()) {
+                      onAddNote(model.id, text); setText("");
+                    }
+                  }} />
+                <button className="btn" data-primary="1"
+                  style={{ opacity: text.trim() ? 1 : 0.4, alignSelf: "flex-start" }}
+                  onClick={() => { if (text.trim()) { onAddNote(model.id, text); setText(""); } }}>
+                  Post
+                </button>
+              </div>
+            )}
+            {notes.length === 0 ? (
+              <div style={{ fontSize: 13, color: "var(--dim)" }}>No notes yet.</div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {notes.map((nt) => (
+                  <div key={nt.rid} style={{ borderLeft: "2px solid var(--accent)", paddingLeft: 11 }}>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 3 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600 }}>{nt.by}</span>
+                      <Tag>{ROLES.find((r) => r.key === nt.role)?.label || nt.role}</Tag>
+                      <span style={{ fontSize: 11, color: "var(--dim)" }}>{when(nt.at)}</span>
+                      {canWrite && (
+                        <button className="btn" title="Delete note"
+                          style={{ marginLeft: "auto", padding: "2px 5px", border: "none", color: "var(--dim)" }}
+                          onClick={() => onDeleteNote(model.id, nt.rid)}>
+                          <X size={11} />
+                        </button>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 13, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{nt.text}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ── FILES (links) ── */}
+        {tab === "files" && (
+          <>
+            <div style={{ fontSize: 11, color: "var(--dim)", marginBottom: 10, lineHeight: 1.5 }}>
+              Paste a link to the file — Google Drive, Dropbox, SharePoint, anywhere.
+              The app stores the link, not the file itself.
+            </div>
+            {canWrite && (
+              <div style={{ marginBottom: 14 }}>
+                <div className="two" style={{ marginBottom: 8 }}>
+                  <Field label="What is it?">
+                    <input value={att.label} placeholder="PO-2026-001 signed copy"
+                      onChange={(e) => setAtt((a) => ({ ...a, label: e.target.value }))} />
+                  </Field>
+                  <Field label="Type">
+                    <select value={att.kind} onChange={(e) => setAtt((a) => ({ ...a, kind: e.target.value }))}>
+                      {ATTACHMENT_KINDS.map((k) => <option key={k}>{k}</option>)}
+                    </select>
+                  </Field>
+                </div>
+                <Field label="Link">
+                  <input value={att.url} placeholder="https://drive.google.com/…"
+                    style={{ fontFamily: "var(--mono)", fontSize: 12 }}
+                    onChange={(e) => setAtt((a) => ({ ...a, url: e.target.value }))}
+                    onKeyDown={(e) => e.key === "Enter" && addAtt()} />
+                </Field>
+                <button className="btn" data-primary="1"
+                  style={{ opacity: att.label.trim() && att.url.trim() ? 1 : 0.4 }}
+                  onClick={addAtt}>Attach link</button>
+              </div>
+            )}
+            {atts.length === 0 ? (
+              <div style={{ fontSize: 13, color: "var(--dim)" }}>Nothing attached yet.</div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {atts.map((a) => (
+                  <div key={a.rid} style={{ display: "flex", gap: 9, alignItems: "center",
+                    padding: "8px 10px", border: "1px solid var(--line)", borderRadius: 8 }}>
+                    <Tag>{a.kind}</Tag>
+                    <a href={a.url} target="_blank" rel="noopener noreferrer"
+                      style={{ fontSize: 13, color: "var(--accent)", textDecoration: "none",
+                        flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {a.label}
+                    </a>
+                    <span style={{ fontSize: 10, color: "var(--dim)" }}>{a.by} · {when(a.at)}</span>
+                    {canWrite && (
+                      <button className="btn" title="Remove link"
+                        style={{ padding: "2px 5px", border: "none", color: "var(--dim)" }}
+                        onClick={() => onDeleteAttachment(model.id, a.rid)}>
+                        <X size={11} />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ── HISTORY ── */}
+        {tab === "history" && (
+          audit.length === 0 ? (
+            <div style={{ fontSize: 13, color: "var(--dim)" }}>No history recorded yet.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 7,
+              maxHeight: 340, overflowY: "auto" }}>
+              {audit.map((a) => (
+                <div key={a.rid} style={{ display: "flex", gap: 9, alignItems: "baseline",
+                  fontSize: 12, paddingBottom: 6, borderBottom: "1px solid var(--line)" }}>
+                  <span style={{ color: "var(--dim)", fontSize: 10, minWidth: 62 }}>{when(a.at)}</span>
+                  <span style={{ fontWeight: 600, minWidth: 0 }}>{a.by}</span>
+                  <span style={{ color: "var(--dim)", flex: 1 }}>{a.action}</span>
+                </div>
+              ))}
+            </div>
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 /* ── SALES TRACKING — shown when stage === "live" ────────────────
    Log a sale by date, marketplace, units, revenue and returns.
    Entries accumulate; nothing is ever overwritten.               */
 
 function SalesTracker({ model, onSave, canLog }) {
+  const rows = allSkus(model);
   const [form, setForm] = useState({
-    date: iso(TODAY), marketplace: "Flipkart", units: "", revenue: "", returns: "", notes: "",
+    date: iso(TODAY), marketplace: "Flipkart", skuRid: rows[0]?.rid ?? "",
+    units: "", revenue: "", returns: "", notes: "",
   });
   const [saved, setSaved] = useState(false);
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
@@ -1708,6 +1984,7 @@ function SalesTracker({ model, onSave, canLog }) {
     onSave(model.id, {
       rid: Date.now(),
       date: form.date, marketplace: form.marketplace,
+      skuRid: form.skuRid === "" ? null : +form.skuRid,
       units: +form.units, revenue: +form.revenue || 0,
       returns: +form.returns || 0, notes: form.notes.trim(),
     });
@@ -1743,6 +2020,48 @@ function SalesTracker({ model, onSave, canLog }) {
           ))}
         </div>
 
+        {/* stock on hand, SKU by SKU */}
+        {rows.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
+              Stock on hand
+              {model.stock.lowRows.length > 0 && (
+                <Tag tone="bad" style={{ marginLeft: 8 }}>{model.stock.lowRows.length} need reordering</Tag>
+              )}
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table>
+                <thead><tr>
+                  <th>SKU</th><th>Received</th><th>Sold</th><th>Returned</th><th>On hand</th><th style={{minWidth:110}}>Level</th>
+                </tr></thead>
+                <tbody>
+                  {model.stock.rows.map((x) => (
+                    <tr key={x.sku.rid} style={{ cursor: "default" }}>
+                      <td className="n" style={{ fontSize: 12, fontWeight: 550 }}>{x.sku.sku || "—"}</td>
+                      <td className="n">{qty(x.received)}</td>
+                      <td className="n">{qty(x.sold)}</td>
+                      <td className="n" style={{ color: x.returned ? "var(--warn)" : undefined }}>{qty(x.returned)}</td>
+                      <td className="n" style={{ fontWeight: 640,
+                        color: x.low ? "var(--bad)" : x.onHand ? "var(--ok)" : "var(--dim)" }}>
+                        {qty(x.onHand)}
+                      </td>
+                      <td>
+                        <div className="mini-bar" title={`${x.pct}% of received stock remaining`}>
+                          <div style={{ width: x.pct + "%",
+                            background: x.low ? "var(--bad)" : x.pct < 50 ? "var(--warn)" : "var(--ok)" }} />
+                        </div>
+                        <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 2 }}>
+                          {x.pct}%{x.low ? " · reorder" : ""}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
         {/* by marketplace */}
         {Object.keys(s.byMarketplace).length > 0 && (
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
@@ -1769,6 +2088,14 @@ function SalesTracker({ model, onSave, canLog }) {
                 </select>
               </Field>
             </div>
+            <Field label="Which SKU?" hint="Needed so stock on hand stays accurate">
+              <select value={form.skuRid} onChange={(e) => set("skuRid", e.target.value)}>
+                <option value="">Not SKU-specific</option>
+                {rows.map((r) => (
+                  <option key={r.rid} value={r.rid}>{r.sku || "(no code)"} · {r.material}</option>
+                ))}
+              </select>
+            </Field>
             <div className="two" style={{ marginBottom: 10 }}>
               <Field label="Units sold *">
                 <input type="number" min="0" value={form.units} placeholder="0"
@@ -1817,16 +2144,18 @@ function SalesTracker({ model, onSave, canLog }) {
             </div>
             <div style={{ overflowX: "auto" }}>
               <table>
-                <thead><tr><th>Date</th><th>Marketplace</th><th>Units</th><th>Revenue</th><th>Returns</th><th>Notes</th></tr></thead>
+                <thead><tr><th>Date</th><th>Marketplace</th><th>SKU</th><th>Units</th><th>Revenue</th><th>Returns</th></tr></thead>
                 <tbody>
                   {[...(model.salesEntries || [])].reverse().slice(0, 20).map((e) => (
                     <tr key={e.rid} style={{ cursor: "default" }}>
                       <td className="n" style={{ fontSize: 12 }}>{showDate(e.date)}</td>
                       <td style={{ fontSize: 12 }}>{e.marketplace}</td>
+                      <td className="n" style={{ fontSize: 11, color: "var(--dim)" }}>
+                        {rows.find((r) => r.rid === e.skuRid)?.sku || "—"}
+                      </td>
                       <td className="n">{qty(e.units)}</td>
                       <td className="n" style={{ fontSize: 12 }}>{e.revenue ? "₹" + Math.round(e.revenue).toLocaleString("en-IN") : "—"}</td>
                       <td className="n" style={{ fontSize: 12, color: e.returns > 0 ? "var(--bad)" : undefined }}>{e.returns || 0}</td>
-                      <td style={{ fontSize: 11, color: "var(--dim)" }}>{e.notes || "—"}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1908,7 +2237,7 @@ function ResearchEditor({ model, onSave }) {
   );
 }
 
-function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave, onSalesLog, canLog, role }) {
+function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave, onSalesLog, canLog, role, onAddNote, onDeleteNote, onAddAttachment, onDeleteAttachment, onArchive }) {
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -1995,6 +2324,12 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
             <SalesTracker model={model} onSave={onSalesLog} canLog={canLog} />
           )}
 
+          {/* Notes, files and the audit trail — every stage */}
+          <ModelExtras model={model}
+            onAddNote={onAddNote} onDeleteNote={onDeleteNote}
+            onAddAttachment={onAddAttachment} onDeleteAttachment={onDeleteAttachment}
+            canWrite={role !== "none"} />
+
           {/* the pipeline */}
           <div>
             <h2>Progress</h2>
@@ -2060,7 +2395,16 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
               </div>
             );
           })()}
-          <button className="btn" onClick={onClose} style={{ marginLeft: "auto" }}>Close</button>
+          {onArchive && (
+            <button className="btn" style={{ marginLeft: "auto", fontSize: 11,
+              color: model.archived ? "var(--ok)" : "var(--dim)" }}
+              title={model.archived ? "Restore to the active board" : "Hide from the board and reports"}
+              onClick={() => onArchive(model.id, !model.archived)}>
+              {model.archived ? "Restore" : "Archive"}
+            </button>
+          )}
+          <button className="btn" onClick={onClose}
+            style={onArchive ? undefined : { marginLeft: "auto" }}>Close</button>
         </div>
       </aside>
     </>
@@ -2068,15 +2412,345 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
 }
 
 
+
+
+/* ── CALENDAR — launches month by month ──────────────────────────
+   Shows where launches cluster. Five in one week is a resourcing
+   problem you can't see on a board.                              */
+
+function Calendar({ models, onOpen, role }) {
+  const [offset, setOffset] = useState(0);   // months from now
+
+  const active = models.filter((m) => !m.archived);
+
+  /* group by YYYY-MM */
+  const byMonth = {};
+  active.forEach((m) => {
+    if (!m.launch) return;
+    (byMonth[m.launch.slice(0, 7)] ||= []).push(m);
+  });
+
+  const base = new Date();
+  base.setDate(1);
+  base.setMonth(base.getMonth() + offset);
+
+  const months = Array.from({ length: 6 }, (_, i) => {
+    const d = new Date(base);
+    d.setMonth(d.getMonth() + i);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    return { key, date: d, list: (byMonth[key] || []).sort((a, b) => a.launch.localeCompare(b.launch)) };
+  });
+
+  const busiest = Math.max(1, ...months.map((mo) => mo.list.length));
+  const label = (d) => d.toLocaleDateString("en-GB", { month: "long", year: "numeric" });
+
+  if (!active.length) return (
+    <div className="card" style={{ textAlign: "center", padding: "40px 24px" }}>
+      <div style={{ fontSize: 15, fontWeight: 620, marginBottom: 6 }}>Nothing scheduled</div>
+      <div style={{ fontSize: 13, color: "var(--dim)" }}>Add a phone to see its launch on the calendar.</div>
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+        <h2 style={{ margin: 0 }}>Launch calendar</h2>
+        <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+          <button className="btn" style={{ fontSize: 11, padding: "5px 10px" }}
+            onClick={() => setOffset((o) => o - 3)}>← Earlier</button>
+          {offset !== 0 && (
+            <button className="btn" style={{ fontSize: 11, padding: "5px 10px" }}
+              onClick={() => setOffset(0)}>Today</button>
+          )}
+          <button className="btn" style={{ fontSize: 11, padding: "5px 10px" }}
+            onClick={() => setOffset((o) => o + 3)}>Later →</button>
+        </span>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
+        {months.map((mo) => {
+          const late = mo.list.filter((m) => m.isLate).length;
+          const heavy = mo.list.length >= 4;
+          return (
+            <div className="card" key={mo.key}
+              style={{ borderColor: heavy ? "var(--warn)" : undefined }}>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4 }}>
+                <span style={{ fontWeight: 640, fontSize: 14 }}>{label(mo.date)}</span>
+                <span className="n" style={{ marginLeft: "auto", fontSize: 13,
+                  color: heavy ? "var(--warn)" : "var(--dim)" }}>{mo.list.length}</span>
+              </div>
+
+              {/* load bar relative to the busiest month on screen */}
+              <div className="mini-bar" style={{ marginBottom: 10 }}>
+                <div style={{ width: (mo.list.length / busiest) * 100 + "%",
+                  background: heavy ? "var(--warn)" : late ? "var(--bad)" : "var(--accent)" }} />
+              </div>
+
+              {heavy && (
+                <div style={{ fontSize: 11, color: "var(--warn)", marginBottom: 8 }}>
+                  Busy month — {mo.list.length} launches
+                </div>
+              )}
+
+              {mo.list.length === 0 ? (
+                <div style={{ fontSize: 12, color: "var(--dim)" }}>No launches</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {mo.list.map((m) => {
+                    const st = advanceStatus(m, role);
+                    return (
+                      <div key={m.id} className="todo-row" style={{ padding: "7px 9px" }}
+                        onClick={() => onOpen(m.id)} role="button" tabIndex={0}
+                        onKeyDown={(e) => e.key === "Enter" && onOpen(m.id)}
+                        title={`${STAGES[m.index].label}${st.ok ? " · ready to move" : ""}`}>
+                        <span className="n" style={{ fontSize: 11, color: "var(--dim)", minWidth: 22 }}>
+                          {m.launch.slice(8, 10)}
+                        </span>
+                        <span style={{ fontSize: 12, flex: 1, minWidth: 0, overflow: "hidden",
+                          textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {m.brand} {m.name}
+                        </span>
+                        {m.isLate
+                          ? <Tag tone="bad">{m.worstDelay}d</Tag>
+                          : st.ok ? <Tag tone="ok">ready</Tag>
+                          : <Tag>{STAGES[m.index].label}</Tag>}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+/* ── CSV IMPORT ──────────────────────────────────────────────────
+   Paste a whole season of phones at once. Every row is validated
+   and duplicates are flagged before anything is written.         */
+
+function CSVImport({ existing, onImport, onDone }) {
+  const [text, setText]           = useState("");
+  const [skipDupes, setSkipDupes] = useState(true);
+  const [fileName, setFileName]   = useState("");
+  const [fileErr, setFileErr]     = useState("");
+
+  /* A filled-in example, not just headers — people copy the shape of
+     the sample rows rather than reading the instructions.          */
+  const downloadTemplate = (fmt) => {
+    const headers = ["Brand", "Model", "Launch Date", "Segment"];
+    const d = (days) => iso(shift(iso(TODAY), days));
+    const rows = [
+      ["Samsung", "Galaxy A57 5G",  d(120), "Mid Range"],
+      ["Redmi",   "Note 15 Pro 5G", d(95),  "Budget"],
+      ["Oppo",    "Reno 15 5G",     d(150), "Premium"],
+      ["OnePlus", "Nord 6",         d(80),  "Flagship"],
+    ];
+    downloadReport("Phone_import_template", headers, rows, fmt);
+  };
+
+  /* Read a .csv / .txt / .tsv straight off disk into the box */
+  const readFile = (file) => {
+    if (!file) return;
+    setFileErr("");
+    if (!/\.(csv|txt|tsv)$/i.test(file.name)) {
+      setFileErr("Pick a .csv, .tsv or .txt file. Excel files must be saved as CSV first.");
+      return;
+    }
+    if (file.size > 2_000_000) { setFileErr("That file is over 2 MB — too large to import."); return; }
+    const reader = new FileReader();
+    reader.onload  = () => { setText(String(reader.result || "")); setFileName(file.name); };
+    reader.onerror = () => setFileErr("Could not read that file.");
+    reader.readAsText(file);
+  };
+
+  const parsed = useMemo(() => {
+    const lines = text.trim().split(/\r?\n/).filter((l) => l.trim());
+    /* Quote-aware splitter. A naive split on "," corrupts any value
+       that legitimately contains one — "Galaxy A57, Pro" would break
+       into two columns and shift the date out of position.          */
+    const splitRow = (line) => {
+      const out = [];
+      let cur = "", inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        if (c === '"') {
+          if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; }   // escaped ""
+          else inQuotes = !inQuotes;
+        } else if ((c === "," || c === "\t") && !inQuotes) {
+          out.push(cur); cur = "";
+        } else cur += c;
+      }
+      out.push(cur);
+      return out.map((v) => v.replace(/^\uFEFF/, "").trim());
+    };
+
+    return lines.map((line, i) => {
+      const p = splitRow(line);
+      /* skip a header row, quoted or not */
+      if (i === 0 && /^brand$/i.test(p[0])) return null;
+      const [brand, name, launch, segment] = p;
+      const errs = [];
+      if (!brand) errs.push("no brand");
+      if (!name)  errs.push("no model name");
+      /* accept YYYY-MM-DD or DD/MM/YYYY */
+      let iso8601 = "";
+      if (!launch) errs.push("no launch date");
+      else if (/^\d{4}-\d{2}-\d{2}$/.test(launch)) iso8601 = launch;
+      else if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(launch)) {
+        const [d, m, y] = launch.split("/");
+        iso8601 = `${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+      } else errs.push("bad date — use YYYY-MM-DD");
+      const seg = ["Budget","Mid Range","Premium","Flagship"]
+        .find((x) => x.toLowerCase() === (segment || "").toLowerCase()) || "Mid Range";
+      const dupe = brand && name ? findDuplicate(existing, brand, name) : null;
+      return { line: i + 1, brand, name, launch: iso8601, segment: seg, errs, dupe };
+    }).filter(Boolean);
+  }, [text, existing]);
+
+  const valid   = parsed.filter((r) => !r.errs.length);
+  const bad     = parsed.filter((r) => r.errs.length);
+  const dupes   = valid.filter((r) => r.dupe);
+  const toAdd   = skipDupes ? valid.filter((r) => !r.dupe) : valid;
+
+  const run = () => {
+    if (!toAdd.length) return;
+    onImport(toAdd.map(({ brand, name, launch, segment }) => ({ brand, name, launch, segment })));
+    setText(""); onDone();
+  };
+
+  return (
+    <div>
+      <div>
+        <h2>Import a list of phones</h2>
+
+        {/* step 1 — get the template */}
+        <div className="card" style={{ marginBottom: 12, background: "var(--bg)" }}>
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+            1 · Start from the template
+          </div>
+          <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 10, lineHeight: 1.5 }}>
+            Four example rows with the right columns and date format. Fill it in,
+            keep the header row, and save as CSV.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button className="btn" style={{ fontSize: 11, padding: "5px 10px" }}
+              onClick={() => downloadTemplate("csv")}>↓ Template (CSV)</button>
+            <button className="btn" style={{ fontSize: 11, padding: "5px 10px" }}
+              onClick={() => downloadTemplate("excel")}>↓ Template (Excel)</button>
+          </div>
+        </div>
+
+        {/* step 2 — upload or paste */}
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+          2 · Upload the file, or paste the rows
+        </div>
+
+        <label
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => { e.preventDefault(); readFile(e.dataTransfer.files?.[0]); }}
+          style={{ display: "block", border: "1px dashed var(--line)", borderRadius: 10,
+            padding: "16px 14px", textAlign: "center", cursor: "pointer", marginBottom: 10 }}>
+          <input type="file" accept=".csv,.tsv,.txt,text/csv" style={{ display: "none" }}
+            onChange={(e) => { readFile(e.target.files?.[0]); e.target.value = ""; }} />
+          <div style={{ fontSize: 13, marginBottom: 3 }}>
+            {fileName
+              ? <span style={{ color: "var(--ok)" }}>✓ {fileName} loaded</span>
+              : "Choose a CSV file, or drag one here"}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--dim)" }}>
+            {fileName ? "Click to pick a different file" : ".csv, .tsv or .txt"}
+          </div>
+        </label>
+        {fileErr && (
+          <div style={{ fontSize: 12, color: "var(--bad)", marginBottom: 10 }}>{fileErr}</div>
+        )}
+
+        <div style={{ fontSize: 11, color: "var(--dim)", marginBottom: 6, lineHeight: 1.6 }}>
+          Columns: <code>Brand, Model, Launch date, Segment</code>.
+          Dates as <code>2026-07-20</code> or <code>20/07/2026</code>. Segment is optional
+          and defaults to Mid Range. Tabs from Excel work, and a header row is skipped.
+        </div>
+        <textarea rows={7} value={text}
+          style={{ fontFamily: "var(--mono)", fontSize: 12, resize: "vertical" }}
+          placeholder={"Samsung, Galaxy A57 5G, 2026-09-15, Mid Range\nRedmi, Note 15 Pro, 2026-10-01, Budget\nOppo, Reno 15, 20/11/2026, Premium"}
+          onChange={(e) => { setText(e.target.value); if (fileName) setFileName(""); }} />
+        {text && (
+          <button className="btn" style={{ fontSize: 11, padding: "4px 9px", marginTop: 7 }}
+            onClick={() => { setText(""); setFileName(""); setFileErr(""); }}>
+            Clear
+          </button>
+        )}
+      </div>
+
+      {parsed.length > 0 && (
+        <div className="card" style={{ marginTop: 14 }}>
+          <div style={{ display: "flex", gap: 7, flexWrap: "wrap", marginBottom: 12 }}>
+            <Tag tone="ok">{valid.length} valid</Tag>
+            {bad.length   > 0 && <Tag tone="bad">{bad.length} with errors</Tag>}
+            {dupes.length > 0 && <Tag tone="warn">{dupes.length} already tracked</Tag>}
+          </div>
+
+          {dupes.length > 0 && (
+            <label style={{ display: "flex", gap: 8, alignItems: "center",
+              fontSize: 12, marginBottom: 12, cursor: "pointer" }}>
+              <input type="checkbox" checked={skipDupes} style={{ width: "auto" }}
+                onChange={(e) => setSkipDupes(e.target.checked)} />
+              Skip the {dupes.length} phone{dupes.length > 1 ? "s" : ""} already in the system
+            </label>
+          )}
+
+          <div style={{ overflowX: "auto", maxHeight: 260, overflowY: "auto" }}>
+            <table>
+              <thead><tr><th>#</th><th>Brand</th><th>Model</th><th>Launch</th><th>Segment</th><th>Status</th></tr></thead>
+              <tbody>
+                {parsed.map((r) => (
+                  <tr key={r.line} style={{ cursor: "default",
+                    opacity: r.errs.length || (skipDupes && r.dupe) ? 0.5 : 1 }}>
+                    <td className="n" style={{ fontSize: 11, color: "var(--dim)" }}>{r.line}</td>
+                    <td style={{ fontSize: 12 }}>{r.brand || "—"}</td>
+                    <td style={{ fontSize: 12, fontWeight: 550 }}>{r.name || "—"}</td>
+                    <td className="n" style={{ fontSize: 12 }}>{r.launch ? showDate(r.launch) : "—"}</td>
+                    <td style={{ fontSize: 12, color: "var(--dim)" }}>{r.segment}</td>
+                    <td style={{ fontSize: 11 }}>
+                      {r.errs.length
+                        ? <span style={{ color: "var(--bad)" }}>{r.errs.join(", ")}</span>
+                        : r.dupe
+                          ? <span style={{ color: "var(--warn)" }}>already tracked</span>
+                          : <span style={{ color: "var(--ok)" }}>ready</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <button className="btn" data-primary="1" style={{ marginTop: 14,
+            opacity: toAdd.length ? 1 : 0.4 }} onClick={run}>
+            Import {toAdd.length} phone{toAdd.length === 1 ? "" : "s"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 /* ── 11. ADD FORM ─────────────────────────────────────────────── */
 
-const NEW_MODEL = {
-  brand: "", name: "", segment: "Mid Range", launch: "",
-  covers: [],
-};
+const NEW_MODEL = { brand: "", name: "", segment: "Mid Range", launch: "" };
 
-function AddForm({ onClose, onSave }) {
+/* Loose match so "Galaxy A57 5G" and "galaxy a57  5g" collide */
+const normName = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const findDuplicate = (list, brand, name) =>
+  list.find((p) => normName(p.brand) === normName(brand) && normName(p.name) === normName(name));
+
+function AddForm({ onClose, onSave, onImport, existing = [] }) {
   const [form, setForm] = useState(NEW_MODEL);
+  const [mode, setMode] = useState("one");   // "one" | "import"
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkText, setBulkText] = useState("");
   const [bulkErr, setBulkErr] = useState("");
@@ -2096,6 +2770,11 @@ function AddForm({ onClose, onSave }) {
     : daysLeft < STAGES[0].daysBeforeLaunch
       ? `Only ${daysLeft} days away — the full process wants ${STAGES[0].daysBeforeLaunch}. It will be tight.`
       : `Comfortable. Research due ${showDate(shift(form.launch, -STAGES[0].daysBeforeLaunch))}.`;
+
+  /* Duplicate check — warns, never blocks. Two colours of the same
+     phone are a legitimate reason to add it twice.               */
+  const dupe = form.brand.trim() && form.name.trim()
+    ? findDuplicate(existing, form.brand, form.name) : null;
 
   const problems = [
     !form.brand.trim() && "Enter a brand",
@@ -2130,6 +2809,17 @@ function AddForm({ onClose, onSave }) {
         </div>
 
         <div className="panel-body">
+          {/* one at a time, or paste a whole season */}
+          <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
+            <button className="btn" data-on={mode === "one" ? "1" : "0"}
+              style={{ fontSize: 11, padding: "5px 10px" }}
+              onClick={() => setMode("one")}>Add one</button>
+            <button className="btn" data-on={mode === "import" ? "1" : "0"}
+              style={{ fontSize: 11, padding: "5px 10px" }}
+              onClick={() => setMode("import")}>Import a list</button>
+          </div>
+
+          {mode === "import" ? <CSVImport existing={existing} onImport={onImport} onDone={onClose} /> : <>
           <div>
             <h2>The phone</h2>
             <div className="two">
@@ -2157,6 +2847,19 @@ function AddForm({ onClose, onSave }) {
             </div>
           </div>
 
+          {dupe && (
+            <div className="card" style={{ borderColor: "var(--bad)" }}>
+              <h2 style={{ color: "var(--bad)" }}>This phone is already tracked</h2>
+              <div style={{ fontSize: 13, color: "var(--dim)", lineHeight: 1.6 }}>
+                <strong style={{ color: "var(--text)" }}>{dupe.brand} {dupe.name}</strong>
+                {" "}is already at <strong style={{ color: "var(--text)" }}>{STAGES[stageIndex(dupe.stage)].label}</strong>,
+                launching {showDate(dupe.launch)}.
+                {" "}You can still add it — two variants of the same phone are a fair reason —
+                but check first that this isn't a duplicate.
+              </div>
+            </div>
+          )}
+
           {problems.length > 0 && (
             <div className="card" style={{ borderColor: "var(--warn)" }}>
               <h2 style={{ color: "var(--warn)" }}>Before you save</h2>
@@ -2165,12 +2868,13 @@ function AddForm({ onClose, onSave }) {
               ))}
             </div>
           )}
+          </>}
         </div>
 
         <div className="panel-foot">
-          <button className="btn" data-primary="1" onClick={save} style={{ opacity: problems.length ? .5 : 1 }}>
-            Add phone
-          </button>
+          {mode === "one" && <button className="btn" data-primary="1" onClick={save} style={{ opacity: problems.length ? .5 : 1 }}>
+            {dupe ? "Add anyway" : "Add phone"}
+          </button>}
           <button className="btn" onClick={onClose}>Cancel</button>
         </div>
       </aside>
@@ -2309,6 +3013,7 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
   const warn        = problems.filter((p) => p.type !== "bad");
   const actionable  = models.filter((m) => advanceStatus(m, role).ok);
   const pendingSkus = listingQueue(models);
+  const lowStock    = reorderQueue(models);
 
   /* The to-do strip. Only rows with something in them are shown, so an
      empty dashboard says "on track" rather than listing eight zeroes. */
@@ -2321,6 +3026,7 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
     { n: stpNotSent,               label: "STP file not sent yet",              tone: "warn", act: () => go("board",  {}) },
     { n: unconfRec,                label: "delivery not confirmed",             tone: "warn", act: () => go("orders", {}) },
     { n: pendingSkus.length,       label: "SKUs waiting on marketplace listing", tone: "warn", act: () => go("listing", {}) },
+    { n: lowStock.length,          label: "SKUs low on stock — reorder",        tone: "bad",  act: () => go("board", {}) },
   ].filter((t) => t.n > 0);
 
   const toneColor = (t) => t === "bad" ? "var(--bad)" : t === "warn" ? "var(--warn)" : "var(--ok)";
@@ -2428,6 +3134,13 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
           tone={launching14.length ? "warn" : undefined}
           sub={launching14.length ? launching14.map(m=>`${m.name} in ${m.daysToLaunch}d`).join(", ").slice(0,50) : "None urgent"}
           onClick={() => go("table", { soonOnly: true })} hint="Show upcoming launches" />
+
+        <KPI label="Stock on hand"
+          value={qty(live.reduce((t, m) => t + m.stock.onHand, 0))}
+          tone={lowStock.length ? "bad" : live.length ? "ok" : undefined}
+          sub={lowStock.length ? `${lowStock.length} SKU${lowStock.length > 1 ? "s" : ""} need reordering`
+             : live.length ? "All healthy" : "Nothing live yet"}
+          onClick={() => go("board", {})} hint="Stock across live models" />
 
         <KPI label="Units in pipeline" value={qty(totalUnits)} tone="accent"
           sub={liveUnits ? `${qty(liveUnits)} live · ${qty(totalUnits - liveUnits)} still coming` : "Nothing live yet"}
@@ -3656,8 +4369,11 @@ export default function App() {
   const models = useMemo(() => phones.map(derive), [phones]);
 
   /* filtered + role-aware view of the phone list */
+  /* everything except archived — what the rest of the app should see */
+  const liveModels = useMemo(() => models.filter((m) => !m.archived), [models]);
+
   /* how many SKUs the catalog team still owes — drives the nav badge */
-  const pendingListings = useMemo(() => listingQueue(models).length, [models]);
+  const pendingListings = useMemo(() => listingQueue(liveModels).length, [liveModels]);
 
   /* Dashboard click-through: jump to a view with filters pre-applied */
   const navigate = (nextView, filterPatch) => {
@@ -3678,7 +4394,8 @@ export default function App() {
       if (p.id !== id) return p;
       const done = { ...p.done };
       STAGES.slice(0, stageIndex(stageKey) + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
-      return { ...p, stage: stageKey, done };
+      return withAudit({ ...p, stage: stageKey, done }, session,
+        `Moved to ${STAGES[stageIndex(stageKey)].label}`);
     });
     const updated = next.find(p => p.id === id);
     if (updated) persist(updated);
@@ -3701,7 +4418,8 @@ export default function App() {
         if (p.id !== id) return p;
         const done = { ...p.done };
         delete done[m.stage];
-        return { ...p, stage: prev.key, done };
+        return withAudit({ ...p, stage: prev.key, done }, session,
+          `Moved back to ${prev.label}`);
       });
       const updated = next.find(p => p.id === id);
       if (updated) persist(updated);
@@ -3713,7 +4431,7 @@ export default function App() {
   /* save edited phone details from ResearchEditor */
   const saveResearch = (id, edits) => {
     setPhones((list) => {
-      const next = list.map((p) => p.id !== id ? p : { ...p, ...edits });
+      const next = list.map((p) => p.id !== id ? p : withAudit({ ...p, ...edits }, session, "Edited phone details"));
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
@@ -3723,7 +4441,7 @@ export default function App() {
   /* save covers array from PlannedSKUEditor */
   const saveSKU = (id, skus) => {
     setPhones((list) => {
-      const next = list.map((p) => p.id !== id ? p : { ...p, skus });
+      const next = list.map((p) => p.id !== id ? p : withAudit({ ...p, skus }, session, `Saved ${skus.length} SKU${skus.length === 1 ? "" : "s"}`));
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
@@ -3734,9 +4452,9 @@ export default function App() {
   /* STP status is set per SKU — rows is a map of rid -> status */
   const updateSTP = (id, statusByRid) => {
     setPhones((list) => {
-      const next = list.map((p) => p.id !== id ? p : {
+      const next = list.map((p) => p.id !== id ? p : withAudit({
         ...p, skus: p.skus.map((r) => statusByRid[r.rid] ? { ...r, stpStatus: statusByRid[r.rid] } : r),
-      });
+      }, session, "Updated STP status"));
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
@@ -3746,10 +4464,10 @@ export default function App() {
   /* listingsByRid = { rid: { Flipkart: "Live", ... } } */
   const saveListings = (id, listingsByRid) => {
     setPhones((list) => {
-      const next = list.map((p) => p.id !== id ? p : {
+      const next = list.map((p) => p.id !== id ? p : withAudit({
         ...p, skus: p.skus.map((r) => listingsByRid[r.rid]
           ? { ...r, listings: { ...r.listings, ...listingsByRid[r.rid] } } : r),
-      });
+      }, session, "Updated marketplace listing"));
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
@@ -3767,15 +4485,16 @@ export default function App() {
         if (gotIds.includes(p.id)) {
           const done = { ...p.done };
           STAGES.slice(0, stageIndex("received") + 1).forEach((st) => { done[st.key] ||= iso(TODAY); });
-          return {
+          return withAudit({
             ...p, stage: "received", done,
             skus: p.skus.map((r) => ({ ...r, receivedQty: r.units, receiptState: "full" })),
-          };
+          }, session, `Received in full against ${p.po}`);
         }
         if (missingIds.includes(p.id)) {
           const done = { ...p.done };
           delete done.production; delete done.received;   // those stages didn't happen
-          return { ...p, stage: "ordered", po: null, done };
+          return withAudit({ ...p, stage: "ordered", po: null, done }, session,
+            `Not received against ${p.po} — returned to Ordered`);
         }
         return p;
       });
@@ -3791,7 +4510,7 @@ export default function App() {
   /* Assign one PO number to several models at once */
   const assignPO = (ids, po) => {
     setPhones((list) => {
-      const next = list.map((p) => ids.includes(p.id) ? { ...p, po: po.trim() } : p);
+      const next = list.map((p) => ids.includes(p.id) ? withAudit({ ...p, po: po.trim() }, session, `Added to PO ${po.trim()}`) : p);
       next.filter((p) => ids.includes(p.id)).forEach(persist);
       return next;
     });
@@ -3800,7 +4519,7 @@ export default function App() {
 
   const savePO = (id, po) => {
     setPhones((list) => {
-      const next = list.map((p) => p.id !== id ? p : { ...p, po: po.trim() });
+      const next = list.map((p) => p.id !== id ? p : withAudit({ ...p, po: po.trim() }, session, po.trim() ? `PO set to ${po.trim()}` : "PO cleared"));
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
@@ -3812,10 +4531,10 @@ export default function App() {
     setPhones((list) => {
       const next = list.map((p) => {
         if (p.id !== id) return p;
-        return { ...p, skus: p.skus.map((row) => {
+        return withAudit({ ...p, skus: p.skus.map((row) => {
           const r = receiptRows.find((rr) => rr.rid === row.rid);
           return r ? { ...row, receivedQty: r.received, receiptState: r.state } : row;
-        }) };
+        }) }, session, "Confirmed goods receipt");
       });
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
@@ -3825,9 +4544,9 @@ export default function App() {
 
   const logSale = (id, entry) => {
     setPhones((list) => {
-      const next = list.map((p) => p.id !== id ? p : {
+      const next = list.map((p) => p.id !== id ? p : withAudit({
         ...p, salesEntries: [...(p.salesEntries || []), entry],
-      });
+      }, session, `Logged ${entry.units} units sold on ${entry.marketplace}`));
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
@@ -3843,9 +4562,74 @@ export default function App() {
     say("All phones deleted");
   };
 
+  const addNote = (id, text) => {
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : withAudit(
+        { ...p, notes: [...(p.notes || []), noteEntry(session, text)] },
+        session, "Added a note"));
+      const u = next.find((p) => p.id === id); if (u) persist(u);
+      return next;
+    });
+    say("Note added");
+  };
+
+  const deleteNote = (id, rid) => {
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p
+        : { ...p, notes: (p.notes || []).filter((x) => x.rid !== rid) });
+      const u = next.find((p) => p.id === id); if (u) persist(u);
+      return next;
+    });
+  };
+
+  const addAttachment = (id, label, url, kind) => {
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : withAudit(
+        { ...p, attachments: [...(p.attachments || []), attachmentEntry(session, label, url, kind)] },
+        session, `Attached ${kind}: ${label}`));
+      const u = next.find((p) => p.id === id); if (u) persist(u);
+      return next;
+    });
+    say("Link attached");
+  };
+
+  const deleteAttachment = (id, rid) => {
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p
+        : { ...p, attachments: (p.attachments || []).filter((x) => x.rid !== rid) });
+      const u = next.find((p) => p.id === id); if (u) persist(u);
+      return next;
+    });
+  };
+
+  const setArchived = (id, archived) => {
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : withAudit(
+        { ...p, archived }, session, archived ? "Archived" : "Restored from archive"));
+      const u = next.find((p) => p.id === id); if (u) persist(u);
+      return next;
+    });
+    say(archived ? "Model archived" : "Model restored");
+    if (archived) setOpenId(null);
+  };
+
+  /* Bulk import from pasted CSV — one phone per line */
+  const importPhones = (rows) => {
+    let nextId = Math.max(0, ...phones.map((p) => p.id)) + 1;
+    const made = rows.map((r) => withAudit({
+      id: nextId++, brand: r.brand, name: r.name, segment: r.segment,
+      launch: r.launch, stage: "research", po: null,
+      done: { research: iso(TODAY) }, skus: [], salesEntries: [],
+      notes: [], attachments: [], archived: false,
+    }, session, "Imported from CSV"));
+    setPhones((list) => [...list, ...made]);
+    if (dbOnline) made.forEach((p) => dbUpsertPhone(p));
+    say(`${made.length} model${made.length === 1 ? "" : "s"} imported`);
+  };
+
   const addPhone = (data) => {
     const id = Math.max(0, ...phones.map((p) => p.id)) + 1;
-    const newPhone = { ...data, id };
+    const newPhone = withAudit({ ...data, id, notes: [], attachments: [], archived: false }, session, "Phone added");
     setPhones((list) => [...list, newPhone]);
     if (dbOnline) dbUpsertPhone(newPhone).then(({ error }) => {
       if (error) say("⚠ DB save failed: " + error);
@@ -3893,6 +4677,9 @@ export default function App() {
             </button>
             <button className="btn" data-on={view === "table" ? "1" : "0"} onClick={() => setView("table")}>
               <List size={14} />List
+            </button>
+            <button className="btn" data-on={view === "calendar" ? "1" : "0"} onClick={() => setView("calendar")}>
+              <BarChart2 size={14} />Calendar
             </button>
             <button className="btn" data-on={view === "orders" ? "1" : "0"} onClick={() => setView("orders")}>
               <Package size={14} />Orders
@@ -3982,7 +4769,7 @@ export default function App() {
           />
         )}
 
-        {view === "dashboard" && <Dashboard models={models} onOpen={setOpenId} onAdd={() => setAdding(true)}
+        {view === "dashboard" && <Dashboard models={liveModels} onOpen={setOpenId} onAdd={() => setAdding(true)}
                                   onNavigate={navigate} role={role} />}
         {view === "board"     && <Board models={visible} allModels={models} onOpen={setOpenId} onMove={moveTo}
                                   onAdd={() => setAdding(true)} onAdvance={advance} role={role}
@@ -3991,19 +4778,24 @@ export default function App() {
                                   onAdvance={advance} role={role} filters={filters} />}
         {view === "orders"    && (
           <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
-            <POManager models={models} onAssign={assignPO}
+            <POManager models={liveModels} onAssign={assignPO}
               onOpen={setOpenId} canEdit={CAN.savePO(role)} />
-            <BulkReceive models={models} onReceive={bulkReceive}
+            <BulkReceive models={liveModels} onReceive={bulkReceive}
               canReceive={CAN.saveReceipt(role)} />
           </div>
         )}
-        {view === "listing"   && <CatalogQueue models={models} onSetListing={saveListings}
+        {view === "listing"   && <CatalogQueue models={liveModels} onSetListing={saveListings}
                                   onOpen={setOpenId} canEdit={CAN.saveListing(role)} />}
-        {view === "reports"   && <Reports models={models} />}
+        {view === "calendar"  && <Calendar models={liveModels} onOpen={setOpenId} role={role} />}
+        {view === "reports"   && <Reports models={liveModels} />}
       </div>
 
-      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onResearchSave={CAN.editResearch(role) ? saveResearch : null} onSKUSave={CAN.editSKUs(role) ? saveSKU : null} onSTPUpdate={CAN.updateSTP(role) ? updateSTP : null} onReceiptSave={CAN.saveReceipt(role) ? saveReceipt : null} onPOSave={CAN.savePO(role) ? savePO : null} onListingSave={CAN.saveListing(role) ? saveListings : null} onSalesLog={logSale} canLog={CAN.logSales(role)} role={role} />}
-      {adding && <AddForm onClose={() => setAdding(false)} onSave={addPhone} />}
+      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onResearchSave={CAN.editResearch(role) ? saveResearch : null} onSKUSave={CAN.editSKUs(role) ? saveSKU : null} onSTPUpdate={CAN.updateSTP(role) ? updateSTP : null} onReceiptSave={CAN.saveReceipt(role) ? saveReceipt : null} onPOSave={CAN.savePO(role) ? savePO : null} onListingSave={CAN.saveListing(role) ? saveListings : null} onSalesLog={logSale} canLog={CAN.logSales(role)} role={role}
+                      onAddNote={addNote} onDeleteNote={deleteNote}
+                      onAddAttachment={addAttachment} onDeleteAttachment={deleteAttachment}
+                      onArchive={CAN.addPhone(role) ? setArchived : null} />}
+      {adding && <AddForm onClose={() => setAdding(false)} onSave={addPhone}
+                      onImport={importPhones} existing={phones} />}
       {confirmReset && (
         <>
           <div className="shade" style={{ zIndex: 50 }} onClick={() => setConfirmReset(false)} />
