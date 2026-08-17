@@ -1476,16 +1476,7 @@ function SKUExport({ model, onPOSave }) {
   const exportFile = (fmt) => {
     const headers = ["SKU", "Material", "Units Planned"];
     const rows = allSkus(model).map((r) => [r.sku || "", r.material || "", r.units]);
-    const isCSV = fmt === "csv";
-    const sep = isCSV ? "," : "	";
-    const mime = isCSV ? "text/csv" : "application/vnd.ms-excel";
-    const ext  = isCSV ? ".csv" : ".xls";
-    const lines = [headers, ...rows].map((r) =>
-      isCSV ? r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",") : r.join("\t")).join("\n");
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob(["﻿" + lines], { type: mime + ";charset=utf-8;" }));
-    a.download = `${model.brand}_${model.name.replace(/\s+/g,"_")}_SKUs${ext}`;
-    a.click(); URL.revokeObjectURL(a.href);
+    downloadReport(`${model.brand}_${model.name}_SKUs`, headers, rows, fmt);
   };
   const missing = allSkus(model).filter((r) => !r.sku);
   return (
@@ -2634,7 +2625,9 @@ function CSVImport({ existing, onImport, onDone }) {
      the sample rows rather than reading the instructions.          */
   const downloadTemplate = (fmt) => {
     const headers = ["Brand", "Model", "Launch Date", "Segment"];
-    const d = (days) => iso(shift(iso(TODAY), days));
+    /* shift() already hands back an ISO string — wrapping it in iso()
+       again throws, which used to kill both template buttons */
+    const d = (days) => shift(iso(TODAY), days);
     const rows = [
       ["Samsung", "Galaxy A57 5G",  d(120), "Mid Range"],
       ["Redmi",   "Note 15 Pro 5G", d(95),  "Budget"],
@@ -2987,19 +2980,36 @@ function AddForm({ onClose, onSave, onImport, existing = [] }) {
    One function, two formats. Called by the stats cards and from
    anywhere else that needs to download tabular data.              */
 
+/* Hand a blob to the browser as a download.
+
+   Two things have to be right or nothing lands in the Downloads folder:
+     - the anchor must be IN the document — Firefox ignores click() on a
+       detached node
+     - the object URL must stay alive until the download has started —
+       revoking it on the next line cancels the transfer                */
+function saveFile(filename, content, mime, ext) {
+  const blob = new Blob(["﻿" + content], { type: mime + ";charset=utf-8;" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = filename.replace(/\s+/g, "_") + ext;
+  a.rel      = "noopener";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 2000);
+}
+
 function downloadReport(filename, headers, rows, fmt) {
   const isCSV = fmt === "csv";
   const lines = [headers, ...rows].map((r) =>
     isCSV
       ? r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")
-      : r.join("\t")
-  ).join("\n");
-  const mime = isCSV ? "text/csv" : "application/vnd.ms-excel";
-  const ext  = isCSV ? ".csv" : ".xls";
-  const a    = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob(["﻿" + lines], { type: mime + ";charset=utf-8;" }));
-  a.download = filename.replace(/\s+/g, "_") + ext;
-  a.click(); URL.revokeObjectURL(a.href);
+      : r.map((v) => String(v ?? "").replace(/[\t\r\n]+/g, " ")).join("\t")
+  ).join("\r\n");
+  saveFile(filename, lines,
+    isCSV ? "text/csv" : "application/vnd.ms-excel",
+    isCSV ? ".csv" : ".xls");
 }
 
 /* Planned report — every phone at Planned stage with cover details */
