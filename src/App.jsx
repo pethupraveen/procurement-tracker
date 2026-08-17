@@ -376,9 +376,13 @@ const ROLES = [
   { key: "sales",       label: "Sales",       color: "var(--dim)"    },
 ];
 
+/* Which stages a role may put a phone into. Used for forward moves
+   (advanceStatus) and backward ones (moveStatus) alike — the role that
+   owns a stage is the role allowed to move work into it. "research" is
+   never a forward target, it only matters when moving back.          */
 const ROLE_CAN_ADVANCE_TO = {
-  admin:       ["planned","ordered","production","received","live"],
-  procurement: ["planned","ordered"],
+  admin:       ["research","planned","ordered","production","received","live"],
+  procurement: ["research","planned","ordered"],
   warehouse:   ["production","received","live"],
   catalog:     [],
   sales:       [],
@@ -441,14 +445,45 @@ function listingQueue(models) {
   return rows;
 }
 
+const roleLabel = (role) => ROLES.find((r) => r.key === role)?.label || "Your role";
+
+/* Every stage change goes through this list */
+const canEnterStage = (role, stageKey) =>
+  !!role && role !== "none" && !!ROLE_CAN_ADVANCE_TO[role]?.includes(stageKey);
+
 function advanceStatus(model, role) {
   const next = STAGES[model.index + 1];
   if (!next) return { ok: false, next: null, reason: "Already live" };
-  if (role && role !== "none" && !ROLE_CAN_ADVANCE_TO[role]?.includes(next.key))
-    return { ok: false, next, reason: `${ROLES.find(r => r.key === role)?.label} can't move to ${next.label}` };
+  if (role && role !== "none" && !canEnterStage(role, next.key))
+    return { ok: false, next, reason: `${roleLabel(role)} can't move to ${next.label}` };
   const block = gateBlock(model);
   if (block) return { ok: false, next, reason: block };
   return { ok: true, next, reason: null };
+}
+
+/* Can this role drop the phone on `stageKey`? One place for every move —
+   the board's drag-and-drop, the Detail footer and the ← back button —
+   so no route around the rules is left open.
+     forward  → must be a single step, and pass advanceStatus
+     backward → the role must own the stage it lands in                */
+function moveStatus(model, role, stageKey) {
+  const target = stageIndex(stageKey);
+  if (target < 0)             return { ok: false, reason: "Unknown stage" };
+  if (target === model.index) return { ok: false, reason: "Already there" };
+
+  if (target > model.index) {
+    /* role first — "Sales can't move to Live" beats "Move to Ordered first" */
+    if (!canEnterStage(role, stageKey))
+      return { ok: false, reason: `${roleLabel(role)} can't move to ${STAGES[target].label}` };
+    if (target > model.index + 1)
+      return { ok: false, reason: `Move to ${STAGES[model.index + 1].label} first` };
+    const st = advanceStatus(model, role);
+    return { ok: st.ok, reason: st.reason };
+  }
+
+  if (!canEnterStage(role, stageKey))
+    return { ok: false, reason: `${roleLabel(role)} can't move back to ${STAGES[target].label}` };
+  return { ok: true, reason: null };
 }
 
 /* ── SEARCH & SORT ──────────────────────────────────────────────── */
@@ -950,8 +985,13 @@ function Board({ models, allModels, onOpen, onMove, onAdd, onAdvance, role, comp
   const [over, setOver]         = useState(null);
   const [collapsed, setCollapsed] = useState({});   // { stageKey: true }
 
+  /* A column only accepts the card if the role is allowed to make that
+     move — the same rule the Move button uses, so dragging can't be a
+     way around it. Illegal columns never light up and never accept. */
+  const canDropOn = (stageKey) => !!dragging && moveStatus(dragging, role, stageKey).ok;
+
   const drop = (stageKey) => {
-    if (dragging && dragging.stage !== stageKey) onMove(dragging.id, stageKey);
+    if (canDropOn(stageKey)) onMove(dragging.id, stageKey);
     setDragging(null); setOver(null);
   };
 
@@ -1020,7 +1060,7 @@ function Board({ models, allModels, onOpen, onMove, onAdd, onAdvance, role, comp
             <div
               className="col-body"
               data-over={over === stage.key ? "1" : "0"}
-              onDragOver={(e) => { e.preventDefault(); setOver(stage.key); }}
+              onDragOver={(e) => { if (!canDropOn(stage.key)) return; e.preventDefault(); setOver(stage.key); }}
               onDragLeave={() => setOver((o) => (o === stage.key ? null : o))}
               onDrop={() => drop(stage.key)}
             >
@@ -1221,20 +1261,26 @@ function Table({ models, allModels, onOpen, onAdvance, role, filters }) {
 
 
 
+/* ── READ-ONLY NOTICE ────────────────────────────────────────────
+   Shown in place of (or beside) an editor when the signed-in role
+   isn't allowed to save it. The data still shows — only the
+   controls go away.                                               */
+
+function RoleLocked({ what, who }) {
+  return (
+    <div className="card" style={{ color: "var(--dim)", fontSize: 12.5, marginBottom: 12 }}>
+      Read-only — your role cannot {what}. Contact {who} or Admin.
+    </div>
+  );
+}
+
+
 /* ── PLANNED STAGE: COVER TYPES + THEIR SKUs ─────────────────────
    Pick cover types, then add as many SKUs as you need under each one.
    Every SKU has its own material and unit count, so a single
    "Silicone Cover" can hold ten SKUs in ten different colours.      */
 
 function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
-  if (!onSave) return (
-    <div>
-      <h2 style={{ color: "var(--warn)" }}>▸ SKUs</h2>
-      <div className="card" style={{ color: "var(--dim)", fontSize: 13 }}>
-        Your role cannot edit SKUs. Contact Procurement or Admin.
-      </div>
-    </div>
-  );
   const [draft, setDraft] = useState(
     () => (model.skus || []).map((r) => ({ ...r }))
   );
@@ -1388,26 +1434,30 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
 /* ── PO NUMBER — typed by the buyer, never invented ──────────────── */
 
 function POField({ model, onSave }) {
+  const canEdit = !!onSave;
   const [po, setPo] = useState(model.po || "");
   const [saved, setSaved] = useState(false);
-  const dirty = po.trim() !== (model.po || "");
+  const dirty = canEdit && po.trim() !== (model.po || "");
   const save = () => { onSave(model.id, po); setSaved(true); setTimeout(() => setSaved(false), 1800); };
 
   return (
     <div style={{ marginBottom: 16, paddingBottom: 14, borderBottom: "1px solid var(--line)" }}>
+      {!canEdit && <RoleLocked what="set the PO number" who="Procurement" />}
       <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
         <div style={{ flex: 1, minWidth: 200 }}>
           <Field label="Purchase order number">
-            <input value={po} placeholder="Type your real PO number"
-              style={{ fontFamily: "var(--mono)" }}
+            <input value={po} placeholder={canEdit ? "Type your real PO number" : "No PO recorded"}
+              style={{ fontFamily: "var(--mono)" }} readOnly={!canEdit}
               onChange={(e) => setPo(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && dirty && save()} />
           </Field>
         </div>
-        <button className="btn" data-primary="1" style={{ opacity: dirty ? 1 : 0.4 }}
-          onClick={() => dirty && save()}>
-          {saved ? "✓ Saved" : "Save PO"}
-        </button>
+        {canEdit && (
+          <button className="btn" data-primary="1" style={{ opacity: dirty ? 1 : 0.4 }}
+            onClick={() => dirty && save()}>
+            {saved ? "✓ Saved" : "Save PO"}
+          </button>
+        )}
       </div>
       {!model.po && (
         <div style={{ fontSize: 11, color: "var(--warn)", marginTop: 4 }}>
@@ -1477,6 +1527,7 @@ function SKUExport({ model, onPOSave }) {
    carries its own STP status.                                     */
 
 function ProductionSTP({ model, onSTPUpdate }) {
+  const canEdit = !!onSTPUpdate;
   const rows = allSkus(model);
   const [draft, setDraft] = useState(
     () => Object.fromEntries(rows.map((r) => [r.rid, r.stpStatus || "Not Sent"]))
@@ -1504,6 +1555,8 @@ function ProductionSTP({ model, onSTPUpdate }) {
           Each SKU has its own STP file, so one material can be rejected while the rest pass.
         </div>
 
+        {!canEdit && <RoleLocked what="update STP status" who="Warehouse" />}
+
         {missingData.length > 0 && (
           <div style={{ fontSize: 12, color: "var(--bad)", marginBottom: 12 }}>
             {missingData.length} SKU{missingData.length > 1 ? "s" : ""} missing a material or code — fix in Planned before filing.
@@ -1511,13 +1564,15 @@ function ProductionSTP({ model, onSTPUpdate }) {
         )}
 
         {/* set every row at once */}
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
-          <span style={{ fontSize: 11, color: "var(--dim)" }}>Set all:</span>
-          {STP_STATUSES.map((st) => (
-            <button key={st} className="btn" style={{ fontSize: 11, padding: "3px 8px" }}
-              onClick={() => setAll(st)}>{st}</button>
-          ))}
-        </div>
+        {canEdit && (
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+            <span style={{ fontSize: 11, color: "var(--dim)" }}>Set all:</span>
+            {STP_STATUSES.map((st) => (
+              <button key={st} className="btn" style={{ fontSize: 11, padding: "3px 8px" }}
+                onClick={() => setAll(st)}>{st}</button>
+            ))}
+          </div>
+        )}
 
         <div style={{ overflowX: "auto", marginBottom: 12 }}>
           <table>
@@ -1530,6 +1585,7 @@ function ProductionSTP({ model, onSTPUpdate }) {
                   <td className="n">{qty(r.units)}</td>
                   <td style={{ padding: "6px 8px" }}>
                     <select value={draft[r.rid] || "Not Sent"} style={{ fontSize: 12 }}
+                      disabled={!canEdit}
                       onChange={(e) => setDraft((d) => ({ ...d, [r.rid]: e.target.value }))}>
                       {STP_STATUSES.map((st) => <option key={st}>{st}</option>)}
                     </select>
@@ -1541,7 +1597,9 @@ function ProductionSTP({ model, onSTPUpdate }) {
         </div>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-          <button className="btn" data-primary="1" onClick={save}>{saved ? "✓ Saved" : "Save STP status"}</button>
+          {canEdit && (
+            <button className="btn" data-primary="1" onClick={save}>{saved ? "✓ Saved" : "Save STP status"}</button>
+          )}
           <button className="btn" onClick={() => exportSTP("csv")}>↓ CSV</button>
           <button className="btn" onClick={() => exportSTP("excel")}>↓ Excel</button>
           <span style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -1561,6 +1619,7 @@ function ProductionSTP({ model, onSTPUpdate }) {
    All covers must be confirmed before you can move to Live.        */
 
 function ReceivedChecker({ model, onSave }) {
+  const canEdit = !!onSave;
   const [rows, setRows] = useState(() =>
     allSkus(model).map((r) => ({
       rid: r.rid, sku: r.sku, material: r.material,
@@ -1605,8 +1664,12 @@ function ReceivedChecker({ model, onSave }) {
           the shortfall shows up in the received report so you can chase it.
         </div>
 
-        <button className="btn" style={{ fontSize: 11, padding: "4px 9px", marginBottom: 12 }}
-          onClick={markAllFull}>Mark all received in full</button>
+        {!canEdit && <RoleLocked what="confirm goods receipt" who="Warehouse" />}
+
+        {canEdit && (
+          <button className="btn" style={{ fontSize: 11, padding: "4px 9px", marginBottom: 12 }}
+            onClick={markAllFull}>Mark all received in full</button>
+        )}
 
         <div style={{ overflowX: "auto", marginBottom: 12 }}>
           <table>
@@ -1625,6 +1688,7 @@ function ReceivedChecker({ model, onSave }) {
                     <td style={{ padding: "6px 8px" }}>
                       <input type="number" min="0" value={r.received ?? ""} placeholder="qty"
                         style={{ fontFamily: "var(--mono)", fontSize: 12, width: 100 }}
+                        readOnly={!canEdit}
                         onChange={(e) => setQty(r.rid, e.target.value)} />
                     </td>
                     <td className="n" style={{ color: gapRow > 0 ? "var(--bad)" : "var(--dim)" }}>
@@ -1636,12 +1700,14 @@ function ReceivedChecker({ model, onSave }) {
                       </Tag>
                     </td>
                     <td style={{ whiteSpace: "nowrap", padding: "6px 4px" }}>
-                      <button className="btn" title="Received in full"
-                        style={{ padding: "3px 6px", fontSize: 11 }}
-                        onClick={() => markFull(r.rid)}><CheckCircle2 size={11} /></button>
-                      <button className="btn" title="Nothing arrived"
-                        style={{ padding: "3px 6px", fontSize: 11, marginLeft: 4, color: "var(--bad)" }}
-                        onClick={() => markNone(r.rid)}><X size={11} /></button>
+                      {canEdit && (<>
+                        <button className="btn" title="Received in full"
+                          style={{ padding: "3px 6px", fontSize: 11 }}
+                          onClick={() => markFull(r.rid)}><CheckCircle2 size={11} /></button>
+                        <button className="btn" title="Nothing arrived"
+                          style={{ padding: "3px 6px", fontSize: 11, marginLeft: 4, color: "var(--bad)" }}
+                          onClick={() => markNone(r.rid)}><X size={11} /></button>
+                      </>)}
                     </td>
                   </tr>
                 );
@@ -1651,7 +1717,9 @@ function ReceivedChecker({ model, onSave }) {
         </div>
 
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <button className="btn" data-primary="1" onClick={save}>{saved ? "✓ Saved" : "Save receipt"}</button>
+          {canEdit && (
+            <button className="btn" data-primary="1" onClick={save}>{saved ? "✓ Saved" : "Save receipt"}</button>
+          )}
           {pending > 0
             ? <Tag>{pending} still unconfirmed</Tag>
             : gap > 0
@@ -1671,6 +1739,7 @@ function ReceivedChecker({ model, onSave }) {
    Click any cell to cycle its status.                             */
 
 function ListingEditor({ model, onSave }) {
+  const canEdit = !!onSave;
   const rows = allSkus(model);
   const [draft, setDraft] = useState(() =>
     Object.fromEntries(rows.map((r) => [r.rid, { ...(r.listings || {}) }]))
@@ -1718,12 +1787,18 @@ function ListingEditor({ model, onSave }) {
       <h2 style={{ color: "var(--warn)" }}>▸ Marketplace listing</h2>
       <div className="card">
         <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
-          Click any cell to cycle it: Not listed → In progress → Live → Blocked.
-          Use a column header button to set a whole marketplace at once.
+          {canEdit
+            ? <>Click any cell to cycle it: Not listed → In progress → Live → Blocked.
+                Use a column header button to set a whole marketplace at once.</>
+            : <>Where each SKU stands on every marketplace.</>}
         </div>
 
-        <button className="btn" style={{ fontSize: 11, padding: "4px 9px", marginBottom: 12 }}
-          onClick={setAllLive}>Mark everything live</button>
+        {!canEdit && <RoleLocked what="change listing status" who="Catalog" />}
+
+        {canEdit && (
+          <button className="btn" style={{ fontSize: 11, padding: "4px 9px", marginBottom: 12 }}
+            onClick={setAllLive}>Mark everything live</button>
+        )}
 
         <div style={{ overflowX: "auto", marginBottom: 12 }}>
           <table>
@@ -1734,9 +1809,11 @@ function ListingEditor({ model, onSave }) {
                 {MARKETPLACES.map((mp) => (
                   <th key={mp} style={{ textAlign: "center", minWidth: 96 }}>
                     <div>{mp}</div>
-                    <button className="btn"
-                      style={{ fontSize: 9, padding: "1px 5px", marginTop: 3, fontWeight: 400 }}
-                      onClick={() => setColumn(mp, "Live")}>all live</button>
+                    {canEdit && (
+                      <button className="btn"
+                        style={{ fontSize: 9, padding: "1px 5px", marginTop: 3, fontWeight: 400 }}
+                        onClick={() => setColumn(mp, "Live")}>all live</button>
+                    )}
                   </th>
                 ))}
               </tr>
@@ -1750,13 +1827,14 @@ function ListingEditor({ model, onSave }) {
                     const st = draft[r.rid]?.[mp] || "Not listed";
                     return (
                       <td key={mp} style={{ textAlign: "center", padding: "6px 4px" }}>
-                        <button className="btn"
-                          title={`${r.sku || "SKU"} on ${mp} — click to change`}
+                        <button className="btn" disabled={!canEdit}
+                          title={canEdit ? `${r.sku || "SKU"} on ${mp} — click to change` : `${mp}: ${st}`}
                           style={{ fontSize: 10, padding: "3px 7px", width: "100%",
+                            cursor: canEdit ? "pointer" : "default",
                             color: st === "Live" ? "var(--ok)" : st === "Blocked" ? "var(--bad)"
                                  : st === "In progress" ? "var(--warn)" : "var(--dim)",
                             borderColor: st === "Live" ? "var(--ok)" : st === "Blocked" ? "var(--bad)" : undefined }}
-                          onClick={() => cycle(r.rid, mp)}>
+                          onClick={() => canEdit && cycle(r.rid, mp)}>
                           {st === "Not listed" ? "—" : st === "In progress" ? "WIP" : st}
                         </button>
                       </td>
@@ -1769,7 +1847,9 @@ function ListingEditor({ model, onSave }) {
         </div>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
-          <button className="btn" data-primary="1" onClick={save}>{saved ? "✓ Saved" : "Save listing status"}</button>
+          {canEdit && (
+            <button className="btn" data-primary="1" onClick={save}>{saved ? "✓ Saved" : "Save listing status"}</button>
+          )}
           <button className="btn" onClick={() => exportListing("csv")}>↓ CSV</button>
           <button className="btn" onClick={() => exportListing("excel")}>↓ Excel</button>
         </div>
@@ -2180,14 +2260,6 @@ function SalesTracker({ model, onSave, canLog }) {
    model name, launch date and segment right where you're looking. */
 
 function ResearchEditor({ model, onSave }) {
-  if (!onSave) return (
-    <div>
-      <h2 style={{ color: "var(--warn)" }}>▸ Research — edit phone details</h2>
-      <div className="card" style={{ color: "var(--dim)", fontSize: 13 }}>
-        Your role cannot edit phone details. Contact Procurement or Admin.
-      </div>
-    </div>
-  );
   const [form, setForm] = useState({
     brand:   model.brand,
     name:    model.name,
@@ -2290,13 +2362,27 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
 
           {/* Research stage: edit phone details */}
           {model.stage === "research" && (
-            <ResearchEditor model={model} onSave={onResearchSave} />
+            onResearchSave
+              ? <ResearchEditor model={model} onSave={onResearchSave} />
+              : (
+                <div>
+                  <h2 style={{ color: "var(--warn)" }}>▸ Research — phone details</h2>
+                  <RoleLocked what="edit phone details" who="Procurement" />
+                </div>
+              )
           )}
 
           {/* Covers stay editable after Planned — a new colour can come up
               mid-production and you shouldn't have to move the phone back. */}
           {["planned", "ordered", "production"].includes(model.stage) && (
-            <PlannedSKUEditor model={model} onSave={onSKUSave} stage={model.stage} />
+            onSKUSave
+              ? <PlannedSKUEditor model={model} onSave={onSKUSave} stage={model.stage} />
+              : (
+                <div>
+                  <h2 style={{ color: "var(--warn)" }}>▸ SKUs</h2>
+                  <RoleLocked what="edit SKUs" who="Procurement" />
+                </div>
+              )
           )}
 
           {/* Ordered stage: export SKU list for the supplier */}
@@ -2374,12 +2460,18 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
         </div>
 
         <div className="panel-foot">
-          {model.index > 0 && (
-            <button className="btn" onClick={() => onGoBack(model.id)}
-              title={`Move back to ${STAGES[model.index - 1].label}`}>
-              ← {STAGES[model.index - 1].label}
-            </button>
-          )}
+          {model.index > 0 && (() => {
+            const prev = STAGES[model.index - 1];
+            const back = moveStatus(model, role, prev.key);
+            return (
+              <button className="btn"
+                style={{ opacity: back.ok ? 1 : 0.4, cursor: back.ok ? undefined : "not-allowed" }}
+                title={back.ok ? `Move back to ${prev.label}` : back.reason}
+                onClick={() => back.ok && onGoBack(model.id)}>
+                ← {prev.label}
+              </button>
+            );
+          })()}
           {!isLast && (() => {
             const st = advanceStatus(model, role);
             return (
@@ -3983,10 +4075,13 @@ function UserManager({ users, onSave, onClose }) {
 
   const saveUser = (id) => {
     if (!form.name?.trim()) return;
+    const name = form.name.trim();
     setList(l => l.map(u => u.id !== id ? u : {
       ...u,
-      name: form.name.trim() + " (" + ROLES.find(r => r.key === form.role)?.label + ")",
+      name: name + " (" + ROLES.find(r => r.key === form.role)?.label + ")",
       role: form.role,
+      /* the badge letter follows the name, or it keeps showing the old one */
+      avatar: name.charAt(0).toUpperCase() || u.avatar,
       ...(newPin.length >= 4 ? { pin: hashPin(newPin) } : {}),
     }));
     setMsg("Saved"); setTimeout(() => setMsg(""), 1500);
@@ -4388,44 +4483,52 @@ export default function App() {
   );
   const open = openId ? models.find((m) => m.id === openId) : null;
 
-  /* move a phone to a stage and record the date it happened */
+  /* move a phone to a stage and record the date it happened.
+     Never call this directly from the UI — go through move(), which
+     checks the role first. */
   const moveTo = (id, stageKey) => setPhones((list) => {
+    const target = stageIndex(stageKey);
     const next = list.map((p) => {
       if (p.id !== id) return p;
       const done = { ...p.done };
-      STAGES.slice(0, stageIndex(stageKey) + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
+      if (target > stageIndex(p.stage)) {
+        STAGES.slice(0, target + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
+      } else {
+        /* moving back: strip the dates for stages that un-happened,
+           so the timeline stays honest */
+        STAGES.slice(target + 1).forEach((s) => { delete done[s.key]; });
+      }
       return withAudit({ ...p, stage: stageKey, done }, session,
-        `Moved to ${STAGES[stageIndex(stageKey)].label}`);
+        target > stageIndex(p.stage)
+          ? `Moved to ${STAGES[target].label}`
+          : `Moved back to ${STAGES[target].label}`);
     });
     const updated = next.find(p => p.id === id);
     if (updated) persist(updated);
     return next;
   });
 
+  /* the single gate every stage change passes through */
+  const move = (id, stageKey) => {
+    const m = models.find((x) => x.id === id);
+    if (!m) return;
+    const st = moveStatus(m, role, stageKey);
+    if (!st.ok) { say(`⚠ ${st.reason}`); return; }
+    const back = stageIndex(stageKey) < m.index;
+    moveTo(id, stageKey);
+    say(`${m.name} moved ${back ? "back " : ""}to ${STAGES[stageIndex(stageKey)].label}`);
+  };
+
   const advance = (id) => {
     const m = models.find((x) => x.id === id);
-    const next = STAGES[m.index + 1];
-    if (next) { moveTo(id, next.key); say(`${m.name} moved to ${next.label}`); }
+    const next = m && STAGES[m.index + 1];
+    if (next) move(id, next.key);
   };
 
   const goBack = (id) => {
     const m = models.find((x) => x.id === id);
-    const prev = STAGES[m.index - 1];
-    if (!prev) return;
-    /* moving back: strip the current stage's done date so the timeline is honest */
-    setPhones((list) => {
-      const next = list.map((p) => {
-        if (p.id !== id) return p;
-        const done = { ...p.done };
-        delete done[m.stage];
-        return withAudit({ ...p, stage: prev.key, done }, session,
-          `Moved back to ${prev.label}`);
-      });
-      const updated = next.find(p => p.id === id);
-      if (updated) persist(updated);
-      return next;
-    });
-    say(`${m.name} moved back to ${prev.label}`);
+    const prev = m && STAGES[m.index - 1];
+    if (prev) move(id, prev.key);
   };
 
   /* save edited phone details from ResearchEditor */
@@ -4771,7 +4874,7 @@ export default function App() {
 
         {view === "dashboard" && <Dashboard models={liveModels} onOpen={setOpenId} onAdd={() => setAdding(true)}
                                   onNavigate={navigate} role={role} />}
-        {view === "board"     && <Board models={visible} allModels={models} onOpen={setOpenId} onMove={moveTo}
+        {view === "board"     && <Board models={visible} allModels={models} onOpen={setOpenId} onMove={move}
                                   onAdd={() => setAdding(true)} onAdvance={advance} role={role}
                                   compact={compact} filters={filters} />}
         {view === "table"     && <Table models={visible} allModels={models} onOpen={setOpenId}
@@ -4834,13 +4937,24 @@ export default function App() {
         <UserManager
           users={users}
           onSave={async (updated) => {
+            /* accounts the admin removed in the dialog — they have to be
+               deleted in the DB too, or they come back on the next load
+               and can still sign in from another browser meanwhile */
+            const removed = users.filter((u) => !updated.some((n) => n.id === u.id));
             setUsers(updated);
             const me = updated.find(u => u.id === session?.id);
             if (me) { setSession(me); saveSession(me); }
             if (dbOnline) {
-              await Promise.all(updated.map(dbUpsertUser));
+              await Promise.all([
+                ...updated.map(dbUpsertUser),
+                ...removed.map((u) => dbDeleteUser(u.id)),
+              ]);
             }
-            say("Users saved");
+            /* an admin who deleted their own account is signed out */
+            if (!me) { setManageUsers(false); logout(); return; }
+            say(removed.length
+              ? `Users saved · ${removed.length} account${removed.length === 1 ? "" : "s"} removed`
+              : "Users saved");
           }}
           onClose={() => setManageUsers(false)}
         />
