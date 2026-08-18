@@ -47,8 +47,20 @@ const STAGES = [
   { key: "production", label: "Production", daysBeforeLaunch:  60, hint: "Supplier is manufacturing the covers." },
   { key: "received",   label: "Received",   daysBeforeLaunch:  25, hint: "Stock arrived, checked, in the warehouse." },
   { key: "live",       label: "Live",       daysBeforeLaunch:   0, hint: "Listed and selling on the marketplaces." },
+
+  /* Off the line. A phone we looked at and decided not to buy. It keeps
+     its record — brand, launch date, notes — but it has no deadlines,
+     no alerts, and no next stage.                                     */
+  { key: "unprocured", label: "Un-Procurement", daysBeforeLaunch: null, terminal: true,
+    hint: "Looked at it, decided not to buy. Kept for the record." },
 ];
 const stageIndex = (key) => STAGES.findIndex((s) => s.key === key);
+
+/* The straight path only. Every rule that walks the pipeline in order —
+   progress, deadlines, next/previous stage — reads PIPELINE, never
+   STAGES, so a terminal stage is never mistaken for "one step further". */
+const PIPELINE   = STAGES.filter((s) => !s.terminal);
+const isTerminal = (key) => !!STAGES[stageIndex(key)]?.terminal;
 
 
 /* ── 3. OPPORTUNITY SCORE REMOVED ─────────────────────────────── */
@@ -233,7 +245,9 @@ const EMPTY = [];
    existed. Spot a phone 30 days before launch and everything is due at once,
    which is honest: you really are in trouble.                              */
 function plannedDate(model, stageKey) {
-  const fromLaunch = shift(model.launch, -STAGES[stageIndex(stageKey)].daysBeforeLaunch);
+  const days = STAGES[stageIndex(stageKey)]?.daysBeforeLaunch;
+  if (days == null) return null;                 // terminal stage — nothing is due
+  const fromLaunch = shift(model.launch, -days);
   const dayAdded   = model.done.research || iso(TODAY);
   return fromLaunch < dayAdded ? dayAdded : fromLaunch;
 }
@@ -241,6 +255,7 @@ function plannedDate(model, stageKey) {
 /* how late a stage is, in days. 0 or less = on time */
 function delayOf(model, stageKey) {
   const planned = plannedDate(model, stageKey);
+  if (!planned) return 0;
   const actual  = model.done[stageKey];
   if (actual) return daysBetween(planned, actual);           // finished: compare to plan
   const overdue = daysBetween(planned, iso(TODAY));          // not finished: how overdue now
@@ -257,17 +272,20 @@ function runwayOf(model) {
 }
 
 function derive(model) {
-  const index = stageIndex(model.stage);
+  const index    = stageIndex(model.stage);
+  const terminal = isTerminal(model.stage);
 
-
-  /* the worst delay across every stage up to where we are now */
-  const worstDelay = Math.max(0, ...STAGES.slice(0, index + 2).map((s) => delayOf(model, s.key)));
+  /* the worst delay across every stage up to where we are now.
+     A phone we decided not to buy cannot be late for anything. */
+  const worstDelay = terminal ? 0
+    : Math.max(0, ...PIPELINE.slice(0, index + 2).map((s) => delayOf(model, s.key)));
 
   return {
     ...model,
     index,
+    terminal,
     units: allSkus(model).reduce((sum, r) => sum + (r.units || 0), 0),
-    progress: Math.round(((index + 1) / STAGES.length) * 100),
+    progress: terminal ? 0 : Math.round(((index + 1) / PIPELINE.length) * 100),
     runway: runwayOf(model),
     daysToLaunch: daysFromToday(model.launch),
     worstDelay,
@@ -285,6 +303,9 @@ function derive(model) {
 function problemsOf(model) {
   const ps = [];
   const push = (type, text) => ps.push({ model, type, text });
+
+  /* Not being procured — no deadlines to miss, so nothing to warn about. */
+  if (model.terminal) return ps;
 
   if (model.isLate)
     push("bad", `+${model.worstDelay}d behind schedule`);
@@ -381,8 +402,8 @@ const ROLES = [
    owns a stage is the role allowed to move work into it. "research" is
    never a forward target, it only matters when moving back.          */
 const ROLE_CAN_ADVANCE_TO = {
-  admin:       ["research","planned","ordered","production","received","live"],
-  procurement: ["research","planned","ordered"],
+  admin:       ["research","planned","ordered","production","received","live","unprocured"],
+  procurement: ["research","planned","ordered","unprocured"],
   warehouse:   ["production","received","live"],
   catalog:     [],
   sales:       [],
@@ -452,7 +473,9 @@ const canEnterStage = (role, stageKey) =>
   !!role && role !== "none" && !!ROLE_CAN_ADVANCE_TO[role]?.includes(stageKey);
 
 function advanceStatus(model, role) {
-  const next = STAGES[model.index + 1];
+  if (isTerminal(model.stage))
+    return { ok: false, next: null, reason: "Not being procured" };
+  const next = PIPELINE[model.index + 1];
   if (!next) return { ok: false, next: null, reason: "Already live" };
   if (role && role !== "none" && !canEnterStage(role, next.key))
     return { ok: false, next, reason: `${roleLabel(role)} can't move to ${next.label}` };
@@ -471,12 +494,31 @@ function moveStatus(model, role, stageKey) {
   if (target < 0)             return { ok: false, reason: "Unknown stage" };
   if (target === model.index) return { ok: false, reason: "Already there" };
 
+  /* Terminal stages sit off the line, so comparing indexes says nothing.
+     Exactly two moves touch them:
+       Research → Un-Procurement   decided this phone is not worth buying
+       Un-Procurement → Research   changed our mind, look at it again    */
+  if (isTerminal(stageKey)) {
+    if (model.stage !== "research")
+      return { ok: false, reason: `Only a phone still at Research can go to ${STAGES[target].label}` };
+    if (!canEnterStage(role, stageKey))
+      return { ok: false, reason: `${roleLabel(role)} can't move to ${STAGES[target].label}` };
+    return { ok: true, reason: null };
+  }
+  if (isTerminal(model.stage)) {
+    if (stageKey !== "research")
+      return { ok: false, reason: "Move back to Research first" };
+    if (!canEnterStage(role, stageKey))
+      return { ok: false, reason: `${roleLabel(role)} can't move back to Research` };
+    return { ok: true, reason: null };
+  }
+
   if (target > model.index) {
     /* role first — "Sales can't move to Live" beats "Move to Ordered first" */
     if (!canEnterStage(role, stageKey))
       return { ok: false, reason: `${roleLabel(role)} can't move to ${STAGES[target].label}` };
     if (target > model.index + 1)
-      return { ok: false, reason: `Move to ${STAGES[model.index + 1].label} first` };
+      return { ok: false, reason: `Move to ${PIPELINE[model.index + 1].label} first` };
     const st = advanceStatus(model, role);
     return { ok: st.ok, reason: st.reason };
   }
@@ -2300,14 +2342,14 @@ function ResearchEditor({ model, onSave }) {
   );
 }
 
-function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave, onSalesLog, canLog, role, onAddNote, onDeleteNote, onAddAttachment, onDeleteAttachment, onArchive }) {
+function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave, onSalesLog, canLog, role, onAddNote, onDeleteNote, onAddAttachment, onDeleteAttachment, onArchive }) {
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const isLast = model.index === STAGES.length - 1;
+  const isLast = model.terminal || model.index === PIPELINE.length - 1;
   const isFirst = model.index === 0;
 
   return (
@@ -2420,7 +2462,7 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
               </div>
             )}
             <div className="card">
-              {STAGES.map((stage, i) => {
+              {PIPELINE.map((stage, i) => {
                 const doneOn  = model.done[stage.key];
                 const planned = plannedDate(model, stage.key);
                 const delay   = delayOf(model, stage.key);
@@ -2451,8 +2493,8 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
         </div>
 
         <div className="panel-foot">
-          {model.index > 0 && (() => {
-            const prev = STAGES[model.index - 1];
+          {(model.terminal || model.index > 0) && (() => {
+            const prev = model.terminal ? PIPELINE[0] : PIPELINE[model.index - 1];
             const back = moveStatus(model, role, prev.key);
             return (
               <button className="btn"
@@ -2478,6 +2520,14 @@ function Detail({ model, onClose, onAdvance, onGoBack, onResearchSave, onSKUSave
               </div>
             );
           })()}
+          {/* Decide against a phone while it is still only research */}
+          {onMove && model.stage === "research" && moveStatus(model, role, "unprocured").ok && (
+            <button className="btn" style={{ fontSize: 11, color: "var(--dim)" }}
+              title="We looked at this phone and decided not to buy it"
+              onClick={() => onMove(model.id, "unprocured")}>
+              Not procuring
+            </button>
+          )}
           {onArchive && (
             <button className="btn" style={{ marginLeft: "auto", fontSize: 11,
               color: model.archived ? "var(--ok)" : "var(--dim)" }}
@@ -3104,12 +3154,12 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
   const listable    = models.filter((m) => ["received","live"].includes(m.stage) && allSkus(m).length);
   const fullyListed = listable.filter((m) => allSkus(m).every(isFullyListed)).length;
   const listBlocked = listable.filter((m) => allSkus(m).some((r) => blockedCount(r) > 0)).length;
-  const launching14 = models.filter((m) => m.stage !== "live" && m.daysToLaunch >= 0 && m.daysToLaunch <= 14);
+  const launching14 = models.filter((m) => m.stage !== "live" && !m.terminal && m.daysToLaunch >= 0 && m.daysToLaunch <= 14);
   const soldUnits   = live.reduce((s, m) => s + m.sales.total, 0);
   const revenue     = live.reduce((s, m) => s + m.sales.revenue, 0);
   const noPO        = ordered.filter((m) => !m.po).length;
 
-  const funnelMax   = Math.max(1, ...STAGES.map((st) => byStage(st.key).length));
+  const funnelMax   = Math.max(1, ...PIPELINE.map((st) => byStage(st.key).length));
   const problems    = models.flatMap(problemsOf);
   const bad         = problems.filter((p) => p.type === "bad");
   const warn        = problems.filter((p) => p.type !== "bad");
@@ -3256,7 +3306,7 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
         <div className="card">
           <h2>Pipeline — click a stage</h2>
           <div className="funnel">
-            {STAGES.map((st) => {
+            {PIPELINE.map((st) => {
               const list     = byStage(st.key);
               const units    = list.reduce((t, m) => t + m.units, 0);
               const lateHere = list.filter((m) => m.isLate).length;
@@ -4500,18 +4550,26 @@ export default function App() {
     const target = stageIndex(stageKey);
     const next = list.map((p) => {
       if (p.id !== id) return p;
-      const done = { ...p.done };
-      if (target > stageIndex(p.stage)) {
-        STAGES.slice(0, target + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
-      } else {
-        /* moving back: strip the dates for stages that un-happened,
-           so the timeline stays honest */
-        STAGES.slice(target + 1).forEach((s) => { delete done[s.key]; });
+      const done  = { ...p.done };
+      const label = STAGES[target].label;
+
+      /* A terminal stage is a decision, not a step that got finished,
+         so it writes nothing to the timeline. */
+      if (isTerminal(stageKey))
+        return withAudit({ ...p, stage: stageKey, done }, session, `Marked ${label}`);
+      if (isTerminal(p.stage)) {
+        PIPELINE.slice(target + 1).forEach((s) => { delete done[s.key]; });
+        return withAudit({ ...p, stage: stageKey, done }, session, `Back into procurement at ${label}`);
       }
+
+      const forward = target > stageIndex(p.stage);
+      if (forward) PIPELINE.slice(0, target + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
+      /* moving back: strip the dates for stages that un-happened,
+         so the timeline stays honest */
+      else PIPELINE.slice(target + 1).forEach((s) => { delete done[s.key]; });
+
       return withAudit({ ...p, stage: stageKey, done }, session,
-        target > stageIndex(p.stage)
-          ? `Moved to ${STAGES[target].label}`
-          : `Moved back to ${STAGES[target].label}`);
+        forward ? `Moved to ${label}` : `Moved back to ${label}`);
     });
     const updated = next.find(p => p.id === id);
     if (updated) persist(updated);
@@ -4531,13 +4589,13 @@ export default function App() {
 
   const advance = (id) => {
     const m = models.find((x) => x.id === id);
-    const next = m && STAGES[m.index + 1];
+    const next = m && !m.terminal && PIPELINE[m.index + 1];
     if (next) move(id, next.key);
   };
 
   const goBack = (id) => {
     const m = models.find((x) => x.id === id);
-    const prev = m && STAGES[m.index - 1];
+    const prev = m && (m.terminal ? PIPELINE[0] : PIPELINE[m.index - 1]);
     if (prev) move(id, prev.key);
   };
 
@@ -4903,7 +4961,7 @@ export default function App() {
         {view === "reports"   && <Reports models={liveModels} />}
       </div>
 
-      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onResearchSave={CAN.editResearch(role) ? saveResearch : null} onSKUSave={CAN.editSKUs(role) ? saveSKU : null} onSTPUpdate={CAN.updateSTP(role) ? updateSTP : null} onReceiptSave={CAN.saveReceipt(role) ? saveReceipt : null} onPOSave={CAN.savePO(role) ? savePO : null} onListingSave={CAN.saveListing(role) ? saveListings : null} onSalesLog={logSale} canLog={CAN.logSales(role)} role={role}
+      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onMove={move} onResearchSave={CAN.editResearch(role) ? saveResearch : null} onSKUSave={CAN.editSKUs(role) ? saveSKU : null} onSTPUpdate={CAN.updateSTP(role) ? updateSTP : null} onReceiptSave={CAN.saveReceipt(role) ? saveReceipt : null} onPOSave={CAN.savePO(role) ? savePO : null} onListingSave={CAN.saveListing(role) ? saveListings : null} onSalesLog={logSale} canLog={CAN.logSales(role)} role={role}
                       onAddNote={addNote} onDeleteNote={deleteNote}
                       onAddAttachment={addAttachment} onDeleteAttachment={deleteAttachment}
                       onArchive={CAN.addPhone(role) ? setArchived : null} />}

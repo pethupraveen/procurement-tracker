@@ -30,7 +30,7 @@ create table phones (
   segment       text        not null default 'Mid Range',
   launch        date        not null,
   stage         text        not null default 'research'
-                check (stage in ('research','planned','ordered','production','received','live')),
+                check (stage in ('research','planned','ordered','production','received','live','unprocured')),
   po            text,
   done          jsonb       not null default '{}'::jsonb,
   skus          jsonb       not null default '[]'::jsonb,
@@ -75,7 +75,7 @@ from phones
 where not archived
 group by stage
 order by array_position(
-  array['research','planned','ordered','production','received','live'], stage);
+  array['research','planned','ordered','production','received','live','unprocured'], stage);
 
 -- ── Default users ───────────────────────────────────────────────
 -- PINs hashed with djb2 (same as the app):
