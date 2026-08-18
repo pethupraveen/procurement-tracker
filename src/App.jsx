@@ -5,14 +5,15 @@ import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, Layou
    NEW MODEL PROCUREMENT TRACKER — simple version
 
    The whole business loop, and nothing else:
-     1. Spot a new phone     -> add it
-     2. Research  → note the phone, no covers yet
-     3. Planned   → choose covers, set SKU + material
-     4. Ordered   → every SKU must be assigned first
-     5. Production → export STP file, track STP status
-     6. Received  → tick each cover received or not
-     7. Live      → only when all received covers confirmed
-     4. See what's running late
+     1. Research   → note the phone, no covers yet
+     2. Planned    → choose covers, set SKU + material
+     3. Ordered    → every SKU coded, PO number recorded
+     4. Production → export STP file, track STP status per SKU
+     5. Received   → tick each cover received or not
+     6. Live       → only once every SKU is listed everywhere
+
+   Off the line:
+     Un-Procurement → looked at it at Research, decided not to buy
 
    Read this file top to bottom. It's in dependency order:
      helpers -> stages -> data -> derive -> UI
@@ -405,7 +406,9 @@ const ROLE_CAN_ADVANCE_TO = {
   admin:       ["research","planned","ordered","production","received","live","unprocured"],
   procurement: ["research","planned","ordered","unprocured"],
   warehouse:   ["production","received","live"],
-  catalog:     [],
+  /* Catalog is the team that gets every SKU listed, which is the only
+     thing standing between Received and Live — so they make that move. */
+  catalog:     ["live"],
   sales:       [],
 };
 
@@ -436,6 +439,22 @@ function gateBlock(model) {
     const missing = allSkus(model).filter((r) => !r.sku?.trim());
     if (missing.length) return `${missing.length} SKU${missing.length > 1 ? "s" : ""} missing a code`;
   }
+  /* You cannot manufacture against a purchase order that doesn't exist.
+     The STP export carries the PO number, so it has to be in first. */
+  if (model.stage === "ordered" && !model.po?.trim())
+    return "No PO number recorded";
+
+  /* Goods can't be received against files the supplier never got, and a
+     rejected STP means that SKU is not being made at all. */
+  if (model.stage === "production") {
+    const rejected = allSkus(model).filter((r) => r.stpStatus === "Rejected");
+    if (rejected.length)
+      return `${rejected.length} STP file${rejected.length > 1 ? "s" : ""} rejected`;
+    const notSent = allSkus(model).filter((r) => !r.stpStatus || r.stpStatus === "Not Sent");
+    if (notSent.length)
+      return `${notSent.length} STP file${notSent.length > 1 ? "s" : ""} not sent yet`;
+  }
+
   if (model.stage === "received") {
     const unconf = allSkus(model).filter((r) => !isConfirmed(r));
     if (unconf.length) return `${unconf.length} SKU${unconf.length > 1 ? "s" : ""} not confirmed`;
@@ -651,7 +670,11 @@ const phoneToRow = (p) => ({
   notes: p.notes || [], attachments: p.attachments || [],
   audit: p.audit || [], archived: !!p.archived,
 });
+/* updatedAt is the row's version stamp, set by a trigger on every write.
+   It is never sent back — phoneToRow leaves it out — it only travels in,
+   so a save can check whether anyone else wrote since this tab read. */
 const rowToPhone = (r) => ({
+  updatedAt: r.updated_at || null,
   id: r.id, brand: r.brand, name: r.name, segment: r.segment,
   launch: r.launch, stage: r.stage, po: r.po,
   done: r.done || {}, skus: r.skus || [], salesEntries: r.sales_entries || [],
@@ -672,9 +695,32 @@ async function dbLoadPhones() {
   const { data, error } = await c.get("/phones?order=id");
   return { data: error ? null : (data || []).map(rowToPhone), error };
 }
+/* Every save writes the WHOLE phone row, so a blind write silently wipes
+   anything a colleague changed since this tab loaded. Compare version
+   stamps first and refuse rather than clobber.
+
+   Returns one of:
+     { conflict: true }   somebody else got there first — caller reloads
+     { error }            the write failed
+     { updatedAt }        saved; the fresh stamp to hold for the next save */
 async function dbUpsertPhone(phone) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
-  return c.upsert("/phones?on_conflict=id", phoneToRow(phone));
+
+  if (phone.updatedAt) {
+    const { data, error } = await c.get("/phones?select=updated_at&id=eq." + phone.id);
+    if (error) return { error };
+    const server = data?.[0]?.updated_at;
+    /* No row on the server means it was deleted; let the write recreate it. */
+    if (server && server !== phone.updatedAt) return { conflict: true };
+  }
+
+  const { error } = await c.upsert("/phones?on_conflict=id", phoneToRow(phone));
+  if (error) return { error };
+
+  /* Read back the stamp the trigger just wrote, or this tab would report a
+     conflict against its own save the very next time. */
+  const { data } = await c.get("/phones?select=updated_at&id=eq." + phone.id);
+  return { updatedAt: data?.[0]?.updated_at || null };
 }
 async function dbDeletePhone(id) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
@@ -2554,7 +2600,7 @@ function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, o
 function Calendar({ models, onOpen, role }) {
   const [offset, setOffset] = useState(0);   // months from now
 
-  const active = models.filter((m) => !m.archived);
+  const active = models.filter((m) => !m.archived && !m.terminal);
 
   /* group by YYYY-MM */
   const byMonth = {};
@@ -2878,6 +2924,20 @@ function CSVImport({ existing, onImport, onDone }) {
 
 const NEW_MODEL = { brand: "", name: "", segment: "Mid Range", launch: "" };
 
+/* A new phone's id.
+
+   max(id)+1 looks obvious and is wrong the moment two people use the app:
+   both browsers read the same list, both compute the same next number, and
+   the second upsert silently overwrites the first phone. A random id in
+   Postgres integer range makes that practically impossible, and we still
+   check the ids we can see.                                             */
+function newPhoneId(existing) {
+  const taken = new Set(existing.map((p) => p.id));
+  let id;
+  do { id = 1 + Math.floor(Math.random() * 2000000000); } while (taken.has(id));
+  return id;
+}
+
 /* Loose match so "Galaxy A57 5G" and "galaxy a57  5g" collide */
 const normName = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 const findDuplicate = (list, brand, name) =>
@@ -3159,7 +3219,11 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
   const revenue     = live.reduce((s, m) => s + m.sales.revenue, 0);
   const noPO        = ordered.filter((m) => !m.po).length;
 
-  const funnelMax   = Math.max(1, ...PIPELINE.map((st) => byStage(st.key).length));
+  const notProcured = models.filter((m) => m.terminal);
+  /* Un-Procurement only earns a funnel row once something is in it —
+     otherwise the pipeline reads as seven stages when it is six. */
+  const funnelStages = notProcured.length ? STAGES : PIPELINE;
+  const funnelMax   = Math.max(1, ...funnelStages.map((st) => byStage(st.key).length));
   const problems    = models.flatMap(problemsOf);
   const bad         = problems.filter((p) => p.type === "bad");
   const warn        = problems.filter((p) => p.type !== "bad");
@@ -3228,6 +3292,12 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
       <div className="kpi-grid">
         <KPI label="Phones tracked" value={models.length} sub="across all stages"
           onClick={() => go("table", {})} hint="Open the full list" />
+
+        {notProcured.length > 0 && (
+          <KPI label="Not procuring" value={notProcured.length}
+            sub="decided against at Research"
+            onClick={() => go("board", {})} hint="Show the board" />
+        )}
 
         <KPI label="Research" value={research.length}
           sub={research.length ? research.map(m=>m.name).join(", ").slice(0,40) : "None yet"}
@@ -3306,7 +3376,7 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
         <div className="card">
           <h2>Pipeline — click a stage</h2>
           <div className="funnel">
-            {PIPELINE.map((st) => {
+            {funnelStages.map((st) => {
               const list     = byStage(st.key);
               const units    = list.reduce((t, m) => t + m.units, 0);
               const lateHere = list.filter((m) => m.isLate).length;
@@ -4471,6 +4541,7 @@ export default function App() {
   const [confirmReset, setConfirmReset] = useState(false);
   const [filters, setFilters] = useState(EMPTY_FILTERS);
   const [compact, setCompact] = useState(false);
+  const [syncedAt, setSyncedAt] = useState(null);
 
   /* ── load data from Supabase on mount & after login ── */
   const loadFromDB = async () => {
@@ -4480,7 +4551,7 @@ export default function App() {
     if (up.error || ph.error) {
       setDbOnline(false); setDbError(up.error || ph.error);
     } else {
-      setDbOnline(true); setDbError("");
+      setDbOnline(true); setDbError(""); setSyncedAt(new Date());
       if (up.data?.length) {
         setUsers(up.data);
         /* Re-validate a restored session against the live user list —
@@ -4501,12 +4572,33 @@ export default function App() {
 
   useEffect(() => { loadFromDB(); }, []);   // on mount
 
+  /* Everyone shares one database, and a save writes the whole phone row.
+     A tab left open all morning would happily overwrite work it never saw,
+     so re-read whenever this tab comes back to the front, and every 90s
+     while it is in view.                                                */
+  useEffect(() => {
+    if (!dbOnline) return;
+    const refresh = () => { if (!document.hidden) loadFromDB(); };
+    const timer = setInterval(refresh, 90000);
+    window.addEventListener("focus", refresh);
+    return () => { clearInterval(timer); window.removeEventListener("focus", refresh); };
+  }, [dbOnline]);
+
   /* ── write-through helper: update local state + persist ── */
   const persist = async (updatedPhone) => {
-    if (dbOnline) {
-      const { error } = await dbUpsertPhone(updatedPhone);
-      if (error) say("⚠ DB save failed: " + error);
+    if (!dbOnline) return;
+    const { error, conflict, updatedAt } = await dbUpsertPhone(updatedPhone);
+
+    if (conflict) {
+      say("⚠ Someone else changed this phone — reloading, please redo your edit");
+      loadFromDB();
+      return;
     }
+    if (error) { say("⚠ DB save failed: " + error); return; }
+
+    /* hold the new stamp so the next save from this tab compares correctly */
+    if (updatedAt) setPhones((list) => list.map((p) =>
+      p.id === updatedPhone.id ? { ...p, updatedAt } : p));
   };
 
   const login = (user) => {
@@ -4655,7 +4747,7 @@ export default function App() {
       const next = list.map((p) => {
         if (gotIds.includes(p.id)) {
           const done = { ...p.done };
-          STAGES.slice(0, stageIndex("received") + 1).forEach((st) => { done[st.key] ||= iso(TODAY); });
+          PIPELINE.slice(0, stageIndex("received") + 1).forEach((st) => { done[st.key] ||= iso(TODAY); });
           return withAudit({
             ...p, stage: "received", done,
             skus: p.skus.map((r) => ({ ...r, receivedQty: r.units, receiptState: "full" })),
@@ -4786,25 +4878,23 @@ export default function App() {
 
   /* Bulk import from pasted CSV — one phone per line */
   const importPhones = (rows) => {
-    let nextId = Math.max(0, ...phones.map((p) => p.id)) + 1;
-    const made = rows.map((r) => withAudit({
-      id: nextId++, brand: r.brand, name: r.name, segment: r.segment,
+    const made = [];
+    rows.forEach((r) => made.push(withAudit({
+      id: newPhoneId([...phones, ...made]), brand: r.brand, name: r.name, segment: r.segment,
       launch: r.launch, stage: "research", po: null,
       done: { research: iso(TODAY) }, skus: [], salesEntries: [],
       notes: [], attachments: [], archived: false,
-    }, session, "Imported from CSV"));
+    }, session, "Imported from CSV")));
     setPhones((list) => [...list, ...made]);
-    if (dbOnline) made.forEach((p) => dbUpsertPhone(p));
+    made.forEach(persist);
     say(`${made.length} model${made.length === 1 ? "" : "s"} imported`);
   };
 
   const addPhone = (data) => {
-    const id = Math.max(0, ...phones.map((p) => p.id)) + 1;
+    const id = newPhoneId(phones);
     const newPhone = withAudit({ ...data, id, notes: [], attachments: [], archived: false }, session, "Phone added");
     setPhones((list) => [...list, newPhone]);
-    if (dbOnline) dbUpsertPhone(newPhone).then(({ error }) => {
-      if (error) say("⚠ DB save failed: " + error);
-    });
+    persist(newPhone);
     setAdding(false);
     setOpenId(id);
     say(`${data.brand} ${data.name} added and tracking`);
@@ -4868,12 +4958,24 @@ export default function App() {
               <FileText size={14} />Reports
             </button>
             {/* DB status indicator */}
-            <div title={dbOnline ? "Database connected" : dbError || "No database configured"}
+            <div title={dbOnline
+                ? (syncedAt ? `Last read from the database at ${syncedAt.toLocaleTimeString()}` : "Database connected")
+                : dbError || "No database configured"}
               style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11,
                 color: dbOnline ? "var(--ok)" : "var(--warn)" }}>
               <div style={{ width: 8, height: 8, borderRadius: "50%",
                 background: dbOnline ? "var(--ok)" : "var(--warn)" }} />
-              {dbOnline ? "DB live" : "Local only"}
+              {dbOnline
+                ? (loading ? "syncing…" : syncedAt
+                    ? "synced " + syncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                    : "DB live")
+                : "Local only"}
+              {dbOnline && (
+                <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
+                  onClick={loadFromDB} title="Re-read everything from the database">
+                  ↻
+                </button>
+              )}
               {CAN.reset(role) && (
                 <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
                   onClick={() => setShowDbSetup(true)} title="Configure database">
