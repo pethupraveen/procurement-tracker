@@ -589,9 +589,21 @@ const EMPTY_FILTERS = { q: "", needsAction: false, lateOnly: false, soonOnly: fa
 
 const DB_CONFIG_KEY = "proc_tracker_sb";
 
+/* Build-time fallback. Set VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY
+   (GitHub Actions secrets, or a local .env) and every visitor gets a
+   working connection without touching DB Setup. A config saved in this
+   browser still wins, so an admin can point one machine elsewhere.   */
+const ENV_DB_CONFIG = {
+  url: String(import.meta.env.VITE_SUPABASE_URL || "").trim().replace(/\/$/, ""),
+  key: String(import.meta.env.VITE_SUPABASE_ANON_KEY || "").trim(),
+};
+
 function dbGetConfig() {
-  try { return JSON.parse(localStorage.getItem(DB_CONFIG_KEY) || "null"); }
-  catch { return null; }
+  try {
+    const saved = JSON.parse(localStorage.getItem(DB_CONFIG_KEY) || "null");
+    if (saved && saved.url && saved.key) return saved;
+  } catch {}
+  return ENV_DB_CONFIG.url && ENV_DB_CONFIG.key ? { ...ENV_DB_CONFIG } : null;
 }
 function dbSaveConfig(url, key) {
   localStorage.setItem(DB_CONFIG_KEY, JSON.stringify({ url: url.trim().replace(/\/$/, ""), key: key.trim() }));
