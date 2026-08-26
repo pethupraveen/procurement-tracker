@@ -95,9 +95,33 @@ const MATERIALS = [
 const MATERIAL_NAMES = MATERIALS.map((m) => m.name);
 const defaultQtyFor  = (name) => MATERIALS.find((m) => m.name === name)?.defaultQty ?? 0;
 
+/* SKU rids are written to the database, so a counter that restarts at 0 on
+   every page load hands out ids that a phone loaded from the DB already
+   uses. STP status, listings and goods receipt are all keyed by rid, so a
+   collision silently updates the wrong SKU. Seed from the clock instead —
+   unique across sessions, not just within one.                          */
 let _skuSeq = 0;
+const newRid = () => Date.now() * 1000 + (++_skuSeq % 1000);
+
+/* Heal phones saved before rids were unique. Within one phone the first row
+   keeps its rid — so the sales entries pointing at it stay attached — and
+   every later duplicate is re-issued. Repaired in memory on load; the next
+   save writes it back.                                                   */
+function repairSkuRids(phone) {
+  const seen = new Set();
+  let changed = false;
+  const skus = (phone.skus || []).map((r) => {
+    if (r.rid != null && !seen.has(r.rid)) { seen.add(r.rid); return r; }
+    changed = true;
+    const rid = newRid();
+    seen.add(rid);
+    return { ...r, rid };
+  });
+  return changed ? { ...phone, skus } : phone;
+}
+
 const skuRow = (sku = "", material = "", units = 0) => ({
-  rid: ++_skuSeq,            // stable React key, never shown to the user
+  rid: newRid(),             // stable React key, never shown to the user
   sku, material, units,
   stpStatus: "Not Sent",     // STP file is tracked per SKU, not per phone
   receivedQty: null,         // how many actually arrived
@@ -400,12 +424,16 @@ const ROLES = [
 /* Which stages a role may put a phone into. Used for forward moves
    (advanceStatus) and backward ones (moveStatus) alike — the role that
    owns a stage is the role allowed to move work into it. "research" is
-   never a forward target, it only matters when moving back.          */
+   never a forward target, it only matters when moving back.
+
+   Live belongs to Catalog, not Warehouse: the gate into Live is "every SKU
+   is live on every marketplace", which is catalog's work, so catalog is the
+   role that presses the button when it is finished.                    */
 const ROLE_CAN_ADVANCE_TO = {
   admin:       ["research","planned","ordered","production","received","live","unprocured"],
   procurement: ["research","planned","ordered","unprocured"],
-  warehouse:   ["production","received","live"],
-  catalog:     [],
+  warehouse:   ["production","received"],
+  catalog:     ["live"],
   sales:       [],
 };
 
@@ -435,6 +463,20 @@ function gateBlock(model) {
     if (allSkus(model).length === 0) return "No SKUs added yet";
     const missing = allSkus(model).filter((r) => !r.sku?.trim());
     if (missing.length) return `${missing.length} SKU${missing.length > 1 ? "s" : ""} missing a code`;
+  }
+  /* You cannot be in production against an order that has no number on it. */
+  if (model.stage === "ordered") {
+    if (!model.po?.trim()) return "No PO number recorded";
+  }
+  /* Nothing leaves production until the supplier has the drawings and has
+     accepted them. A rejection is a stop, not a warning.                 */
+  if (model.stage === "production") {
+    const rejected = allSkus(model).filter((r) => r.stpStatus === "Rejected");
+    if (rejected.length)
+      return `STP file rejected on ${rejected.length} SKU${rejected.length > 1 ? "s" : ""}`;
+    const notSent = allSkus(model).filter((r) => !r.stpStatus || r.stpStatus === "Not Sent");
+    if (notSent.length)
+      return `STP file not sent on ${notSent.length} SKU${notSent.length > 1 ? "s" : ""}`;
   }
   if (model.stage === "received") {
     const unconf = allSkus(model).filter((r) => !isConfirmed(r));
@@ -495,12 +537,19 @@ function moveStatus(model, role, stageKey) {
   if (target === model.index) return { ok: false, reason: "Already there" };
 
   /* Terminal stages sit off the line, so comparing indexes says nothing.
-     Exactly two moves touch them:
-       Research → Un-Procurement   decided this phone is not worth buying
-       Un-Procurement → Research   changed our mind, look at it again    */
+     Two kinds of move touch them:
+       ... → Un-Procurement        decided this phone is not worth buying
+       Un-Procurement → Research   changed our mind, look at it again
+
+     A phone can be dropped at any point before the stock physically lands —
+     a bad quote at Ordered or a slipped launch at Production is exactly when
+     you decide not to buy. Once it is in the warehouse it is a write-off,
+     not a decision not to buy, so archive it instead.                    */
   if (isTerminal(stageKey)) {
-    if (model.stage !== "research")
-      return { ok: false, reason: `Only a phone still at Research can go to ${STAGES[target].label}` };
+    if (isTerminal(model.stage))
+      return { ok: false, reason: "Already off the line" };
+    if (model.index >= stageIndex("received"))
+      return { ok: false, reason: "Stock has already arrived — archive it instead" };
     if (!canEnterStage(role, stageKey))
       return { ok: false, reason: `${roleLabel(role)} can't move to ${STAGES[target].label}` };
     return { ok: true, reason: null };
@@ -651,7 +700,7 @@ const phoneToRow = (p) => ({
   notes: p.notes || [], attachments: p.attachments || [],
   audit: p.audit || [], archived: !!p.archived,
 });
-const rowToPhone = (r) => ({
+const rowToPhone = (r) => repairSkuRids({
   id: r.id, brand: r.brand, name: r.name, segment: r.segment,
   launch: r.launch, stage: r.stage, po: r.po,
   done: r.done || {}, skus: r.skus || [], salesEntries: r.sales_entries || [],
@@ -2520,8 +2569,8 @@ function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, o
               </div>
             );
           })()}
-          {/* Decide against a phone while it is still only research */}
-          {onMove && model.stage === "research" && moveStatus(model, role, "unprocured").ok && (
+          {/* Decide against a phone any time before the stock arrives */}
+          {onMove && !model.terminal && moveStatus(model, role, "unprocured").ok && (
             <button className="btn" style={{ fontSize: 11, color: "var(--dim)" }}
               title="We looked at this phone and decided not to buy it"
               onClick={() => onMove(model.id, "unprocured")}>
@@ -4520,6 +4569,12 @@ export default function App() {
 
   const say = (text) => { setToast(text); setTimeout(() => setToast((t) => (t === text ? null : t)), 2500); };
 
+  /* Every message that claims something was saved goes through here. With no
+     database the edit only lives in this tab and dies on refresh — saying
+     "Saved" for that is a lie the user pays for later.                    */
+  const saved = (text) =>
+    say(dbOnline ? text : `⚠ ${text} in this tab only — no database, changes are lost on refresh`);
+
   /* derive everything, every render — never stored, never stale */
   const models = useMemo(() => phones.map(derive), [phones]);
 
@@ -4584,7 +4639,7 @@ export default function App() {
     if (!st.ok) { say(`⚠ ${st.reason}`); return; }
     const back = stageIndex(stageKey) < m.index;
     moveTo(id, stageKey);
-    say(`${m.name} moved ${back ? "back " : ""}to ${STAGES[stageIndex(stageKey)].label}`);
+    saved(`${m.name} moved ${back ? "back " : ""}to ${STAGES[stageIndex(stageKey)].label}`);
   };
 
   const advance = (id) => {
@@ -4606,7 +4661,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Phone details updated");
+    saved("Phone details updated");
   };
 
   /* save covers array from PlannedSKUEditor */
@@ -4616,7 +4671,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("SKUs saved");
+    saved("SKUs saved");
   };
 
   /* update STP file status from ProductionSTP */
@@ -4629,7 +4684,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("STP status saved");
+    saved("STP status saved");
   };
 
   /* listingsByRid = { rid: { Flipkart: "Live", ... } } */
@@ -4642,7 +4697,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Listing status saved");
+    saved("Listing status saved");
   };
 
   /* PO number is typed by the buyer, never invented by the app */
@@ -4675,7 +4730,7 @@ export default function App() {
     const bits = [];
     if (gotIds.length)     bits.push(`${gotIds.length} received`);
     if (missingIds.length) bits.push(`${missingIds.length} back to Ordered for a new PO`);
-    say(bits.join(" · "));
+    saved(bits.join(" · "));
   };
 
   /* Assign one PO number to several models at once */
@@ -4685,7 +4740,7 @@ export default function App() {
       next.filter((p) => ids.includes(p.id)).forEach(persist);
       return next;
     });
-    say(`${po} assigned to ${ids.length} model${ids.length === 1 ? "" : "s"}`);
+    saved(`${po} assigned to ${ids.length} model${ids.length === 1 ? "" : "s"}`);
   };
 
   const savePO = (id, po) => {
@@ -4694,7 +4749,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say(po.trim() ? "PO number saved" : "PO number cleared");
+    saved(po.trim() ? "PO number saved" : "PO number cleared");
   };
 
   /* save goods receipt rows from ReceivedChecker */
@@ -4710,7 +4765,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Receipt saved");
+    saved("Receipt saved");
   };
 
   const logSale = (id, entry) => {
@@ -4721,7 +4776,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Sale logged");
+    saved("Sale logged");
   };
 
   const resetAll = async () => {
@@ -4741,7 +4796,7 @@ export default function App() {
       const u = next.find((p) => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Note added");
+    saved("Note added");
   };
 
   const deleteNote = (id, rid) => {
@@ -4761,7 +4816,7 @@ export default function App() {
       const u = next.find((p) => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Link attached");
+    saved("Link attached");
   };
 
   const deleteAttachment = (id, rid) => {
@@ -4780,7 +4835,7 @@ export default function App() {
       const u = next.find((p) => p.id === id); if (u) persist(u);
       return next;
     });
-    say(archived ? "Model archived" : "Model restored");
+    saved(archived ? "Model archived" : "Model restored");
     if (archived) setOpenId(null);
   };
 
@@ -4794,8 +4849,16 @@ export default function App() {
       notes: [], attachments: [], archived: false,
     }, session, "Imported from CSV"));
     setPhones((list) => [...list, ...made]);
-    if (dbOnline) made.forEach((p) => dbUpsertPhone(p));
-    say(`${made.length} model${made.length === 1 ? "" : "s"} imported`);
+    const noun = (n) => `${n} model${n === 1 ? "" : "s"}`;
+    if (!dbOnline) { saved(`${noun(made.length)} imported`); return; }
+    /* A bulk import that half-failed used to report a clean success. */
+    Promise.all(made.map(dbUpsertPhone)).then((results) => {
+      const failed = results.filter((r) => r?.error);
+      if (failed.length)
+        say(`⚠ ${noun(made.length - failed.length)} imported · ${failed.length} failed to save: ${failed[0].error}`);
+      else
+        say(`${noun(made.length)} imported`);
+    });
   };
 
   const addPhone = (data) => {
@@ -4807,7 +4870,7 @@ export default function App() {
     });
     setAdding(false);
     setOpenId(id);
-    say(`${data.brand} ${data.name} added and tracking`);
+    saved(`${data.brand} ${data.name} added and tracking`);
   };
 
   /* ── DB setup flow: Admin must configure Supabase first ── */
@@ -4874,6 +4937,13 @@ export default function App() {
               <div style={{ width: 8, height: 8, borderRadius: "50%",
                 background: dbOnline ? "var(--ok)" : "var(--warn)" }} />
               {dbOnline ? "DB live" : "Local only"}
+              {/* Nothing pushes changes from other people — this is how you
+                  find out someone else moved a phone while you were looking. */}
+              <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
+                onClick={() => { loadFromDB(); say("Reloaded from the database"); }}
+                title="Reload phones and users from the database">
+                ↻
+              </button>
               {CAN.reset(role) && (
                 <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
                   onClick={() => setShowDbSetup(true)} title="Configure database">
@@ -4929,6 +4999,21 @@ export default function App() {
             )}
           </div>
         </div>
+
+        {/* Without a database every edit is a scratchpad that dies on refresh.
+            A small grey dot was not enough warning for that. */}
+        {!dbOnline && (
+          <div className="card" style={{ borderColor: "var(--warn)", marginBottom: 16 }}>
+            <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
+              <strong style={{ color: "var(--warn)" }}>Not connected to the database.</strong>{" "}
+              Anything you change stays in this browser tab and is lost when you
+              refresh. {dbError && <span style={{ color: "var(--dim)" }}>({dbError})</span>}{" "}
+              {CAN.reset(role)
+                ? "Use the ⚙ button above to configure it."
+                : "Ask an admin to configure it."}
+            </div>
+          </div>
+        )}
 
         {/* Search + filters — shown on Board and List only */}
         {["board","table"].includes(view) && models.length > 0 && (
