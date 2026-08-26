@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, LayoutGrid, List, BarChart2, FileText } from "lucide-react";
 
 /* ═══════════════════════════════════════════════════════════════
@@ -660,8 +660,8 @@ function dbClient() {
 
   /* Supabase REST upsert rules:
      - POST to /<table>?on_conflict=<col>
-     - Prefer header must be EXACTLY "resolution=merge-duplicates"
-       (adding return=representation causes 409 on some Supabase versions)
+     - New phones use an upsert and request their generated updated_at version
+       back; existing phones use the conditional PATCH below.
      - apikey + Authorization both required               */
   const hdrs = (extra) => ({
     "Content-Type":  "application/json",
@@ -686,7 +686,7 @@ function dbClient() {
 
   return {
     get:    (p)    => req("GET",    p, null, { "Prefer": "return=representation" }),
-    upsert: (p, b) => req("POST",   p, b,    { "Prefer": "resolution=merge-duplicates" }),
+    upsert: (p, b) => req("POST",   p, b,    { "Prefer": "resolution=merge-duplicates,return=representation" }),
     patch:  (p, b) => req("PATCH",  p, b,    { "Prefer": "return=representation" }),
     del:    (p)    => req("DELETE", p),
   };
@@ -705,7 +705,7 @@ const rowToPhone = (r) => repairSkuRids({
   launch: r.launch, stage: r.stage, po: r.po,
   done: r.done || {}, skus: r.skus || [], salesEntries: r.sales_entries || [],
   notes: r.notes || [], attachments: r.attachments || [],
-  audit: r.audit || [], archived: !!r.archived,
+  audit: r.audit || [], archived: !!r.archived, updatedAt: r.updated_at,
 });
 
 /* user row <-> app shape (identical, just snake_case alias) */
@@ -724,6 +724,16 @@ async function dbLoadPhones() {
 async function dbUpsertPhone(phone) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
   return c.upsert("/phones?on_conflict=id", phoneToRow(phone));
+}
+/* Compare-and-swap update: an empty successful response means another browser
+   has already changed the row, so this edit must never overwrite it. */
+async function dbUpdatePhone(phone, expectedUpdatedAt) {
+  const c = dbClient(); if (!c) return { error: "Not configured" };
+  const version = encodeURIComponent(expectedUpdatedAt);
+  const result = await c.patch(`/phones?id=eq.${phone.id}&updated_at=eq.${version}`, phoneToRow(phone));
+  return !result.error && !result.data?.length
+    ? { data: null, error: null, conflict: true }
+    : result;
 }
 async function dbDeletePhone(id) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
@@ -4499,7 +4509,12 @@ export default function App() {
   const [dbReady, setDbReady]   = useState(() => !!dbGetConfig());
   const [dbOnline, setDbOnline] = useState(false);
   const [dbError, setDbError]   = useState("");
+  const [conflictedIds, setConflictedIds] = useState(() => new Set());
   const [showDbSetup, setShowDbSetup] = useState(false);
+  /* One phone can be edited several times before its first request returns.
+     Serialize those writes and use the timestamp returned by each successful
+     request for the next one, rather than creating a conflict with ourselves. */
+  const writeState = useRef(new Map());
 
   /* ── session state ── */
   const [users, setUsers]     = useState(DEFAULT_USERS);
@@ -4544,6 +4559,8 @@ export default function App() {
         });
       }
       if (ph.data)         setPhones(ph.data);
+      writeState.current.clear();
+      setConflictedIds(new Set());
     }
     setLoading(false);
   };
@@ -4551,11 +4568,37 @@ export default function App() {
   useEffect(() => { loadFromDB(); }, []);   // on mount
 
   /* ── write-through helper: update local state + persist ── */
-  const persist = async (updatedPhone) => {
-    if (dbOnline) {
-      const { error } = await dbUpsertPhone(updatedPhone);
-      if (error) say("⚠ DB save failed: " + error);
-    }
+  const persist = (updatedPhone) => {
+    if (!dbOnline) return Promise.resolve();
+    const id = updatedPhone.id;
+    const state = writeState.current.get(id) || {
+      version: updatedPhone.updatedAt, queue: Promise.resolve(), conflicted: false,
+    };
+    writeState.current.set(id, state);
+
+    state.queue = state.queue.then(async () => {
+      if (state.conflicted) return;
+      const result = state.version
+        ? await dbUpdatePhone(updatedPhone, state.version)
+        : await dbUpsertPhone(updatedPhone);
+      if (result.conflict) {
+        state.conflicted = true;
+        setConflictedIds((ids) => new Set(ids).add(id));
+        say("Save conflict — someone else changed this model. Refresh before editing it again.");
+        return { conflict: true };
+      }
+      if (result.error) { say("DB save failed: " + result.error); return result; }
+      const savedRow = result.data?.[0];
+      if (!savedRow?.updated_at) return result;
+      state.version = savedRow.updated_at;
+      /* Keep newer local edits, but advance their version token. */
+      setPhones((list) => list.map((p) => p.id === id ? { ...p, updatedAt: savedRow.updated_at } : p));
+      return result;
+    }).catch((error) => {
+      say("DB save failed: " + error.message);
+      return { error: error.message };
+    });
+    return state.queue;
   };
 
   const login = (user) => {
@@ -4852,7 +4895,7 @@ export default function App() {
     const noun = (n) => `${n} model${n === 1 ? "" : "s"}`;
     if (!dbOnline) { saved(`${noun(made.length)} imported`); return; }
     /* A bulk import that half-failed used to report a clean success. */
-    Promise.all(made.map(dbUpsertPhone)).then((results) => {
+    Promise.all(made.map(persist)).then((results) => {
       const failed = results.filter((r) => r?.error);
       if (failed.length)
         say(`⚠ ${noun(made.length - failed.length)} imported · ${failed.length} failed to save: ${failed[0].error}`);
@@ -4865,7 +4908,7 @@ export default function App() {
     const id = Math.max(0, ...phones.map((p) => p.id)) + 1;
     const newPhone = withAudit({ ...data, id, notes: [], attachments: [], archived: false }, session, "Phone added");
     setPhones((list) => [...list, newPhone]);
-    if (dbOnline) dbUpsertPhone(newPhone).then(({ error }) => {
+    if (dbOnline) persist(newPhone).then(({ error } = {}) => {
       if (error) say("⚠ DB save failed: " + error);
     });
     setAdding(false);
@@ -4931,12 +4974,12 @@ export default function App() {
               <FileText size={14} />Reports
             </button>
             {/* DB status indicator */}
-            <div title={dbOnline ? "Database connected" : dbError || "No database configured"}
+            <div title={conflictedIds.size ? "A newer version exists in the database — refresh required" : dbOnline ? "Database connected" : dbError || "No database configured"}
               style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11,
-                color: dbOnline ? "var(--ok)" : "var(--warn)" }}>
+                color: conflictedIds.size ? "var(--bad)" : dbOnline ? "var(--ok)" : "var(--warn)" }}>
               <div style={{ width: 8, height: 8, borderRadius: "50%",
-                background: dbOnline ? "var(--ok)" : "var(--warn)" }} />
-              {dbOnline ? "DB live" : "Local only"}
+                background: conflictedIds.size ? "var(--bad)" : dbOnline ? "var(--ok)" : "var(--warn)" }} />
+              {conflictedIds.size ? "Refresh required" : dbOnline ? "DB live" : "Local only"}
               {/* Nothing pushes changes from other people — this is how you
                   find out someone else moved a phone while you were looking. */}
               <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
@@ -5011,6 +5054,14 @@ export default function App() {
               {CAN.reset(role)
                 ? "Use the ⚙ button above to configure it."
                 : "Ask an admin to configure it."}
+            </div>
+          </div>
+        )}
+        {dbOnline && conflictedIds.size > 0 && (
+          <div className="card" style={{ borderColor: "var(--bad)", marginBottom: 16 }}>
+            <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
+              <strong style={{ color: "var(--bad)" }}>A model was changed by someone else.</strong>{" "}
+              Your local edit was not saved. Use the ↻ button above to load the current version before editing again.
             </div>
           </div>
         )}
