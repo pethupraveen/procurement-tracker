@@ -1,18 +1,19 @@
-import React, { useState, useMemo, useEffect, useRef } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, LayoutGrid, List, BarChart2, FileText } from "lucide-react";
 
 /* ═══════════════════════════════════════════════════════════════
    NEW MODEL PROCUREMENT TRACKER — simple version
 
    The whole business loop, and nothing else:
-     1. Spot a new phone     -> add it
-     2. Research  → note the phone, no covers yet
-     3. Planned   → choose covers, set SKU + material
-     4. Ordered   → every SKU must be assigned first
-     5. Production → export STP file, track STP status
-     6. Received  → tick each cover received or not
-     7. Live      → only when all received covers confirmed
-     4. See what's running late
+     1. Research   → note the phone, no covers yet
+     2. Planned    → choose covers, set SKU + material
+     3. Ordered    → every SKU coded, PO number recorded
+     4. Production → export STP file, track STP status per SKU
+     5. Received   → tick each cover received or not
+     6. Live       → only once every SKU is listed everywhere
+
+   Off the line:
+     Un-Procurement → looked at it at Research, decided not to buy
 
    Read this file top to bottom. It's in dependency order:
      helpers -> stages -> data -> derive -> UI
@@ -95,31 +96,21 @@ const MATERIALS = [
 const MATERIAL_NAMES = MATERIALS.map((m) => m.name);
 const defaultQtyFor  = (name) => MATERIALS.find((m) => m.name === name)?.defaultQty ?? 0;
 
-/* SKU rids are written to the database, so a counter that restarts at 0 on
-   every page load hands out ids that a phone loaded from the DB already
-   uses. STP status, listings and goods receipt are all keyed by rid, so a
-   collision silently updates the wrong SKU. Seed from the clock instead —
-   unique across sessions, not just within one.                          */
+/* SKU ids are persisted, so a counter that restarts on reload can collide
+   with an existing row and update the wrong SKU. */
 let _skuSeq = 0;
 const newRid = () => Date.now() * 1000 + (++_skuSeq % 1000);
-
-/* Heal phones saved before rids were unique. Within one phone the first row
-   keeps its rid — so the sales entries pointing at it stay attached — and
-   every later duplicate is re-issued. Repaired in memory on load; the next
-   save writes it back.                                                   */
 function repairSkuRids(phone) {
   const seen = new Set();
   let changed = false;
-  const skus = (phone.skus || []).map((r) => {
-    if (r.rid != null && !seen.has(r.rid)) { seen.add(r.rid); return r; }
+  const skus = (phone.skus || []).map((row) => {
+    if (row.rid != null && !seen.has(row.rid)) { seen.add(row.rid); return row; }
     changed = true;
-    const rid = newRid();
-    seen.add(rid);
-    return { ...r, rid };
+    const rid = newRid(); seen.add(rid);
+    return { ...row, rid };
   });
   return changed ? { ...phone, skus } : phone;
 }
-
 const skuRow = (sku = "", material = "", units = 0) => ({
   rid: newRid(),             // stable React key, never shown to the user
   sku, material, units,
@@ -424,15 +415,13 @@ const ROLES = [
 /* Which stages a role may put a phone into. Used for forward moves
    (advanceStatus) and backward ones (moveStatus) alike — the role that
    owns a stage is the role allowed to move work into it. "research" is
-   never a forward target, it only matters when moving back.
-
-   Live belongs to Catalog, not Warehouse: the gate into Live is "every SKU
-   is live on every marketplace", which is catalog's work, so catalog is the
-   role that presses the button when it is finished.                    */
+   never a forward target, it only matters when moving back.          */
 const ROLE_CAN_ADVANCE_TO = {
   admin:       ["research","planned","ordered","production","received","live","unprocured"],
   procurement: ["research","planned","ordered","unprocured"],
   warehouse:   ["production","received"],
+  /* Catalog is the team that gets every SKU listed, which is the only
+     thing standing between Received and Live — so they make that move. */
   catalog:     ["live"],
   sales:       [],
 };
@@ -464,20 +453,22 @@ function gateBlock(model) {
     const missing = allSkus(model).filter((r) => !r.sku?.trim());
     if (missing.length) return `${missing.length} SKU${missing.length > 1 ? "s" : ""} missing a code`;
   }
-  /* You cannot be in production against an order that has no number on it. */
-  if (model.stage === "ordered") {
-    if (!model.po?.trim()) return "No PO number recorded";
-  }
-  /* Nothing leaves production until the supplier has the drawings and has
-     accepted them. A rejection is a stop, not a warning.                 */
+  /* You cannot manufacture against a purchase order that doesn't exist.
+     The STP export carries the PO number, so it has to be in first. */
+  if (model.stage === "ordered" && !model.po?.trim())
+    return "No PO number recorded";
+
+  /* Goods can't be received against files the supplier never got, and a
+     rejected STP means that SKU is not being made at all. */
   if (model.stage === "production") {
     const rejected = allSkus(model).filter((r) => r.stpStatus === "Rejected");
     if (rejected.length)
-      return `STP file rejected on ${rejected.length} SKU${rejected.length > 1 ? "s" : ""}`;
+      return `${rejected.length} STP file${rejected.length > 1 ? "s" : ""} rejected`;
     const notSent = allSkus(model).filter((r) => !r.stpStatus || r.stpStatus === "Not Sent");
     if (notSent.length)
-      return `STP file not sent on ${notSent.length} SKU${notSent.length > 1 ? "s" : ""}`;
+      return `${notSent.length} STP file${notSent.length > 1 ? "s" : ""} not sent yet`;
   }
+
   if (model.stage === "received") {
     const unconf = allSkus(model).filter((r) => !isConfirmed(r));
     if (unconf.length) return `${unconf.length} SKU${unconf.length > 1 ? "s" : ""} not confirmed`;
@@ -537,19 +528,12 @@ function moveStatus(model, role, stageKey) {
   if (target === model.index) return { ok: false, reason: "Already there" };
 
   /* Terminal stages sit off the line, so comparing indexes says nothing.
-     Two kinds of move touch them:
-       ... → Un-Procurement        decided this phone is not worth buying
-       Un-Procurement → Research   changed our mind, look at it again
-
-     A phone can be dropped at any point before the stock physically lands —
-     a bad quote at Ordered or a slipped launch at Production is exactly when
-     you decide not to buy. Once it is in the warehouse it is a write-off,
-     not a decision not to buy, so archive it instead.                    */
+     Exactly two moves touch them:
+       Research → Un-Procurement   decided this phone is not worth buying
+       Un-Procurement → Research   changed our mind, look at it again    */
   if (isTerminal(stageKey)) {
-    if (isTerminal(model.stage))
-      return { ok: false, reason: "Already off the line" };
-    if (model.index >= stageIndex("received"))
-      return { ok: false, reason: "Stock has already arrived — archive it instead" };
+    if (model.stage !== "research")
+      return { ok: false, reason: `Only a phone still at Research can go to ${STAGES[target].label}` };
     if (!canEnterStage(role, stageKey))
       return { ok: false, reason: `${roleLabel(role)} can't move to ${STAGES[target].label}` };
     return { ok: true, reason: null };
@@ -619,9 +603,21 @@ const EMPTY_FILTERS = { q: "", needsAction: false, lateOnly: false, soonOnly: fa
 
 const DB_CONFIG_KEY = "proc_tracker_sb";
 
+/* Build-time fallback. Set VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY
+   (GitHub Actions secrets, or a local .env) and every visitor gets a
+   working connection without touching DB Setup. A config saved in this
+   browser still wins, so an admin can point one machine elsewhere.   */
+const ENV_DB_CONFIG = {
+  url: String(import.meta.env.VITE_SUPABASE_URL || "").trim().replace(/\/$/, ""),
+  key: String(import.meta.env.VITE_SUPABASE_ANON_KEY || "").trim(),
+};
+
 function dbGetConfig() {
-  try { return JSON.parse(localStorage.getItem(DB_CONFIG_KEY) || "null"); }
-  catch { return null; }
+  try {
+    const saved = JSON.parse(localStorage.getItem(DB_CONFIG_KEY) || "null");
+    if (saved && saved.url && saved.key) return saved;
+  } catch {}
+  return ENV_DB_CONFIG.url && ENV_DB_CONFIG.key ? { ...ENV_DB_CONFIG } : null;
 }
 function dbSaveConfig(url, key) {
   localStorage.setItem(DB_CONFIG_KEY, JSON.stringify({ url: url.trim().replace(/\/$/, ""), key: key.trim() }));
@@ -660,8 +656,8 @@ function dbClient() {
 
   /* Supabase REST upsert rules:
      - POST to /<table>?on_conflict=<col>
-     - New phones use an upsert and request their generated updated_at version
-       back; existing phones use the conditional PATCH below.
+     - Prefer header must be EXACTLY "resolution=merge-duplicates"
+       (adding return=representation causes 409 on some Supabase versions)
      - apikey + Authorization both required               */
   const hdrs = (extra) => ({
     "Content-Type":  "application/json",
@@ -700,12 +696,16 @@ const phoneToRow = (p) => ({
   notes: p.notes || [], attachments: p.attachments || [],
   audit: p.audit || [], archived: !!p.archived,
 });
+/* updatedAt is the row's version stamp, set by a trigger on every write.
+   It is never sent back — phoneToRow leaves it out — it only travels in,
+   so a save can check whether anyone else wrote since this tab read. */
 const rowToPhone = (r) => repairSkuRids({
+  updatedAt: r.updated_at || null,
   id: r.id, brand: r.brand, name: r.name, segment: r.segment,
   launch: r.launch, stage: r.stage, po: r.po,
   done: r.done || {}, skus: r.skus || [], salesEntries: r.sales_entries || [],
   notes: r.notes || [], attachments: r.attachments || [],
-  audit: r.audit || [], archived: !!r.archived, updatedAt: r.updated_at,
+  audit: r.audit || [], archived: !!r.archived,
 });
 
 /* user row <-> app shape (identical, just snake_case alias) */
@@ -721,12 +721,20 @@ async function dbLoadPhones() {
   const { data, error } = await c.get("/phones?order=id");
   return { data: error ? null : (data || []).map(rowToPhone), error };
 }
+/* Every save writes the WHOLE phone row, so a blind write silently wipes
+   anything a colleague changed since this tab loaded. Compare version
+   stamps first and refuse rather than clobber.
+
+   Returns one of:
+     { conflict: true }   somebody else got there first — caller reloads
+     { error }            the write failed
+     { updatedAt }        saved; the fresh stamp to hold for the next save */
 async function dbUpsertPhone(phone) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
   return c.upsert("/phones?on_conflict=id", phoneToRow(phone));
 }
-/* Compare-and-swap update: an empty successful response means another browser
-   has already changed the row, so this edit must never overwrite it. */
+/* An atomic compare-and-swap update. A zero-row PATCH means a concurrent
+   browser changed the row first; do not overwrite it. */
 async function dbUpdatePhone(phone, expectedUpdatedAt) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
   const version = encodeURIComponent(expectedUpdatedAt);
@@ -2579,8 +2587,8 @@ function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, o
               </div>
             );
           })()}
-          {/* Decide against a phone any time before the stock arrives */}
-          {onMove && !model.terminal && moveStatus(model, role, "unprocured").ok && (
+          {/* Decide against a phone while it is still only research */}
+          {onMove && model.stage === "research" && moveStatus(model, role, "unprocured").ok && (
             <button className="btn" style={{ fontSize: 11, color: "var(--dim)" }}
               title="We looked at this phone and decided not to buy it"
               onClick={() => onMove(model.id, "unprocured")}>
@@ -2613,7 +2621,7 @@ function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, o
 function Calendar({ models, onOpen, role }) {
   const [offset, setOffset] = useState(0);   // months from now
 
-  const active = models.filter((m) => !m.archived);
+  const active = models.filter((m) => !m.archived && !m.terminal);
 
   /* group by YYYY-MM */
   const byMonth = {};
@@ -2750,9 +2758,8 @@ function CSVImport({ existing, onImport, onDone }) {
   const readFile = (file) => {
     if (!file) return;
     setFileErr("");
-    /* The app's own Excel template is tab-delimited text with an .xls
-       extension, so rejecting it made a download from step 1 impossible to
-       upload in step 2. Native .xlsx workbooks remain unsupported. */
+    /* The app's Excel template is tab-delimited text with an .xls extension.
+       Native .xlsx workbooks still need to be saved as CSV first. */
     if (!/\.(csv|txt|tsv|xls)$/i.test(file.name)) {
       setFileErr("Pick a .csv, .tsv, .txt or Excel-compatible .xls file. Save .xlsx workbooks as CSV first.");
       return;
@@ -2939,6 +2946,20 @@ function CSVImport({ existing, onImport, onDone }) {
 /* ── 11. ADD FORM ─────────────────────────────────────────────── */
 
 const NEW_MODEL = { brand: "", name: "", segment: "Mid Range", launch: "" };
+
+/* A new phone's id.
+
+   max(id)+1 looks obvious and is wrong the moment two people use the app:
+   both browsers read the same list, both compute the same next number, and
+   the second upsert silently overwrites the first phone. A random id in
+   Postgres integer range makes that practically impossible, and we still
+   check the ids we can see.                                             */
+function newPhoneId(existing) {
+  const taken = new Set(existing.map((p) => p.id));
+  let id;
+  do { id = 1 + Math.floor(Math.random() * 2000000000); } while (taken.has(id));
+  return id;
+}
 
 /* Loose match so "Galaxy A57 5G" and "galaxy a57  5g" collide */
 const normName = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -3221,7 +3242,11 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
   const revenue     = live.reduce((s, m) => s + m.sales.revenue, 0);
   const noPO        = ordered.filter((m) => !m.po).length;
 
-  const funnelMax   = Math.max(1, ...PIPELINE.map((st) => byStage(st.key).length));
+  const notProcured = models.filter((m) => m.terminal);
+  /* Un-Procurement only earns a funnel row once something is in it —
+     otherwise the pipeline reads as seven stages when it is six. */
+  const funnelStages = notProcured.length ? STAGES : PIPELINE;
+  const funnelMax   = Math.max(1, ...funnelStages.map((st) => byStage(st.key).length));
   const problems    = models.flatMap(problemsOf);
   const bad         = problems.filter((p) => p.type === "bad");
   const warn        = problems.filter((p) => p.type !== "bad");
@@ -3290,6 +3315,12 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
       <div className="kpi-grid">
         <KPI label="Phones tracked" value={models.length} sub="across all stages"
           onClick={() => go("table", {})} hint="Open the full list" />
+
+        {notProcured.length > 0 && (
+          <KPI label="Not procuring" value={notProcured.length}
+            sub="decided against at Research"
+            onClick={() => go("board", {})} hint="Show the board" />
+        )}
 
         <KPI label="Research" value={research.length}
           sub={research.length ? research.map(m=>m.name).join(", ").slice(0,40) : "None yet"}
@@ -3368,7 +3399,7 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
         <div className="card">
           <h2>Pipeline — click a stage</h2>
           <div className="funnel">
-            {PIPELINE.map((st) => {
+            {funnelStages.map((st) => {
               const list     = byStage(st.key);
               const units    = list.reduce((t, m) => t + m.units, 0);
               const lateHere = list.filter((m) => m.isLate).length;
@@ -4514,9 +4545,6 @@ export default function App() {
   const [dbError, setDbError]   = useState("");
   const [conflictedIds, setConflictedIds] = useState(() => new Set());
   const [showDbSetup, setShowDbSetup] = useState(false);
-  /* One phone can be edited several times before its first request returns.
-     Serialize those writes and use the timestamp returned by each successful
-     request for the next one, rather than creating a conflict with ourselves. */
   const writeState = useRef(new Map());
 
   /* ── session state ── */
@@ -4538,6 +4566,7 @@ export default function App() {
   const [confirmReset, setConfirmReset] = useState(false);
   const [filters, setFilters] = useState(EMPTY_FILTERS);
   const [compact, setCompact] = useState(false);
+  const [syncedAt, setSyncedAt] = useState(null);
 
   /* ── load data from Supabase on mount & after login ── */
   const loadFromDB = async () => {
@@ -4547,7 +4576,7 @@ export default function App() {
     if (up.error || ph.error) {
       setDbOnline(false); setDbError(up.error || ph.error);
     } else {
-      setDbOnline(true); setDbError("");
+      setDbOnline(true); setDbError(""); setSyncedAt(new Date());
       if (up.data?.length) {
         setUsers(up.data);
         /* Re-validate a restored session against the live user list —
@@ -4570,7 +4599,35 @@ export default function App() {
 
   useEffect(() => { loadFromDB(); }, []);   // on mount
 
+  /* Everyone shares one database, and a save writes the whole phone row.
+     A tab left open all morning would happily overwrite work it never saw,
+     so re-read whenever this tab comes back to the front, and every 90s
+     while it is in view.                                                */
+  useEffect(() => {
+    if (!dbOnline) return;
+    const refresh = () => { if (!document.hidden) loadFromDB(); };
+    const timer = setInterval(refresh, 90000);
+    window.addEventListener("focus", refresh);
+    return () => { clearInterval(timer); window.removeEventListener("focus", refresh); };
+  }, [dbOnline]);
+
   /* ── write-through helper: update local state + persist ── */
+  const persistLegacy = async (updatedPhone) => {
+    if (!dbOnline) return;
+    const { error, conflict, updatedAt } = await dbUpsertPhone(updatedPhone);
+
+    if (conflict) {
+      say("⚠ Someone else changed this phone — reloading, please redo your edit");
+      loadFromDB();
+      return;
+    }
+    if (error) { say("⚠ DB save failed: " + error); return; }
+
+    /* hold the new stamp so the next save from this tab compares correctly */
+    if (updatedAt) setPhones((list) => list.map((p) =>
+      p.id === updatedPhone.id ? { ...p, updatedAt } : p));
+  };
+
   const persist = (updatedPhone) => {
     if (!dbOnline) return Promise.resolve();
     const id = updatedPhone.id;
@@ -4578,7 +4635,6 @@ export default function App() {
       version: updatedPhone.updatedAt, queue: Promise.resolve(), conflicted: false,
     };
     writeState.current.set(id, state);
-
     state.queue = state.queue.then(async () => {
       if (state.conflicted) return;
       const result = state.version
@@ -4594,7 +4650,6 @@ export default function App() {
       const savedRow = result.data?.[0];
       if (!savedRow?.updated_at) return result;
       state.version = savedRow.updated_at;
-      /* Keep newer local edits, but advance their version token. */
       setPhones((list) => list.map((p) => p.id === id ? { ...p, updatedAt: savedRow.updated_at } : p));
       return result;
     }).catch((error) => {
@@ -4614,12 +4669,6 @@ export default function App() {
   };
 
   const say = (text) => { setToast(text); setTimeout(() => setToast((t) => (t === text ? null : t)), 2500); };
-
-  /* Every message that claims something was saved goes through here. With no
-     database the edit only lives in this tab and dies on refresh — saying
-     "Saved" for that is a lie the user pays for later.                    */
-  const saved = (text) =>
-    say(dbOnline ? text : `⚠ ${text} in this tab only — no database, changes are lost on refresh`);
 
   /* derive everything, every render — never stored, never stale */
   const models = useMemo(() => phones.map(derive), [phones]);
@@ -4685,7 +4734,7 @@ export default function App() {
     if (!st.ok) { say(`⚠ ${st.reason}`); return; }
     const back = stageIndex(stageKey) < m.index;
     moveTo(id, stageKey);
-    saved(`${m.name} moved ${back ? "back " : ""}to ${STAGES[stageIndex(stageKey)].label}`);
+    say(`${m.name} moved ${back ? "back " : ""}to ${STAGES[stageIndex(stageKey)].label}`);
   };
 
   const advance = (id) => {
@@ -4707,7 +4756,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    saved("Phone details updated");
+    say("Phone details updated");
   };
 
   /* save covers array from PlannedSKUEditor */
@@ -4717,7 +4766,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    saved("SKUs saved");
+    say("SKUs saved");
   };
 
   /* update STP file status from ProductionSTP */
@@ -4730,7 +4779,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    saved("STP status saved");
+    say("STP status saved");
   };
 
   /* listingsByRid = { rid: { Flipkart: "Live", ... } } */
@@ -4743,7 +4792,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    saved("Listing status saved");
+    say("Listing status saved");
   };
 
   /* PO number is typed by the buyer, never invented by the app */
@@ -4756,7 +4805,7 @@ export default function App() {
       const next = list.map((p) => {
         if (gotIds.includes(p.id)) {
           const done = { ...p.done };
-          STAGES.slice(0, stageIndex("received") + 1).forEach((st) => { done[st.key] ||= iso(TODAY); });
+          PIPELINE.slice(0, stageIndex("received") + 1).forEach((st) => { done[st.key] ||= iso(TODAY); });
           return withAudit({
             ...p, stage: "received", done,
             skus: p.skus.map((r) => ({ ...r, receivedQty: r.units, receiptState: "full" })),
@@ -4776,7 +4825,7 @@ export default function App() {
     const bits = [];
     if (gotIds.length)     bits.push(`${gotIds.length} received`);
     if (missingIds.length) bits.push(`${missingIds.length} back to Ordered for a new PO`);
-    saved(bits.join(" · "));
+    say(bits.join(" · "));
   };
 
   /* Assign one PO number to several models at once */
@@ -4786,7 +4835,7 @@ export default function App() {
       next.filter((p) => ids.includes(p.id)).forEach(persist);
       return next;
     });
-    saved(`${po} assigned to ${ids.length} model${ids.length === 1 ? "" : "s"}`);
+    say(`${po} assigned to ${ids.length} model${ids.length === 1 ? "" : "s"}`);
   };
 
   const savePO = (id, po) => {
@@ -4795,7 +4844,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    saved(po.trim() ? "PO number saved" : "PO number cleared");
+    say(po.trim() ? "PO number saved" : "PO number cleared");
   };
 
   /* save goods receipt rows from ReceivedChecker */
@@ -4811,7 +4860,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    saved("Receipt saved");
+    say("Receipt saved");
   };
 
   const logSale = (id, entry) => {
@@ -4822,7 +4871,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    saved("Sale logged");
+    say("Sale logged");
   };
 
   const resetAll = async () => {
@@ -4842,7 +4891,7 @@ export default function App() {
       const u = next.find((p) => p.id === id); if (u) persist(u);
       return next;
     });
-    saved("Note added");
+    say("Note added");
   };
 
   const deleteNote = (id, rid) => {
@@ -4862,7 +4911,7 @@ export default function App() {
       const u = next.find((p) => p.id === id); if (u) persist(u);
       return next;
     });
-    saved("Link attached");
+    say("Link attached");
   };
 
   const deleteAttachment = (id, rid) => {
@@ -4881,42 +4930,38 @@ export default function App() {
       const u = next.find((p) => p.id === id); if (u) persist(u);
       return next;
     });
-    saved(archived ? "Model archived" : "Model restored");
+    say(archived ? "Model archived" : "Model restored");
     if (archived) setOpenId(null);
   };
 
   /* Bulk import from pasted CSV — one phone per line */
   const importPhones = (rows) => {
-    let nextId = Math.max(0, ...phones.map((p) => p.id)) + 1;
-    const made = rows.map((r) => withAudit({
-      id: nextId++, brand: r.brand, name: r.name, segment: r.segment,
+    const made = [];
+    rows.forEach((r) => made.push(withAudit({
+      id: newPhoneId([...phones, ...made]), brand: r.brand, name: r.name, segment: r.segment,
       launch: r.launch, stage: "research", po: null,
       done: { research: iso(TODAY) }, skus: [], salesEntries: [],
       notes: [], attachments: [], archived: false,
-    }, session, "Imported from CSV"));
+    }, session, "Imported from CSV")));
     setPhones((list) => [...list, ...made]);
     const noun = (n) => `${n} model${n === 1 ? "" : "s"}`;
-    if (!dbOnline) { saved(`${noun(made.length)} imported`); return; }
-    /* A bulk import that half-failed used to report a clean success. */
+    if (!dbOnline) { say(`${noun(made.length)} imported in this tab only`); return; }
     Promise.all(made.map(persist)).then((results) => {
-      const failed = results.filter((r) => r?.error);
+      const failed = results.filter((result) => result?.error || result?.conflict);
       if (failed.length)
-        say(`⚠ ${noun(made.length - failed.length)} imported · ${failed.length} failed to save: ${failed[0].error}`);
-      else
-        say(`${noun(made.length)} imported`);
+        say(`${noun(made.length - failed.length)} imported · ${failed.length} failed to save`);
+      else say(`${noun(made.length)} imported`);
     });
   };
 
   const addPhone = (data) => {
-    const id = Math.max(0, ...phones.map((p) => p.id)) + 1;
+    const id = newPhoneId(phones);
     const newPhone = withAudit({ ...data, id, notes: [], attachments: [], archived: false }, session, "Phone added");
     setPhones((list) => [...list, newPhone]);
-    if (dbOnline) persist(newPhone).then(({ error } = {}) => {
-      if (error) say("⚠ DB save failed: " + error);
-    });
+    persist(newPhone);
     setAdding(false);
     setOpenId(id);
-    saved(`${data.brand} ${data.name} added and tracking`);
+    say(`${data.brand} ${data.name} added and tracking`);
   };
 
   /* ── DB setup flow: Admin must configure Supabase first ── */
@@ -4977,19 +5022,24 @@ export default function App() {
               <FileText size={14} />Reports
             </button>
             {/* DB status indicator */}
-            <div title={conflictedIds.size ? "A newer version exists in the database — refresh required" : dbOnline ? "Database connected" : dbError || "No database configured"}
+            <div title={conflictedIds.size ? "A newer version exists in the database — refresh required" : dbOnline
+                ? (syncedAt ? `Last read from the database at ${syncedAt.toLocaleTimeString()}` : "Database connected")
+                : dbError || "No database configured"}
               style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11,
                 color: conflictedIds.size ? "var(--bad)" : dbOnline ? "var(--ok)" : "var(--warn)" }}>
               <div style={{ width: 8, height: 8, borderRadius: "50%",
                 background: conflictedIds.size ? "var(--bad)" : dbOnline ? "var(--ok)" : "var(--warn)" }} />
-              {conflictedIds.size ? "Refresh required" : dbOnline ? "DB live" : "Local only"}
-              {/* Nothing pushes changes from other people — this is how you
-                  find out someone else moved a phone while you were looking. */}
-              <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
-                onClick={() => { loadFromDB(); say("Reloaded from the database"); }}
-                title="Reload phones and users from the database">
-                ↻
-              </button>
+              {conflictedIds.size ? "Refresh required" : dbOnline
+                ? (loading ? "syncing…" : syncedAt
+                    ? "synced " + syncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                    : "DB live")
+                : "Local only"}
+              {dbOnline && (
+                <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
+                  onClick={loadFromDB} title="Re-read everything from the database">
+                  ↻
+                </button>
+              )}
               {CAN.reset(role) && (
                 <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
                   onClick={() => setShowDbSetup(true)} title="Configure database">
@@ -5045,29 +5095,6 @@ export default function App() {
             )}
           </div>
         </div>
-
-        {/* Without a database every edit is a scratchpad that dies on refresh.
-            A small grey dot was not enough warning for that. */}
-        {!dbOnline && (
-          <div className="card" style={{ borderColor: "var(--warn)", marginBottom: 16 }}>
-            <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
-              <strong style={{ color: "var(--warn)" }}>Not connected to the database.</strong>{" "}
-              Anything you change stays in this browser tab and is lost when you
-              refresh. {dbError && <span style={{ color: "var(--dim)" }}>({dbError})</span>}{" "}
-              {CAN.reset(role)
-                ? "Use the ⚙ button above to configure it."
-                : "Ask an admin to configure it."}
-            </div>
-          </div>
-        )}
-        {dbOnline && conflictedIds.size > 0 && (
-          <div className="card" style={{ borderColor: "var(--bad)", marginBottom: 16 }}>
-            <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
-              <strong style={{ color: "var(--bad)" }}>A model was changed by someone else.</strong>{" "}
-              Your local edit was not saved. Use the ↻ button above to load the current version before editing again.
-            </div>
-          </div>
-        )}
 
         {/* Search + filters — shown on Board and List only */}
         {["board","table"].includes(view) && models.length > 0 && (
