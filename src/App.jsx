@@ -96,9 +96,23 @@ const MATERIALS = [
 const MATERIAL_NAMES = MATERIALS.map((m) => m.name);
 const defaultQtyFor  = (name) => MATERIALS.find((m) => m.name === name)?.defaultQty ?? 0;
 
+/* SKU ids are persisted, so a counter that restarts on reload can collide
+   with an existing row and update the wrong SKU. */
 let _skuSeq = 0;
+const newRid = () => Date.now() * 1000 + (++_skuSeq % 1000);
+function repairSkuRids(phone) {
+  const seen = new Set();
+  let changed = false;
+  const skus = (phone.skus || []).map((row) => {
+    if (row.rid != null && !seen.has(row.rid)) { seen.add(row.rid); return row; }
+    changed = true;
+    const rid = newRid(); seen.add(rid);
+    return { ...row, rid };
+  });
+  return changed ? { ...phone, skus } : phone;
+}
 const skuRow = (sku = "", material = "", units = 0) => ({
-  rid: ++_skuSeq,            // stable React key, never shown to the user
+  rid: newRid(),             // stable React key, never shown to the user
   sku, material, units,
   stpStatus: "Not Sent",     // STP file is tracked per SKU, not per phone
   receivedQty: null,         // how many actually arrived
@@ -405,7 +419,7 @@ const ROLES = [
 const ROLE_CAN_ADVANCE_TO = {
   admin:       ["research","planned","ordered","production","received","live","unprocured"],
   procurement: ["research","planned","ordered","unprocured"],
-  warehouse:   ["production","received","live"],
+  warehouse:   ["production","received"],
   /* Catalog is the team that gets every SKU listed, which is the only
      thing standing between Received and Live — so they make that move. */
   catalog:     ["live"],
@@ -668,7 +682,7 @@ function dbClient() {
 
   return {
     get:    (p)    => req("GET",    p, null, { "Prefer": "return=representation" }),
-    upsert: (p, b) => req("POST",   p, b,    { "Prefer": "resolution=merge-duplicates" }),
+    upsert: (p, b) => req("POST",   p, b,    { "Prefer": "resolution=merge-duplicates,return=representation" }),
     patch:  (p, b) => req("PATCH",  p, b,    { "Prefer": "return=representation" }),
     del:    (p)    => req("DELETE", p),
   };
@@ -685,7 +699,7 @@ const phoneToRow = (p) => ({
 /* updatedAt is the row's version stamp, set by a trigger on every write.
    It is never sent back — phoneToRow leaves it out — it only travels in,
    so a save can check whether anyone else wrote since this tab read. */
-const rowToPhone = (r) => ({
+const rowToPhone = (r) => repairSkuRids({
   updatedAt: r.updated_at || null,
   id: r.id, brand: r.brand, name: r.name, segment: r.segment,
   launch: r.launch, stage: r.stage, po: r.po,
@@ -717,22 +731,17 @@ async function dbLoadPhones() {
      { updatedAt }        saved; the fresh stamp to hold for the next save */
 async function dbUpsertPhone(phone) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
-
-  if (phone.updatedAt) {
-    const { data, error } = await c.get("/phones?select=updated_at&id=eq." + phone.id);
-    if (error) return { error };
-    const server = data?.[0]?.updated_at;
-    /* No row on the server means it was deleted; let the write recreate it. */
-    if (server && server !== phone.updatedAt) return { conflict: true };
-  }
-
-  const { error } = await c.upsert("/phones?on_conflict=id", phoneToRow(phone));
-  if (error) return { error };
-
-  /* Read back the stamp the trigger just wrote, or this tab would report a
-     conflict against its own save the very next time. */
-  const { data } = await c.get("/phones?select=updated_at&id=eq." + phone.id);
-  return { updatedAt: data?.[0]?.updated_at || null };
+  return c.upsert("/phones?on_conflict=id", phoneToRow(phone));
+}
+/* An atomic compare-and-swap update. A zero-row PATCH means a concurrent
+   browser changed the row first; do not overwrite it. */
+async function dbUpdatePhone(phone, expectedUpdatedAt) {
+  const c = dbClient(); if (!c) return { error: "Not configured" };
+  const version = encodeURIComponent(expectedUpdatedAt);
+  const result = await c.patch(`/phones?id=eq.${phone.id}&updated_at=eq.${version}`, phoneToRow(phone));
+  return !result.error && !result.data?.length
+    ? { data: null, error: null, conflict: true }
+    : result;
 }
 async function dbDeletePhone(id) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
@@ -2749,8 +2758,10 @@ function CSVImport({ existing, onImport, onDone }) {
   const readFile = (file) => {
     if (!file) return;
     setFileErr("");
-    if (!/\.(csv|txt|tsv)$/i.test(file.name)) {
-      setFileErr("Pick a .csv, .tsv or .txt file. Excel files must be saved as CSV first.");
+    /* The app's Excel template is tab-delimited text with an .xls extension.
+       Native .xlsx workbooks still need to be saved as CSV first. */
+    if (!/\.(csv|txt|tsv|xls)$/i.test(file.name)) {
+      setFileErr("Pick a .csv, .tsv, .txt or Excel-compatible .xls file. Save .xlsx workbooks as CSV first.");
       return;
     }
     if (file.size > 2_000_000) { setFileErr("That file is over 2 MB — too large to import."); return; }
@@ -2847,15 +2858,15 @@ function CSVImport({ existing, onImport, onDone }) {
           onDrop={(e) => { e.preventDefault(); readFile(e.dataTransfer.files?.[0]); }}
           style={{ display: "block", border: "1px dashed var(--line)", borderRadius: 10,
             padding: "16px 14px", textAlign: "center", cursor: "pointer", marginBottom: 10 }}>
-          <input type="file" accept=".csv,.tsv,.txt,text/csv" style={{ display: "none" }}
+          <input type="file" accept=".csv,.tsv,.txt,.xls,text/csv,application/vnd.ms-excel" style={{ display: "none" }}
             onChange={(e) => { readFile(e.target.files?.[0]); e.target.value = ""; }} />
           <div style={{ fontSize: 13, marginBottom: 3 }}>
             {fileName
               ? <span style={{ color: "var(--ok)" }}>✓ {fileName} loaded</span>
-              : "Choose a CSV file, or drag one here"}
+              : "Choose a CSV or Excel-compatible file, or drag one here"}
           </div>
           <div style={{ fontSize: 11, color: "var(--dim)" }}>
-            {fileName ? "Click to pick a different file" : ".csv, .tsv or .txt"}
+            {fileName ? "Click to pick a different file" : ".csv, .tsv, .txt or .xls"}
           </div>
         </label>
         {fileErr && (
@@ -4532,7 +4543,9 @@ export default function App() {
   const [dbReady, setDbReady]   = useState(() => !!dbGetConfig());
   const [dbOnline, setDbOnline] = useState(false);
   const [dbError, setDbError]   = useState("");
+  const [conflictedIds, setConflictedIds] = useState(() => new Set());
   const [showDbSetup, setShowDbSetup] = useState(false);
+  const writeState = useRef(new Map());
 
   /* ── session state ── */
   const [users, setUsers]     = useState(DEFAULT_USERS);
@@ -4578,6 +4591,8 @@ export default function App() {
         });
       }
       if (ph.data)         setPhones(ph.data);
+      writeState.current.clear();
+      setConflictedIds(new Set());
     }
     setLoading(false);
   };
@@ -4597,7 +4612,7 @@ export default function App() {
   }, [dbOnline]);
 
   /* ── write-through helper: update local state + persist ── */
-  const persist = async (updatedPhone) => {
+  const persistLegacy = async (updatedPhone) => {
     if (!dbOnline) return;
     const { error, conflict, updatedAt } = await dbUpsertPhone(updatedPhone);
 
@@ -4611,6 +4626,37 @@ export default function App() {
     /* hold the new stamp so the next save from this tab compares correctly */
     if (updatedAt) setPhones((list) => list.map((p) =>
       p.id === updatedPhone.id ? { ...p, updatedAt } : p));
+  };
+
+  const persist = (updatedPhone) => {
+    if (!dbOnline) return Promise.resolve();
+    const id = updatedPhone.id;
+    const state = writeState.current.get(id) || {
+      version: updatedPhone.updatedAt, queue: Promise.resolve(), conflicted: false,
+    };
+    writeState.current.set(id, state);
+    state.queue = state.queue.then(async () => {
+      if (state.conflicted) return;
+      const result = state.version
+        ? await dbUpdatePhone(updatedPhone, state.version)
+        : await dbUpsertPhone(updatedPhone);
+      if (result.conflict) {
+        state.conflicted = true;
+        setConflictedIds((ids) => new Set(ids).add(id));
+        say("Save conflict — someone else changed this model. Refresh before editing it again.");
+        return { conflict: true };
+      }
+      if (result.error) { say("DB save failed: " + result.error); return result; }
+      const savedRow = result.data?.[0];
+      if (!savedRow?.updated_at) return result;
+      state.version = savedRow.updated_at;
+      setPhones((list) => list.map((p) => p.id === id ? { ...p, updatedAt: savedRow.updated_at } : p));
+      return result;
+    }).catch((error) => {
+      say("DB save failed: " + error.message);
+      return { error: error.message };
+    });
+    return state.queue;
   };
 
   const login = (user) => {
@@ -4898,8 +4944,14 @@ export default function App() {
       notes: [], attachments: [], archived: false,
     }, session, "Imported from CSV")));
     setPhones((list) => [...list, ...made]);
-    made.forEach(persist);
-    say(`${made.length} model${made.length === 1 ? "" : "s"} imported`);
+    const noun = (n) => `${n} model${n === 1 ? "" : "s"}`;
+    if (!dbOnline) { say(`${noun(made.length)} imported in this tab only`); return; }
+    Promise.all(made.map(persist)).then((results) => {
+      const failed = results.filter((result) => result?.error || result?.conflict);
+      if (failed.length)
+        say(`${noun(made.length - failed.length)} imported · ${failed.length} failed to save`);
+      else say(`${noun(made.length)} imported`);
+    });
   };
 
   const addPhone = (data) => {
@@ -4970,14 +5022,14 @@ export default function App() {
               <FileText size={14} />Reports
             </button>
             {/* DB status indicator */}
-            <div title={dbOnline
+            <div title={conflictedIds.size ? "A newer version exists in the database — refresh required" : dbOnline
                 ? (syncedAt ? `Last read from the database at ${syncedAt.toLocaleTimeString()}` : "Database connected")
                 : dbError || "No database configured"}
               style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11,
-                color: dbOnline ? "var(--ok)" : "var(--warn)" }}>
+                color: conflictedIds.size ? "var(--bad)" : dbOnline ? "var(--ok)" : "var(--warn)" }}>
               <div style={{ width: 8, height: 8, borderRadius: "50%",
-                background: dbOnline ? "var(--ok)" : "var(--warn)" }} />
-              {dbOnline
+                background: conflictedIds.size ? "var(--bad)" : dbOnline ? "var(--ok)" : "var(--warn)" }} />
+              {conflictedIds.size ? "Refresh required" : dbOnline
                 ? (loading ? "syncing…" : syncedAt
                     ? "synced " + syncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
                     : "DB live")

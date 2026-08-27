@@ -46,6 +46,9 @@ create table phones (
 );
 
 -- Auto-update updated_at
+-- This timestamp is also the optimistic-lock version token. The app updates a
+-- phone only when the timestamp it originally loaded still matches; a zero-row
+-- PATCH is a conflict, never a permitted last-write-wins overwrite.
 create or replace function touch_updated_at()
 returns trigger language plpgsql as $$
 begin new.updated_at = now(); return new; end; $$;
