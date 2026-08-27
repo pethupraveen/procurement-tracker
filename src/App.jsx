@@ -536,8 +536,8 @@ function moveStatus(model, role, stageKey) {
        Research → Un-Procurement   decided this phone is not worth buying
        Un-Procurement → Research   changed our mind, look at it again    */
   if (isTerminal(stageKey)) {
-    if (model.stage !== "research")
-      return { ok: false, reason: `Only a phone still at Research can go to ${STAGES[target].label}` };
+    if (["received", "live"].includes(model.stage))
+      return { ok: false, reason: "Stock has already arrived — archive it instead" };
     if (!canEnterStage(role, stageKey))
       return { ok: false, reason: `${roleLabel(role)} can't move to ${STAGES[target].label}` };
     return { ok: true, reason: null };
@@ -1122,7 +1122,7 @@ function Board({ models, allModels, onOpen, onMove, onAdd, onAdvance, role, comp
       <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
       <div style={{ fontSize: 16, fontWeight: 640, marginBottom: 8 }}>Board is empty</div>
       <div style={{ fontSize: 13, color: "var(--dim)", marginBottom: 20 }}>Add a phone to see it appear here.</div>
-      <button className="btn" data-primary="1" onClick={onAdd}><Plus size={14} />Add phone</button>
+      {onAdd && <button className="btn" data-primary="1" onClick={onAdd}><Plus size={14} />Add phone</button>}
     </div>
   );
 
@@ -3290,9 +3290,9 @@ function Dashboard({ models, onOpen, onAdd, onNavigate, role }) {
         Click <strong>Add phone</strong> to start tracking your first new model.
         Every phone moves through Research → Planned → Ordered → Production → Received → Live.
       </div>
-      <button className="btn" data-primary="1" onClick={onAdd}>
+      {onAdd && <button className="btn" data-primary="1" onClick={onAdd}>
         <Plus size={14} />Add your first phone
-      </button>
+      </button>}
     </div>
   );
 
@@ -4947,6 +4947,10 @@ export default function App() {
 
   /* Bulk import from pasted CSV — one phone per line */
   const importPhones = (rows) => {
+    if (!CAN.addPhone(role)) {
+      say(`${roleLabel(role)} can't add phones`);
+      return;
+    }
     const made = [];
     rows.forEach((r) => made.push(withAudit({
       id: newPhoneId([...phones, ...made]), brand: r.brand, name: r.name, segment: r.segment,
@@ -4966,6 +4970,10 @@ export default function App() {
   };
 
   const addPhone = (data) => {
+    if (!CAN.addPhone(role)) {
+      say(`${roleLabel(role)} can't add phones`);
+      return;
+    }
     const id = newPhoneId(phones);
     const newPhone = withAudit({ ...data, id, notes: [], attachments: [], archived: false }, session, "Phone added");
     setPhones((list) => [...list, newPhone]);
@@ -5117,10 +5125,10 @@ export default function App() {
           />
         )}
 
-        {view === "dashboard" && <Dashboard models={liveModels} onOpen={setOpenId} onAdd={() => setAdding(true)}
+        {view === "dashboard" && <Dashboard models={liveModels} onOpen={setOpenId} onAdd={CAN.addPhone(role) ? () => setAdding(true) : null}
                                   onNavigate={navigate} role={role} />}
         {view === "board"     && <Board models={visible} allModels={models} onOpen={setOpenId} onMove={move}
-                                  onAdd={() => setAdding(true)} onAdvance={advance} role={role}
+                                  onAdd={CAN.addPhone(role) ? () => setAdding(true) : null} onAdvance={advance} role={role}
                                   compact={compact} filters={filters} />}
         {view === "table"     && <Table models={visible} allModels={models} onOpen={setOpenId}
                                   onAdvance={advance} role={role} filters={filters} />}
