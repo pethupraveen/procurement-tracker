@@ -682,7 +682,9 @@ function dbClient() {
 
   return {
     get:    (p)    => req("GET",    p, null, { "Prefer": "return=representation" }),
-    upsert: (p, b) => req("POST",   p, b,    { "Prefer": "resolution=merge-duplicates,return=representation" }),
+    /* Some Supabase/PostgREST versions reject return=representation when it
+       is combined with an upsert. Insert first, then read the version token. */
+    upsert: (p, b) => req("POST",   p, b,    { "Prefer": "resolution=merge-duplicates" }),
     patch:  (p, b) => req("PATCH",  p, b,    { "Prefer": "return=representation" }),
     del:    (p)    => req("DELETE", p),
   };
@@ -731,7 +733,12 @@ async function dbLoadPhones() {
      { updatedAt }        saved; the fresh stamp to hold for the next save */
 async function dbUpsertPhone(phone) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
-  return c.upsert("/phones?on_conflict=id", phoneToRow(phone));
+  const saved = await c.upsert("/phones?on_conflict=id", phoneToRow(phone));
+  if (saved.error) return saved;
+  /* The insert response is deliberately empty for compatibility above. Read
+     back updated_at so the next edit can use the optimistic-lock token. */
+  const version = await c.get(`/phones?select=updated_at&id=eq.${phone.id}`);
+  return version.error ? version : { data: version.data, error: null };
 }
 /* An atomic compare-and-swap update. A zero-row PATCH means a concurrent
    browser changed the row first; do not overwrite it. */
@@ -4949,7 +4956,7 @@ export default function App() {
     Promise.all(made.map(persist)).then((results) => {
       const failed = results.filter((result) => result?.error || result?.conflict);
       if (failed.length)
-        say(`${noun(made.length - failed.length)} imported · ${failed.length} failed to save`);
+        say(`${noun(made.length - failed.length)} imported · ${failed.length} failed to save: ${failed[0].error || "save conflict"}`);
       else say(`${noun(made.length)} imported`);
     });
   };
