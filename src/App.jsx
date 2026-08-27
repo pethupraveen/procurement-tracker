@@ -2750,8 +2750,11 @@ function CSVImport({ existing, onImport, onDone }) {
   const readFile = (file) => {
     if (!file) return;
     setFileErr("");
-    if (!/\.(csv|txt|tsv)$/i.test(file.name)) {
-      setFileErr("Pick a .csv, .tsv or .txt file. Excel files must be saved as CSV first.");
+    /* The app's own Excel template is tab-delimited text with an .xls
+       extension, so rejecting it made a download from step 1 impossible to
+       upload in step 2. Native .xlsx workbooks remain unsupported. */
+    if (!/\.(csv|txt|tsv|xls)$/i.test(file.name)) {
+      setFileErr("Pick a .csv, .tsv, .txt or Excel-compatible .xls file. Save .xlsx workbooks as CSV first.");
       return;
     }
     if (file.size > 2_000_000) { setFileErr("That file is over 2 MB — too large to import."); return; }
@@ -2848,15 +2851,15 @@ function CSVImport({ existing, onImport, onDone }) {
           onDrop={(e) => { e.preventDefault(); readFile(e.dataTransfer.files?.[0]); }}
           style={{ display: "block", border: "1px dashed var(--line)", borderRadius: 10,
             padding: "16px 14px", textAlign: "center", cursor: "pointer", marginBottom: 10 }}>
-          <input type="file" accept=".csv,.tsv,.txt,text/csv" style={{ display: "none" }}
+          <input type="file" accept=".csv,.tsv,.txt,.xls,text/csv,application/vnd.ms-excel" style={{ display: "none" }}
             onChange={(e) => { readFile(e.target.files?.[0]); e.target.value = ""; }} />
           <div style={{ fontSize: 13, marginBottom: 3 }}>
             {fileName
               ? <span style={{ color: "var(--ok)" }}>✓ {fileName} loaded</span>
-              : "Choose a CSV file, or drag one here"}
+              : "Choose a CSV or Excel-compatible file, or drag one here"}
           </div>
           <div style={{ fontSize: 11, color: "var(--dim)" }}>
-            {fileName ? "Click to pick a different file" : ".csv, .tsv or .txt"}
+            {fileName ? "Click to pick a different file" : ".csv, .tsv, .txt or .xls"}
           </div>
         </label>
         {fileErr && (
