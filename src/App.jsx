@@ -427,7 +427,11 @@ const ROLE_CAN_ADVANCE_TO = {
 };
 
 const CAN = {
-  addPhone:    (r) => ["admin","procurement"].includes(r),
+  /* Catalog may create the initial phone record through either the
+     manual form or the CSV importer. Downstream procurement steps remain
+     governed by their existing role permissions. */
+  addPhone:    (r) => ["admin","procurement","catalog"].includes(r),
+  archive:     (r) => ["admin","procurement"].includes(r),
   editResearch:(r) => ["admin","procurement"].includes(r),
   editSKUs:    (r) => ["admin","procurement"].includes(r),
   savePO:      (r) => ["admin","procurement"].includes(r),
@@ -5137,7 +5141,7 @@ export default function App() {
       {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onMove={move} onResearchSave={CAN.editResearch(role) ? saveResearch : null} onSKUSave={CAN.editSKUs(role) ? saveSKU : null} onSTPUpdate={CAN.updateSTP(role) ? updateSTP : null} onReceiptSave={CAN.saveReceipt(role) ? saveReceipt : null} onPOSave={CAN.savePO(role) ? savePO : null} onListingSave={CAN.saveListing(role) ? saveListings : null} onSalesLog={logSale} canLog={CAN.logSales(role)} role={role}
                       onAddNote={addNote} onDeleteNote={deleteNote}
                       onAddAttachment={addAttachment} onDeleteAttachment={deleteAttachment}
-                      onArchive={CAN.addPhone(role) ? setArchived : null} />}
+                      onArchive={CAN.archive(role) ? setArchived : null} />}
       {adding && <AddForm onClose={() => setAdding(false)} onSave={addPhone}
                       onImport={importPhones} existing={phones} />}
       {confirmReset && (
