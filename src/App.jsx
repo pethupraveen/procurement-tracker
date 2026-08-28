@@ -465,6 +465,9 @@ function gateBlock(model) {
   /* Goods can't be received against files the supplier never got, and a
      rejected STP means that SKU is not being made at all. */
   if (model.stage === "production") {
+    /* SKUs stay editable this late, so they can all be deleted here. Without
+       this an empty list makes every check below pass on nothing. */
+    if (allSkus(model).length === 0) return "No SKUs on this phone";
     const rejected = allSkus(model).filter((r) => r.stpStatus === "Rejected");
     if (rejected.length)
       return `${rejected.length} STP file${rejected.length > 1 ? "s" : ""} rejected`;
@@ -474,6 +477,7 @@ function gateBlock(model) {
   }
 
   if (model.stage === "received") {
+    if (allSkus(model).length === 0) return "No SKUs on this phone";
     const unconf = allSkus(model).filter((r) => !isConfirmed(r));
     if (unconf.length) return `${unconf.length} SKU${unconf.length > 1 ? "s" : ""} not confirmed`;
     /* Catalog gate: nothing goes Live until every SKU is live on every
@@ -4647,7 +4651,13 @@ export default function App() {
     };
     writeState.current.set(id, state);
     state.queue = state.queue.then(async () => {
-      if (state.conflicted) return;
+      /* Already lost a race on this phone. Every edit until the next refresh is
+         local-only, so say so each time — the caller has its own success toast
+         queued up and the red header dot is not loud enough to beat it. */
+      if (state.conflicted) {
+        say("⚠ Not saved — this phone has a newer version in the database. Refresh first.");
+        return { conflict: true };
+      }
       const result = state.version
         ? await dbUpdatePhone(updatedPhone, state.version)
         : await dbUpsertPhone(updatedPhone);
@@ -4680,6 +4690,14 @@ export default function App() {
   };
 
   const say = (text) => { setToast(text); setTimeout(() => setToast((t) => (t === text ? null : t)), 2500); };
+
+  /* Every toast that claims something was saved goes through here. With no
+     database configured `persist` is a no-op, so the work lives in this tab and
+     dies on the next refresh — the toast has to admit that rather than show the
+     same cheerful green it shows when the row really reached Supabase. */
+  const saved = (text) => say(dbOnline
+    ? text
+    : `⚠ ${text} — in this tab only, no database. Lost on refresh.`);
 
   /* derive everything, every render — never stored, never stale */
   const models = useMemo(() => phones.map(derive), [phones]);
@@ -4718,10 +4736,13 @@ export default function App() {
          so it writes nothing to the timeline. */
       if (isTerminal(stageKey))
         return withAudit({ ...p, stage: stageKey, done }, session, `Marked ${label}`);
-      if (isTerminal(p.stage)) {
-        PIPELINE.slice(target + 1).forEach((s) => { delete done[s.key]; });
+      /* Coming back from a terminal stage keeps the timeline it already earned.
+         A phone un-procured at Ordered really did pass Planned and Ordered, and
+         it still holds the PO and SKUs from that run — stripping the dates would
+         leave the record contradicting itself. The forward walk below uses ||=,
+         so nothing gets re-stamped on the way through a second time. */
+      if (isTerminal(p.stage))
         return withAudit({ ...p, stage: stageKey, done }, session, `Back into procurement at ${label}`);
-      }
 
       const forward = target > stageIndex(p.stage);
       if (forward) PIPELINE.slice(0, target + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
@@ -4745,7 +4766,7 @@ export default function App() {
     if (!st.ok) { say(`⚠ ${st.reason}`); return; }
     const back = stageIndex(stageKey) < m.index;
     moveTo(id, stageKey);
-    say(`${m.name} moved ${back ? "back " : ""}to ${STAGES[stageIndex(stageKey)].label}`);
+    saved(`${m.name} moved ${back ? "back " : ""}to ${STAGES[stageIndex(stageKey)].label}`);
   };
 
   const advance = (id) => {
@@ -4767,7 +4788,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Phone details updated");
+    saved("Phone details updated");
   };
 
   /* save covers array from PlannedSKUEditor */
@@ -4777,7 +4798,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("SKUs saved");
+    saved("SKUs saved");
   };
 
   /* update STP file status from ProductionSTP */
@@ -4790,7 +4811,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("STP status saved");
+    saved("STP status saved");
   };
 
   /* listingsByRid = { rid: { Flipkart: "Live", ... } } */
@@ -4803,7 +4824,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Listing status saved");
+    saved("Listing status saved");
   };
 
   /* PO number is typed by the buyer, never invented by the app */
@@ -4812,6 +4833,10 @@ export default function App() {
        missing → PO cleared and stage returns to Ordered so the model
                  reappears in the PO builder for the next order        */
   const bulkReceive = (gotIds, missingIds) => {
+    /* canReceive only hides the buttons — the permission has to hold here too.
+       Note this path deliberately skips gateBlock's STP check: an arrival at the
+       warehouse is a physical fact, not something to block on paperwork. */
+    if (!CAN.saveReceipt(role)) { say(`⚠ ${roleLabel(role)} can't record a goods receipt`); return; }
     setPhones((list) => {
       const next = list.map((p) => {
         if (gotIds.includes(p.id)) {
@@ -4836,7 +4861,7 @@ export default function App() {
     const bits = [];
     if (gotIds.length)     bits.push(`${gotIds.length} received`);
     if (missingIds.length) bits.push(`${missingIds.length} back to Ordered for a new PO`);
-    say(bits.join(" · "));
+    saved(bits.join(" · "));
   };
 
   /* Assign one PO number to several models at once */
@@ -4846,7 +4871,7 @@ export default function App() {
       next.filter((p) => ids.includes(p.id)).forEach(persist);
       return next;
     });
-    say(`${po} assigned to ${ids.length} model${ids.length === 1 ? "" : "s"}`);
+    saved(`${po} assigned to ${ids.length} model${ids.length === 1 ? "" : "s"}`);
   };
 
   const savePO = (id, po) => {
@@ -4855,7 +4880,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say(po.trim() ? "PO number saved" : "PO number cleared");
+    saved(po.trim() ? "PO number saved" : "PO number cleared");
   };
 
   /* save goods receipt rows from ReceivedChecker */
@@ -4871,7 +4896,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Receipt saved");
+    saved("Receipt saved");
   };
 
   const logSale = (id, entry) => {
@@ -4882,7 +4907,7 @@ export default function App() {
       const u = next.find(p => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Sale logged");
+    saved("Sale logged");
   };
 
   const resetAll = async () => {
@@ -4902,7 +4927,7 @@ export default function App() {
       const u = next.find((p) => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Note added");
+    saved("Note added");
   };
 
   const deleteNote = (id, rid) => {
@@ -4922,7 +4947,7 @@ export default function App() {
       const u = next.find((p) => p.id === id); if (u) persist(u);
       return next;
     });
-    say("Link attached");
+    saved("Link attached");
   };
 
   const deleteAttachment = (id, rid) => {
@@ -4941,7 +4966,7 @@ export default function App() {
       const u = next.find((p) => p.id === id); if (u) persist(u);
       return next;
     });
-    say(archived ? "Model archived" : "Model restored");
+    saved(archived ? "Model archived" : "Model restored");
     if (archived) setOpenId(null);
   };
 
@@ -4980,7 +5005,7 @@ export default function App() {
     persist(newPhone);
     setAdding(false);
     setOpenId(id);
-    say(`${data.brand} ${data.name} added and tracking`);
+    saved(`${data.brand} ${data.name} added and tracking`);
   };
 
   /* ── DB setup flow: Admin must configure Supabase first ── */
@@ -5115,6 +5140,34 @@ export default function App() {
           </div>
         </div>
 
+        {/* The 11px "Local only" dot in the header is not loud enough for what
+            it means: nothing is being written anywhere, and a morning's work
+            disappears on refresh. Say it at full size. */}
+        {!dbOnline && (
+          <div className="card" style={{
+            marginBottom: 12, borderColor: "var(--warn)",
+            color: "var(--warn)", fontSize: 13, lineHeight: 1.5,
+          }}>
+            <strong>Not connected to the database.</strong> Everything you change stays
+            in this browser tab and is lost when you refresh or close it.
+            {dbError ? ` (${dbError})` : ""}
+            {CAN.reset(role) && <> Use the <strong>⚙</strong> button above to connect Supabase.</>}
+          </div>
+        )}
+
+        {/* A phone that lost a save race stays editable but writes nothing.
+            Tell the user before they spend an hour on it. */}
+        {conflictedIds.size > 0 && (
+          <div className="card" style={{
+            marginBottom: 12, borderColor: "var(--bad)",
+            color: "var(--bad)", fontSize: 13, lineHeight: 1.5,
+          }}>
+            <strong>{conflictedIds.size} phone{conflictedIds.size === 1 ? " has" : "s have"} a newer
+            version in the database.</strong> Edits to {conflictedIds.size === 1 ? "it" : "them"} are
+            not being saved. Press <strong>↻</strong> above to reload before editing further.
+          </div>
+        )}
+
         {/* Search + filters — shown on Board and List only */}
         {["board","table"].includes(view) && models.length > 0 && (
           <FilterBar
@@ -5205,7 +5258,7 @@ export default function App() {
             }
             /* an admin who deleted their own account is signed out */
             if (!me) { setManageUsers(false); logout(); return; }
-            say(removed.length
+            saved(removed.length
               ? `Users saved · ${removed.length} account${removed.length === 1 ? "" : "s"} removed`
               : "Users saved");
           }}
