@@ -115,6 +115,11 @@ const skuRow = (sku = "", material = "", units = 0) => ({
   rid: newRid(),             // stable React key, never shown to the user
   sku, material, units,
   stpStatus: "Not Sent",     // STP file is tracked per SKU, not per phone
+  /* Whether this SKU needs an STP file at all — Catalog's call, made model-wise
+     and material-wise. Tri-state on purpose: null means nobody has decided yet,
+     which is different from a deliberate "no file needed". Only `true` holds up
+     the move out of Production. */
+  stpRequired: null,         // null = undecided | true = required | false = not
   receivedQty: null,         // how many actually arrived
   receiptState: null,        // null = unconfirmed | "full" | "short" | "none"
   /* Listing runs per SKU per marketplace — a colour can be live on
@@ -210,6 +215,13 @@ const stpTone = (st) => st === "Completed" ? "ok" : st === "Rejected" ? "bad" : 
 
 /* A SKU is settled once someone has said what happened to it. */
 const isConfirmed = (r) => r.receiptState != null;
+/* Only an explicit `true` means the factory owes us a file. An undecided SKU
+   does not hold the phone up — that was the call made when this shipped — but
+   it is counted and shown so the gap never goes quiet. */
+const stpNeeded    = (r) => r.stpRequired === true;
+const stpUndecided = (r) => r.stpRequired == null;
+const stpLabel     = (r) => r.stpRequired === true ? "Required"
+                          : r.stpRequired === false ? "Not required" : "Not decided";
 const shortfallOf = (r) => Math.max(0, (r.units || 0) - (r.receivedQty || 0));
 const receiptLabel = (r) =>
   r.receiptState === "full"  ? "Received in full" :
@@ -338,11 +350,16 @@ function problemsOf(model) {
   if (model.stage === "ordered" && !model.po)
     push("warn", "No PO number recorded");
 
-  if (model.stage === "production" && allSkus(model).some((r) => !r.stpStatus || r.stpStatus === "Not Sent"))
+  if (model.stage === "production" && allSkus(model).some((r) => stpNeeded(r) && (!r.stpStatus || r.stpStatus === "Not Sent")))
     push("warn", "STP file not sent yet");
 
-  if (model.stage === "production" && allSkus(model).some((r) => r.stpStatus === "Rejected"))
+  if (model.stage === "production" && allSkus(model).some((r) => stpNeeded(r) && r.stpStatus === "Rejected"))
     push("bad", "STP file rejected on one or more SKUs");
+
+  /* The move out of Production no longer waits on an undecided SKU, so say so
+     here instead — otherwise the omission is completely invisible. */
+  if (["ordered", "production"].includes(model.stage) && allSkus(model).some(stpUndecided))
+    push("warn", `${allSkus(model).filter(stpUndecided).length} SKU(s) with no STP decision`);
 
   if (allSkus(model).some((r) => r.receiptState === "short"))
     push("warn", `Short delivery — ${qty(allSkus(model).reduce((s, r) => s + shortfallOf(r), 0))} units missing`);
@@ -419,10 +436,13 @@ const ROLES = [
 const ROLE_CAN_ADVANCE_TO = {
   admin:       ["research","planned","ordered","production","received","live","unprocured"],
   procurement: ["research","planned","ordered","unprocured"],
-  warehouse:   ["production","received"],
-  /* Catalog is the team that gets every SKU listed, which is the only
-     thing standing between Received and Live — so they make that move. */
-  catalog:     ["live"],
+  /* Warehouse keeps the factory end — putting a phone into Production and
+     chasing STP files with the supplier. Inwarding moved to Catalog. */
+  warehouse:   ["production"],
+  /* Catalog now owns everything from the loading bay onward: they book the
+     stock in, so they make the move to Received, and they finish the listings,
+     which is the only thing standing between Received and Live. */
+  catalog:     ["production","received","live"],
   sales:       [],
 };
 
@@ -435,8 +455,12 @@ const CAN = {
   editResearch:(r) => ["admin","procurement"].includes(r),
   editSKUs:    (r) => ["admin","procurement"].includes(r),
   savePO:      (r) => ["admin","procurement"].includes(r),
+  /* Two separate jobs, deliberately not one permission. Warehouse chases the
+     file with the factory (status); Catalog decides whether a file is owed at
+     all (requirement). Neither should be able to do the other's half. */
   updateSTP:   (r) => ["admin","warehouse"].includes(r),
-  saveReceipt: (r) => ["admin","warehouse"].includes(r),
+  setStpRequired: (r) => ["admin","catalog"].includes(r),
+  saveReceipt: (r) => ["admin","catalog"].includes(r),
   saveListing: (r) => ["admin","catalog"].includes(r),
   logSales:    (r) => ["admin","sales"].includes(r),
   manageUsers: (r) => r === "admin",
@@ -468,10 +492,12 @@ function gateBlock(model) {
     /* SKUs stay editable this late, so they can all be deleted here. Without
        this an empty list makes every check below pass on nothing. */
     if (allSkus(model).length === 0) return "No SKUs on this phone";
-    const rejected = allSkus(model).filter((r) => r.stpStatus === "Rejected");
+    /* Only SKUs Catalog has marked as needing a file hold the phone up. An
+       undecided SKU passes — see the STP requirement screen for the count. */
+    const rejected = allSkus(model).filter((r) => stpNeeded(r) && r.stpStatus === "Rejected");
     if (rejected.length)
       return `${rejected.length} STP file${rejected.length > 1 ? "s" : ""} rejected`;
-    const notSent = allSkus(model).filter((r) => !r.stpStatus || r.stpStatus === "Not Sent");
+    const notSent = allSkus(model).filter((r) => stpNeeded(r) && (!r.stpStatus || r.stpStatus === "Not Sent"));
     if (notSent.length)
       return `${notSent.length} STP file${notSent.length > 1 ? "s" : ""} not sent yet`;
   }
@@ -758,6 +784,57 @@ async function dbUpdatePhone(phone, expectedUpdatedAt) {
     ? { data: null, error: null, conflict: true }
     : result;
 }
+/* ── REPORT EMAIL ────────────────────────────────────────────────
+   A browser cannot hold a mail credential — anything shipped in this
+   bundle is readable by every visitor — so the send goes through a
+   Supabase Edge Function that holds the API key server-side.
+   See supabase/functions/send-stp-report/index.ts; until that is
+   deployed this reports the failure rather than pretending.        */
+
+const REPORT_MAIL_KEY = "proc_tracker_report_mail";
+
+function mailGetRecipients() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(REPORT_MAIL_KEY) || "null");
+    return Array.isArray(raw) ? raw : [];
+  } catch { return []; }
+}
+function mailSaveRecipients(list) {
+  localStorage.setItem(REPORT_MAIL_KEY, JSON.stringify(list));
+}
+/* "a@b.com, c@d.com" -> ["a@b.com", "c@d.com"], rejecting anything that
+   plainly is not an address so the failure happens here, not at the API. */
+function parseRecipients(text) {
+  const parts = String(text || "").split(/[,;\s]+/).map((s) => s.trim()).filter(Boolean);
+  const bad = parts.filter((p) => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(p));
+  return { list: parts, bad };
+}
+
+async function dbSendReport({ subject, intro, headers, rows }) {
+  const cfg = dbGetConfig();
+  if (!cfg) return { error: "No database configured — the mail function lives in your Supabase project" };
+  const to = mailGetRecipients();
+  if (!to.length) return { error: "No recipients set — add MD / Factory addresses first" };
+  try {
+    const res = await fetch(`${cfg.url}/functions/v1/send-stp-report`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: cfg.key,
+        Authorization: `Bearer ${cfg.key}`,
+      },
+      body: JSON.stringify({ to, subject, intro, headers, rows }),
+    });
+    if (res.status === 404)
+      return { error: "Mail function not deployed yet — run: supabase functions deploy send-stp-report" };
+    const body = await res.text();
+    if (!res.ok) return { error: `Mail failed (${res.status}): ${body.slice(0, 200)}` };
+    return { ok: true, sent: to.length };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
 async function dbDeletePhone(id) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
   return c.del("/phones?id=eq." + id);
@@ -1653,9 +1730,9 @@ function ProductionSTP({ model, onSTPUpdate }) {
   const save   = () => { onSTPUpdate(model.id, draft); setSaved(true); setTimeout(() => setSaved(false), 2000); };
 
   const exportSTP = (fmt) => {
-    const headers = ["Brand", "Model", "PO", "SKU", "Material", "Units", "STP Status"];
+    const headers = ["Brand", "Model", "PO", "SKU", "Material", "Units", "STP File", "STP Status"];
     const body = rows.map((r) => [model.brand, model.name, model.po || "",
-      r.sku || "", r.material || "", r.units, draft[r.rid] || "Not Sent"]);
+      r.sku || "", r.material || "", r.units, stpLabel(r), draft[r.rid] || "Not Sent"]);
     downloadReport(`STP_${model.brand}_${model.name}`, headers, body, fmt);
   };
 
@@ -1691,13 +1768,18 @@ function ProductionSTP({ model, onSTPUpdate }) {
 
         <div style={{ overflowX: "auto", marginBottom: 12 }}>
           <table>
-            <thead><tr><th>SKU</th><th>Material</th><th>Units</th><th style={{ minWidth: 150 }}>STP status</th></tr></thead>
+            <thead><tr><th>SKU</th><th>Material</th><th>Units</th><th>File needed?</th><th style={{ minWidth: 150 }}>STP status</th></tr></thead>
             <tbody>
               {rows.map((r) => (
                 <tr key={r.rid} style={{ cursor: "default" }}>
                   <td className="n" style={{ fontWeight: 550, fontSize: 12 }}>{r.sku || <span style={{ color: "var(--warn)" }}>missing</span>}</td>
                   <td style={{ color: "var(--dim)", fontSize: 12 }}>{r.material || <span style={{ color: "var(--bad)" }}>missing</span>}</td>
                   <td className="n">{qty(r.units)}</td>
+                  {/* Catalog's call, read-only here — chasing a file nobody
+                      asked for is the waste this column exists to prevent. */}
+                  <td style={{ fontSize: 11 }}>
+                    <Tag tone={stpNeeded(r) ? "ok" : stpUndecided(r) ? "warn" : undefined}>{stpLabel(r)}</Tag>
+                  </td>
                   <td style={{ padding: "6px 8px" }}>
                     <select value={draft[r.rid] || "Not Sent"} style={{ fontSize: 12 }}
                       disabled={!canEdit}
@@ -1779,7 +1861,7 @@ function ReceivedChecker({ model, onSave }) {
           the shortfall shows up in the received report so you can chase it.
         </div>
 
-        {!canEdit && <RoleLocked what="confirm goods receipt" who="Warehouse" />}
+        {!canEdit && <RoleLocked what="confirm goods receipt" who="Catalog" />}
 
         {canEdit && (
           <button className="btn" style={{ fontSize: 11, padding: "4px 9px", marginBottom: 12 }}
@@ -3722,6 +3804,447 @@ function CatalogQueue({ models, onSetListing, onOpen, canEdit }) {
    again in the PO builder for the next order.
    ─────────────────────────────────────────────────────────────── */
 
+/* ── CATALOG: INWARD STOCK ───────────────────────────────────────
+   Every SKU with stock out with a supplier or just arrived, on one
+   screen, so Catalog can book it all in without opening each phone.
+
+   The edits are held in a draft keyed by SKU rid and committed in one
+   go, which is what makes "mark forty SKUs received" a single action
+   rather than forty. Stages belong to the phone, not the SKU, so the
+   move button is per model — the SKU rows tell you what is blocking. */
+
+const INWARD_STAGES = ["ordered", "production", "received"];
+
+function InwardStock({ models, onSaveReceipt, onOpen, onMove, canEdit, role }) {
+  const [draft, setDraft] = useState({});     // rid -> { received, state }
+  const [onlyPending, setOnlyPending] = useState(false);
+
+  const queue = models
+    .filter((m) => INWARD_STAGES.includes(m.stage) && allSkus(m).length)
+    .sort(byUrgency);
+
+  /* draft first, stored value second — one place so nothing reads stale */
+  const valueOf = (r) => draft[r.rid] ?? { received: r.receivedQty ?? null, state: r.receiptState ?? null };
+  const stateFor = (n, planned) => n === null ? null : n === 0 ? "none" : n >= planned ? "full" : "short";
+
+  const setQty = (r, raw) => setDraft((d) => {
+    const n = raw === "" ? null : Math.max(0, +raw);
+    return { ...d, [r.rid]: { received: n, state: stateFor(n, r.units || 0) } };
+  });
+
+  /* the bulk primitive every button below goes through */
+  const markMany = (rows, kind) => setDraft((d) => {
+    const next = { ...d };
+    rows.forEach((r) => {
+      if (kind === "full")      next[r.rid] = { received: r.units || 0, state: "full" };
+      else if (kind === "none") next[r.rid] = { received: 0, state: "none" };
+      else                      next[r.rid] = { received: null, state: null };
+    });
+    return next;
+  });
+
+  const touched = Object.keys(draft).length;
+
+  const saveAll = () => {
+    /* a rid belongs to exactly one model, so group and send one save each —
+       every write goes through the normal per-phone optimistic-lock path */
+    queue.forEach((m) => {
+      const rows = allSkus(m).filter((r) => r.rid in draft)
+        .map((r) => ({ rid: r.rid, received: draft[r.rid].received, state: draft[r.rid].state }));
+      if (rows.length) onSaveReceipt(m.id, rows);
+    });
+    setDraft({});
+  };
+
+  /* totals across everything on screen, using draft values */
+  const allRows   = queue.flatMap(allSkus);
+  const ordered   = allRows.reduce((s, r) => s + (r.units || 0), 0);
+  const receivedN = allRows.reduce((s, r) => s + (valueOf(r).received || 0), 0);
+  const pendingN  = allRows.filter((r) => valueOf(r).state == null).length;
+  const shortN    = allRows.filter((r) => valueOf(r).state === "short").length;
+  const noneN     = allRows.filter((r) => valueOf(r).state === "none").length;
+
+  const exportInward = (fmt) => {
+    const headers = ["Brand", "Model", "Stage", "PO", "SKU", "Material",
+      "Units Ordered", "Units Received", "Short By", "Receipt Status"];
+    const rows = queue.flatMap((m) => allSkus(m).map((r) => {
+      const v = valueOf(r);
+      return [m.brand, m.name, STAGES[m.index].label, m.po || "", r.sku || "", r.material || "",
+        r.units || 0, v.received ?? "", v.state == null ? "" : Math.max(0, (r.units || 0) - (v.received || 0)),
+        receiptLabel({ receiptState: v.state })];
+    }));
+    downloadReport("Inward_stock", headers, rows, fmt);
+  };
+
+  if (!queue.length) return (
+    <div>
+      <h2>Inward stock</h2>
+      <div className="card" style={{ fontSize: 13, color: "var(--dim)" }}>
+        Nothing to book in. Phones appear here once they reach Ordered, and stay
+        until every SKU has been confirmed at Received.
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      <h2>Inward stock — {queue.length} model{queue.length === 1 ? "" : "s"}</h2>
+
+      {!canEdit && <RoleLocked what="book stock in" who="Catalog" />}
+
+      {/* the ordered-vs-received decision, in one line */}
+      <div className="card" style={{ marginBottom: 12, display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
+        <span style={{ fontSize: 12, color: "var(--dim)" }}>Ordered <strong style={{ color: "var(--text)", fontFamily: "var(--mono)" }}>{qty(ordered)}</strong></span>
+        <span style={{ fontSize: 12, color: "var(--dim)" }}>Received <strong style={{ color: "var(--text)", fontFamily: "var(--mono)" }}>{qty(receivedN)}</strong></span>
+        {ordered - receivedN > 0 && <Tag tone="warn">{qty(ordered - receivedN)} units short</Tag>}
+        {pendingN > 0 && <Tag>{pendingN} SKUs unconfirmed</Tag>}
+        {shortN   > 0 && <Tag tone="warn">{shortN} short</Tag>}
+        {noneN    > 0 && <Tag tone="bad">{noneN} never arrived</Tag>}
+        <label style={{ marginLeft: "auto", fontSize: 11, color: "var(--dim)", display: "flex", gap: 5, alignItems: "center" }}>
+          <input type="checkbox" checked={onlyPending} onChange={(e) => setOnlyPending(e.target.checked)} />
+          Unconfirmed only
+        </label>
+      </div>
+
+      {/* one bar that acts on every SKU on screen */}
+      {canEdit && (
+        <div className="card" style={{ marginBottom: 12, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ fontSize: 11, color: "var(--dim)" }}>All {allRows.length} SKUs:</span>
+          <button className="btn" style={{ fontSize: 11, padding: "3px 8px" }}
+            onClick={() => markMany(allRows, "full")}>Everything received in full</button>
+          <button className="btn" style={{ fontSize: 11, padding: "3px 8px", color: "var(--bad)" }}
+            onClick={() => markMany(allRows, "none")}>Nothing received</button>
+          <button className="btn" style={{ fontSize: 11, padding: "3px 8px" }}
+            onClick={() => markMany(allRows, "clear")}>Clear</button>
+          <span style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+            {touched > 0 && <Tag tone="warn">{touched} unsaved</Tag>}
+            <button className="btn" data-primary="1" disabled={!touched} onClick={saveAll}>
+              Save {touched || ""} change{touched === 1 ? "" : "s"}
+            </button>
+          </span>
+        </div>
+      )}
+
+      {queue.map((m) => {
+        const rows  = allSkus(m).filter((r) => !onlyPending || valueOf(r).state == null);
+        if (!rows.length) return null;
+        const block = gateBlock(m);
+        const next  = PIPELINE[m.index + 1];
+        const canGo = next && moveStatus(m, role, next.key).ok;
+        const mOrdered  = allSkus(m).reduce((s, r) => s + (r.units || 0), 0);
+        const mReceived = allSkus(m).reduce((s, r) => s + (valueOf(r).received || 0), 0);
+
+        return (
+          <div className="card" key={m.id} style={{ marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+              <strong style={{ cursor: "pointer" }} onClick={() => onOpen(m.id)}>{m.brand} {m.name}</strong>
+              <Tag>{STAGES[m.index].label}</Tag>
+              {m.po && <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--dim)" }}>{m.po}</span>}
+              <span style={{ fontSize: 11, color: "var(--dim)", fontFamily: "var(--mono)" }}>
+                {qty(mReceived)} / {qty(mOrdered)}
+              </span>
+              {canEdit && (<>
+                <button className="btn" style={{ fontSize: 11, padding: "3px 8px" }}
+                  onClick={() => markMany(allSkus(m), "full")}>All received</button>
+                <button className="btn" style={{ fontSize: 11, padding: "3px 8px", color: "var(--bad)" }}
+                  onClick={() => markMany(allSkus(m), "none")}>None received</button>
+              </>)}
+              <span style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+                {block
+                  ? <Tag tone="warn">{block}</Tag>
+                  : canGo
+                    ? <button className="btn" data-primary="1" style={{ fontSize: 11, padding: "3px 8px" }}
+                        onClick={() => onMove(m.id, next.key)}>Move to {next.label} →</button>
+                    : next && <Tag>{moveStatus(m, role, next.key).reason}</Tag>}
+              </span>
+            </div>
+
+            <div style={{ overflowX: "auto" }}>
+              <table>
+                <thead><tr>
+                  <th>SKU</th><th>Material</th><th>Ordered</th>
+                  <th style={{ minWidth: 100 }}>Received</th><th>Short by</th><th>Status</th><th></th>
+                </tr></thead>
+                <tbody>
+                  {rows.map((r) => {
+                    const v   = valueOf(r);
+                    const gap = v.state == null ? null : Math.max(0, (r.units || 0) - (v.received || 0));
+                    const dirty = r.rid in draft;
+                    return (
+                      <tr key={r.rid} style={{ cursor: "default", background: dirty ? "var(--line)" : undefined }}>
+                        <td className="n" style={{ fontWeight: 550, fontSize: 12 }}>{r.sku || "—"}</td>
+                        <td style={{ color: "var(--dim)", fontSize: 12 }}>{r.material || "—"}</td>
+                        <td className="n">{qty(r.units || 0)}</td>
+                        <td style={{ padding: "6px 8px" }}>
+                          <input type="number" min="0" value={v.received ?? ""} placeholder="qty"
+                            style={{ fontFamily: "var(--mono)", fontSize: 12, width: 90 }}
+                            readOnly={!canEdit}
+                            onChange={(e) => setQty(r, e.target.value)} />
+                        </td>
+                        <td className="n" style={{ color: gap > 0 ? "var(--bad)" : "var(--dim)" }}>
+                          {gap == null ? "—" : gap > 0 ? qty(gap) : "0"}
+                        </td>
+                        <td>
+                          <Tag tone={v.state === "full" ? "ok" : v.state === "short" ? "warn" : v.state === "none" ? "bad" : undefined}>
+                            {receiptLabel({ receiptState: v.state })}
+                          </Tag>
+                        </td>
+                        <td style={{ whiteSpace: "nowrap", padding: "6px 4px" }}>
+                          {canEdit && (<>
+                            <button className="btn" title="Received in full"
+                              style={{ padding: "3px 6px", fontSize: 11 }}
+                              onClick={() => markMany([r], "full")}><CheckCircle2 size={11} /></button>
+                            <button className="btn" title="Nothing arrived"
+                              style={{ padding: "3px 6px", fontSize: 11, marginLeft: 4, color: "var(--bad)" }}
+                              onClick={() => markMany([r], "none")}><X size={11} /></button>
+                          </>)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })}
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button className="btn" onClick={() => exportInward("csv")}>↓ CSV</button>
+        <button className="btn" onClick={() => exportInward("excel")}>↓ Excel</button>
+      </div>
+    </div>
+  );
+}
+
+
+/* ── CATALOG: STP REQUIREMENT, MODEL × MATERIAL ──────────────────
+   Whether the factory owes us an STP file at all. Marked per model
+   and per material — one cell covers every SKU of that material in
+   that model, which is why two SKUs sharing a material move together.
+
+   Click a cell to cycle: not decided → required → not required.     */
+
+const STP_CYCLE  = { und: true, req: false, no: null };
+/* how a cell reads on screen, and in the report that leaves the building */
+const CELL_TEXT   = { req: "Required", no: "Not required", und: "— decide —", mixed: "Mixed", na: "" };
+const CELL_REPORT = { req: "Required", no: "Not required", und: "Not decided", mixed: "Mixed", na: "—" };
+
+function STPRequirement({ models, onSetRequired, canEdit, onEmail, emailState }) {
+  const queue = models
+    .filter((m) => ["ordered", "production"].includes(m.stage) && allSkus(m).length)
+    .sort(byUrgency);
+
+  /* every SKU of one material inside one model — the unit a cell acts on */
+  const cellSkus  = (m, mat) => allSkus(m).filter((r) => (r.material || "") === mat);
+  const cellState = (list) => {
+    if (!list.length) return "na";
+    const vals = new Set(list.map((r) => r.stpRequired === true ? "req" : r.stpRequired === false ? "no" : "und"));
+    return vals.size > 1 ? "mixed" : [...vals][0];
+  };
+
+  const setCell = (m, mat, value) => {
+    const list = cellSkus(m, mat);
+    if (!list.length) return;
+    onSetRequired(m.id, Object.fromEntries(list.map((r) => [r.rid, value])));
+  };
+  const cycleCell = (m, mat) => {
+    const st = cellState(cellSkus(m, mat));
+    setCell(m, mat, st === "mixed" ? true : STP_CYCLE[st]);
+  };
+  const setModel = (m, value) =>
+    onSetRequired(m.id, Object.fromEntries(allSkus(m).map((r) => [r.rid, value])));
+  const setMaterial = (mat, value) =>
+    queue.forEach((m) => setCell(m, mat, value));
+
+  const allRows   = queue.flatMap(allSkus);
+  const undecided = allRows.filter(stpUndecided).length;
+  const required  = allRows.filter(stpNeeded).length;
+
+  /* model-wise then material-wise — the shape MD and the factory asked for */
+  const reportRows = () => queue.flatMap((m) =>
+    MATERIAL_NAMES.filter((mat) => cellSkus(m, mat).length).map((mat) => {
+      const list = cellSkus(m, mat);
+      return [m.brand, m.name, STAGES[m.index].label, m.po || "", mat,
+        list.map((r) => r.sku).filter(Boolean).join(" / "),
+        list.reduce((s, r) => s + (r.units || 0), 0),
+        CELL_REPORT[cellState(list)]];
+    }));
+  const REPORT_HEADERS = ["Brand", "Model", "Stage", "PO", "Material", "SKUs", "Units", "STP File"];
+
+  const exportReq = (fmt) =>
+    downloadReport("STP_requirement_model_material", REPORT_HEADERS, reportRows(), fmt);
+
+  const cellStyle = (st) => ({
+    cursor: canEdit && st !== "na" ? "pointer" : "default",
+    textAlign: "center", padding: "6px 8px", fontSize: 11, userSelect: "none",
+    color: st === "req" ? "var(--ok)" : st === "no" ? "var(--dim)" : st === "mixed" ? "var(--warn)" : "var(--warn)",
+  });
+
+  if (!queue.length) return (
+    <div>
+      <h2>STP requirement</h2>
+      <div className="card" style={{ fontSize: 13, color: "var(--dim)" }}>
+        Nothing to decide. Phones appear here at Ordered and stay through Production.
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      <h2>STP requirement — model × material</h2>
+
+      {!canEdit && <RoleLocked what="decide whether an STP file is needed" who="Catalog" />}
+
+      <div className="card" style={{ marginBottom: 12, fontSize: 12, color: "var(--dim)", lineHeight: 1.5 }}>
+        One cell covers every SKU of that material in that model. Only <strong>Required</strong>
+        {" "}holds a phone up at Production — an undecided SKU passes through.
+        <span style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+          {required  > 0 && <Tag tone="ok">{required} SKUs require a file</Tag>}
+          {undecided > 0 && <Tag tone="warn">{undecided} SKUs not decided</Tag>}
+        </span>
+      </div>
+
+      <div className="card" style={{ marginBottom: 12, overflowX: "auto" }}>
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th><th>PO</th>
+              {MATERIAL_NAMES.map((mat) => <th key={mat} style={{ textAlign: "center" }}>{mat}</th>)}
+              {canEdit && <th style={{ textAlign: "center" }}>Whole model</th>}
+            </tr>
+            {canEdit && (
+              <tr>
+                <th colSpan={2} style={{ fontWeight: 400, fontSize: 10, color: "var(--dim)" }}>set column →</th>
+                {MATERIAL_NAMES.map((mat) => (
+                  <th key={mat} style={{ textAlign: "center", fontWeight: 400 }}>
+                    <button className="btn" style={{ fontSize: 10, padding: "2px 5px" }}
+                      title={`Every model needs an STP file for ${mat}`}
+                      onClick={() => setMaterial(mat, true)}>Req</button>
+                    <button className="btn" style={{ fontSize: 10, padding: "2px 5px", marginLeft: 3 }}
+                      title={`No model needs an STP file for ${mat}`}
+                      onClick={() => setMaterial(mat, false)}>No</button>
+                  </th>
+                ))}
+                <th />
+              </tr>
+            )}
+          </thead>
+          <tbody>
+            {queue.map((m) => (
+              <tr key={m.id} style={{ cursor: "default" }}>
+                <td style={{ fontWeight: 550, fontSize: 12 }}>{m.brand} {m.name}</td>
+                <td style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--dim)" }}>{m.po || "—"}</td>
+                {MATERIAL_NAMES.map((mat) => {
+                  const st = cellState(cellSkus(m, mat));
+                  return (
+                    <td key={mat} style={cellStyle(st)}
+                      title={st === "na" ? "No SKU of this material" : canEdit ? "Click to cycle" : ""}
+                      onClick={() => canEdit && st !== "na" && cycleCell(m, mat)}>
+                      {CELL_TEXT[st]}
+                    </td>
+                  );
+                })}
+                {canEdit && (
+                  <td style={{ textAlign: "center", whiteSpace: "nowrap" }}>
+                    <button className="btn" style={{ fontSize: 10, padding: "2px 5px" }}
+                      onClick={() => setModel(m, true)}>Req</button>
+                    <button className="btn" style={{ fontSize: 10, padding: "2px 5px", marginLeft: 3 }}
+                      onClick={() => setModel(m, false)}>No</button>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <button className="btn" onClick={() => exportReq("csv")}>↓ CSV</button>
+        <button className="btn" onClick={() => exportReq("excel")}>↓ Excel</button>
+        <button className="btn" data-primary="1" disabled={emailState === "sending"}
+          onClick={() => onEmail(REPORT_HEADERS, reportRows())}>
+          {emailState === "sending" ? "Sending…" : "✉ Email MD / Factory"}
+        </button>
+        {undecided > 0 && <Tag tone="warn">{undecided} SKUs still undecided</Tag>}
+      </div>
+    </div>
+  );
+}
+
+
+/* Two halves of the same Catalog job, behind one nav entry: book the
+   stock in, and decide what the factory owes us a file for. */
+function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
+                         canReceive, canSetStp, role, onNotify }) {
+  const [tab, setTab] = useState("inward");
+  const [emailState, setEmailState] = useState("idle");
+  const [mailText, setMailText] = useState(() => mailGetRecipients().join(", "));
+  const [mailOpen, setMailOpen] = useState(false);
+
+  const saveRecipients = () => {
+    const { list, bad } = parseRecipients(mailText);
+    if (bad.length) { onNotify(`⚠ Not an email address: ${bad[0]}`); return; }
+    mailSaveRecipients(list);
+    onNotify(list.length ? `Report goes to ${list.length} recipient${list.length === 1 ? "" : "s"}` : "Recipients cleared");
+    setMailOpen(false);
+  };
+
+  const sendEmail = async (headers, rows) => {
+    if (!rows.length) { onNotify("⚠ Nothing to send"); return; }
+    setEmailState("sending");
+    const result = await dbSendReport({
+      subject: `STP file requirement — ${rows.length} model/material rows`,
+      intro: "Model-wise and material-wise STP file requirement, as marked by the catalog team.",
+      headers, rows,
+    });
+    setEmailState("idle");
+    onNotify(result.error ? `⚠ ${result.error}` : `Report emailed to ${result.sent} recipient${result.sent === 1 ? "" : "s"}`);
+  };
+
+  const TABS = [["inward", "Inward stock"], ["stp", "STP requirement"]];
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
+        {TABS.map(([key, label]) => (
+          <button key={key} className="btn" data-on={tab === key ? "1" : "0"} onClick={() => setTab(key)}>
+            {label}
+          </button>
+        ))}
+        {tab === "stp" && (
+          <button className="btn" style={{ marginLeft: "auto", fontSize: 11 }}
+            onClick={() => setMailOpen((o) => !o)}>
+            ✉ Recipients ({mailGetRecipients().length})
+          </button>
+        )}
+      </div>
+
+      {tab === "stp" && mailOpen && (
+        <div className="card" style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 8, lineHeight: 1.5 }}>
+            Who receives the STP requirement report — MD, the factory team, anyone else.
+            Comma separated. Stored in this browser, not in the database.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input value={mailText} onChange={(e) => setMailText(e.target.value)}
+              placeholder="md@example.com, factory@example.com"
+              style={{ flex: 1, minWidth: 240, fontSize: 12 }} />
+            <button className="btn" data-primary="1" onClick={saveRecipients}>Save</button>
+          </div>
+        </div>
+      )}
+
+      {tab === "inward"
+        ? <InwardStock models={models} onSaveReceipt={onSaveReceipt} onOpen={onOpen}
+            onMove={onMove} canEdit={canReceive} role={role} />
+        : <STPRequirement models={models} onSetRequired={onSetRequired}
+            canEdit={canSetStp} onEmail={sendEmail} emailState={emailState} />}
+    </div>
+  );
+}
+
+
 function BulkReceive({ models, onReceive, canReceive }) {
   const [openPO, setOpenPO] = useState(null);
   const [marks, setMarks]   = useState({});   // { modelId: "got" | "missing" }
@@ -4107,8 +4630,27 @@ function buildReportRows(reportKey, models) {
       rows: models.filter((m) => m.stage === "production").flatMap((m) =>
         allSkus(m).map((r) => [m.brand, m.name, m.segment, m.launch, m.po || "",
           r.sku || "MISSING", r.material || "MISSING", r.units,
-          (!r.material || !r.sku) ? "YES — fix data" : "YES", r.stpStatus || "Not Sent"])),
+          stpLabel(r), r.stpStatus || "Not Sent"])),
     };
+    /* Model-wise then material-wise — the shape MD and the factory asked for.
+       One row per material per model, collapsing the SKUs that share it. */
+    case "stp-requirement": {
+      const inPlay = models.filter((m) => ["ordered", "production"].includes(m.stage));
+      return {
+        headers: ["Brand", "Model", "Stage", "PO Number", "Material", "SKUs", "Units", "STP File"],
+        rows: inPlay.flatMap((m) => {
+          const byMaterial = {};
+          allSkus(m).forEach((r) => { (byMaterial[r.material || "—"] ||= []).push(r); });
+          return Object.entries(byMaterial).map(([mat, list]) => {
+            const decided = new Set(list.map((r) => stpLabel(r)));
+            return [m.brand, m.name, STAGES[m.index].label, m.po || "", mat,
+              list.map((r) => r.sku).filter(Boolean).join(" / "),
+              list.reduce((s, r) => s + (r.units || 0), 0),
+              decided.size > 1 ? "Mixed" : [...decided][0]];
+          });
+        }),
+      };
+    }
     case "received": return {
       headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "SKU", "Material", "Planned Qty", "Received Qty", "Short By", "Status"],
       rows: models.filter((m) => m.stage === "received").flatMap((m) =>
@@ -4150,6 +4692,7 @@ const REPORT_DEFS = [
   { key: "planned",    label: "Planned" },
   { key: "ordered",    label: "Ordered" },
   { key: "production", label: "Production / STP" },
+  { key: "stp-requirement", label: "STP Requirement" },
   { key: "received",   label: "Received" },
   { key: "listing",    label: "Listing" },
   { key: "late",       label: "Late Models" },
@@ -4709,6 +5252,12 @@ export default function App() {
   /* how many SKUs the catalog team still owes — drives the nav badge */
   const pendingListings = useMemo(() => listingQueue(liveModels).length, [liveModels]);
 
+  /* SKUs with stock out with a supplier that nobody has booked in yet —
+     drives the Inward badge the same way pendingListings drives Listing. */
+  const pendingInward = useMemo(() => liveModels
+    .filter((m) => INWARD_STAGES.includes(m.stage))
+    .flatMap(allSkus).filter((r) => !isConfirmed(r)).length, [liveModels]);
+
   /* Dashboard click-through: jump to a view with filters pre-applied */
   const navigate = (nextView, filterPatch) => {
     setFilters({ ...EMPTY_FILTERS, ...(filterPatch || {}) });
@@ -4814,6 +5363,23 @@ export default function App() {
     saved("STP status saved");
   };
 
+  /* Catalog's call on whether a file is owed at all. requiredByRid maps a SKU
+     rid to true/false — a rid left out keeps whatever it had, so a model-wide
+     or material-wide bulk mark can send only the cells it actually changed. */
+  const setStpRequired = (id, requiredByRid) => {
+    if (!CAN.setStpRequired(role)) { say(`⚠ ${roleLabel(role)} can't set STP requirement`); return; }
+    const marked = Object.keys(requiredByRid).length;
+    setPhones((list) => {
+      const next = list.map((p) => p.id !== id ? p : withAudit({
+        ...p, skus: p.skus.map((r) => r.rid in requiredByRid
+          ? { ...r, stpRequired: requiredByRid[r.rid] } : r),
+      }, session, `STP requirement set on ${marked} SKU${marked === 1 ? "" : "s"}`));
+      const u = next.find((p) => p.id === id); if (u) persist(u);
+      return next;
+    });
+    saved(`STP requirement saved on ${marked} SKU${marked === 1 ? "" : "s"}`);
+  };
+
   /* listingsByRid = { rid: { Flipkart: "Live", ... } } */
   const saveListings = (id, listingsByRid) => {
     setPhones((list) => {
@@ -4885,6 +5451,7 @@ export default function App() {
 
   /* save goods receipt rows from ReceivedChecker */
   const saveReceipt = (id, receiptRows) => {
+    if (!CAN.saveReceipt(role)) { say(`⚠ ${roleLabel(role)} can't record a goods receipt`); return; }
     setPhones((list) => {
       const next = list.map((p) => {
         if (p.id !== id) return p;
@@ -5053,6 +5620,15 @@ export default function App() {
             <button className="btn" data-on={view === "orders" ? "1" : "0"} onClick={() => setView("orders")}>
               <Package size={14} />Orders
             </button>
+            <button className="btn" data-on={view === "inward" ? "1" : "0"} onClick={() => setView("inward")}>
+              <Package size={14} />Inward
+              {pendingInward > 0 && (
+                <span style={{ marginLeft: 5, background: "var(--warn)", color: "#000",
+                  borderRadius: 9, padding: "0 6px", fontSize: 10, fontWeight: 700 }}>
+                  {pendingInward}
+                </span>
+              )}
+            </button>
             <button className="btn" data-on={view === "listing" ? "1" : "0"} onClick={() => setView("listing")}>
               <CheckCircle2 size={14} />Listing
               {pendingListings > 0 && (
@@ -5193,6 +5769,10 @@ export default function App() {
               canReceive={CAN.saveReceipt(role)} />
           </div>
         )}
+        {view === "inward"    && <CatalogInward models={liveModels} onSaveReceipt={saveReceipt}
+                                  onSetRequired={setStpRequired} onOpen={setOpenId} onMove={move}
+                                  canReceive={CAN.saveReceipt(role)} canSetStp={CAN.setStpRequired(role)}
+                                  role={role} onNotify={say} />}
         {view === "listing"   && <CatalogQueue models={liveModels} onSetListing={saveListings}
                                   onOpen={setOpenId} canEdit={CAN.saveListing(role)} />}
         {view === "calendar"  && <Calendar models={liveModels} onOpen={setOpenId} role={role} />}
