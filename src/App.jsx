@@ -3804,7 +3804,7 @@ function CatalogQueue({ models, onSetListing, onOpen, canEdit }) {
    again in the PO builder for the next order.
    ─────────────────────────────────────────────────────────────── */
 
-/* ── CATALOG: INWARD STOCK ───────────────────────────────────────
+/* ── CATALOG: PO NUMBER TO BATCH NUMBER ──────────────────────────
    Every SKU with stock out with a supplier or just arrived, on one
    screen, so Catalog can book it all in without opening each phone.
 
@@ -3873,12 +3873,12 @@ function InwardStock({ models, onSaveReceipt, onOpen, onMove, canEdit, role }) {
         r.units || 0, v.received ?? "", v.state == null ? "" : Math.max(0, (r.units || 0) - (v.received || 0)),
         receiptLabel({ receiptState: v.state })];
     }));
-    downloadReport("Inward_stock", headers, rows, fmt);
+    downloadReport("PO_Number_To_Batch_Number", headers, rows, fmt);
   };
 
   if (!queue.length) return (
     <div>
-      <h2>Inward stock</h2>
+      <h2>PO Number To Batch Number</h2>
       <div className="card" style={{ fontSize: 13, color: "var(--dim)" }}>
         Nothing to book in. Phones appear here once they reach Ordered, and stay
         until every SKU has been confirmed at Received.
@@ -3888,7 +3888,7 @@ function InwardStock({ models, onSaveReceipt, onOpen, onMove, canEdit, role }) {
 
   return (
     <div>
-      <h2>Inward stock — {queue.length} model{queue.length === 1 ? "" : "s"}</h2>
+      <h2>PO Number To Batch Number — {queue.length} model{queue.length === 1 ? "" : "s"}</h2>
 
       {!canEdit && <RoleLocked what="book stock in" who="Catalog" />}
 
@@ -4202,7 +4202,7 @@ function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
     onNotify(result.error ? `⚠ ${result.error}` : `Report emailed to ${result.sent} recipient${result.sent === 1 ? "" : "s"}`);
   };
 
-  const TABS = [["inward", "Inward stock"], ["stp", "STP requirement"]];
+  const TABS = [["inward", "PO Number To Batch Number"], ["stp", "STP requirement"]];
 
   return (
     <div>
@@ -5253,7 +5253,7 @@ export default function App() {
   const pendingListings = useMemo(() => listingQueue(liveModels).length, [liveModels]);
 
   /* SKUs with stock out with a supplier that nobody has booked in yet —
-     drives the Inward badge the same way pendingListings drives Listing. */
+     drives the PO Number To Batch Number badge the same way pendingListings drives Listing. */
   const pendingInward = useMemo(() => liveModels
     .filter((m) => INWARD_STAGES.includes(m.stage))
     .flatMap(allSkus).filter((r) => !isConfirmed(r)).length, [liveModels]);
@@ -5621,7 +5621,7 @@ export default function App() {
               <Package size={14} />Orders
             </button>
             <button className="btn" data-on={view === "inward" ? "1" : "0"} onClick={() => setView("inward")}>
-              <Package size={14} />Inward
+              <Package size={14} />PO Number To Batch Number
               {pendingInward > 0 && (
                 <span style={{ marginLeft: 5, background: "var(--warn)", color: "#000",
                   borderRadius: 9, padding: "0 6px", fontSize: 10, fontWeight: 700 }}>
