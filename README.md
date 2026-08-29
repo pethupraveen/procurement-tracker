@@ -67,7 +67,7 @@ It keeps the research record but removes the model from deadline tracking.
 
 ~~~mermaid
 flowchart LR
-    Procurement[Procurement] -->|Research, SKUs, PO| Ordered[Ordered]
+    Procurement[Procurement] -->|Research, SKUs, PO,<br/>move to production| Production[Production]
     Warehouse[Warehouse] -->|Move to production<br/>and update STP status| Production[Production]
     Catalog[Catalog] -->|Decide STP requirement,<br/>receive stock, list SKUs| Live[Live]
     Sales[Sales] -->|Record sales| Metrics[Sales and stock metrics]
@@ -77,7 +77,7 @@ flowchart LR
 | Role | Main responsibilities |
 | --- | --- |
 | Admin | Full workflow access, user management, and reset/configuration actions |
-| Procurement | Create models, research, maintain SKUs, assign POs, and move work through planned and ordered stages |
+| Procurement | Create models, research, maintain SKUs, assign POs, and move work through planned, ordered, and production stages |
 | Warehouse | Move models into production and update supplier STP-file status |
 | Catalog | Create models, decide whether an STP file is required, receive stock, maintain listings, and move work from production to received to live |
 | Sales | Record sales and review stock/sales information |

@@ -435,9 +435,11 @@ const ROLES = [
    never a forward target, it only matters when moving back.          */
 const ROLE_CAN_ADVANCE_TO = {
   admin:       ["research","planned","ordered","production","received","live","unprocured"],
-  procurement: ["research","planned","ordered","unprocured"],
-  /* Warehouse keeps the factory end — putting a phone into Production and
-     chasing STP files with the supplier. Inwarding moved to Catalog. */
+  /* Procurement can hand the purchase order to the factory by moving a model
+     into Production. Warehouse owns the supplier-facing STP follow-up. */
+  procurement: ["research","planned","ordered","production","unprocured"],
+  /* Warehouse also keeps the factory hand-off and chases STP files with the
+     supplier. Inwarding moved to Catalog. */
   warehouse:   ["production"],
   /* Catalog now owns everything from the loading bay onward: they book the
      stock in, so they make the move to Received, and they finish the listings,
