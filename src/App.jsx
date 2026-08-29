@@ -568,8 +568,8 @@ function moveStatus(model, role, stageKey) {
        Research → Un-Procurement   decided this phone is not worth buying
        Un-Procurement → Research   changed our mind, look at it again    */
   if (isTerminal(stageKey)) {
-    if (["received", "live"].includes(model.stage))
-      return { ok: false, reason: "Stock has already arrived — archive it instead" };
+    if (model.stage !== "research")
+      return { ok: false, reason: "Only Research models can move to Un-Procurement" };
     if (!canEnterStage(role, stageKey))
       return { ok: false, reason: `${roleLabel(role)} can't move to ${STAGES[target].label}` };
     return { ok: true, reason: null };
@@ -4252,8 +4252,7 @@ function BulkReceive({ models, onReceive, canReceive }) {
   const [marks, setMarks]   = useState({});   // { modelId: "got" | "missing" }
 
   /* Only models actually out with a supplier can be received */
-  const inFlight = models.filter((m) =>
-    m.po && ["ordered", "production"].includes(m.stage));
+  const inFlight = models.filter((m) => m.po && m.stage === "production");
 
   const groups = {};
   inFlight.forEach((m) => { (groups[m.po] ||= []).push(m); });
@@ -4269,10 +4268,10 @@ function BulkReceive({ models, onReceive, canReceive }) {
     const got     = list.filter((m) => marks[m.id] === "got").map((m) => m.id);
     const missing = list.filter((m) => marks[m.id] === "missing").map((m) => m.id);
     if (!got.length && !missing.length) return;
-    onReceive(got, missing);
+    const result = onReceive(got, missing) || { appliedIds: [] };
     setMarks((s) => {
       const next = { ...s };
-      [...got, ...missing].forEach((id) => delete next[id]);
+      result.appliedIds.forEach((id) => delete next[id]);
       return next;
     });
   };
@@ -4282,7 +4281,7 @@ function BulkReceive({ models, onReceive, canReceive }) {
       <h2>Receive against a PO</h2>
       <div className="card" style={{ fontSize: 13, color: "var(--dim)" }}>
         Nothing is out with a supplier right now. Models appear here once they have
-        a PO and are at Ordered or Production.
+        a PO, are in Production, and pass the required STP checks.
       </div>
     </div>
   );
@@ -5401,13 +5400,42 @@ export default function App() {
        missing → PO cleared and stage returns to Ordered so the model
                  reappears in the PO builder for the next order        */
   const bulkReceive = (gotIds, missingIds) => {
-    /* canReceive only hides the buttons — the permission has to hold here too.
-       Note this path deliberately skips gateBlock's STP check: an arrival at the
-       warehouse is a physical fact, not something to block on paperwork. */
+    /* canReceive only hides the buttons - the permission has to hold here too.
+       The Production gate below is mandatory before any receipt can move a
+       model to Received. */
     if (!CAN.saveReceipt(role)) { say(`⚠ ${roleLabel(role)} can't record a goods receipt`); return; }
+    const wantedGot = new Set(gotIds);
+    const wantedMissing = new Set(missingIds);
+    const received = [];
+    const returned = [];
+    const blocked = [];
+    const stale = [];
+
+    phones.forEach((p) => {
+      if (!wantedGot.has(p.id) && !wantedMissing.has(p.id)) return;
+      if (p.stage !== "production") { stale.push(p); return; }
+      if (wantedGot.has(p.id)) {
+        const block = gateBlock(p);
+        if (block) { blocked.push({ model: p, reason: block }); return; }
+        received.push(p.id);
+        return;
+      }
+      returned.push(p.id);
+    });
+
+    const appliedIds = [...received, ...returned];
+    if (!appliedIds.length) {
+      const skipped = [
+        ...blocked.map(({ model, reason }) => `${model.brand} ${model.name}: ${reason}`),
+        ...stale.map((p) => `${p.brand} ${p.name}: no longer in Production`),
+      ];
+      say(`Warning: ${skipped.join("; ") || "Selected models are no longer in Production"}`);
+      return { appliedIds: [] };
+    }
+
     setPhones((list) => {
       const next = list.map((p) => {
-        if (gotIds.includes(p.id)) {
+        if (received.includes(p.id)) {
           const done = { ...p.done };
           PIPELINE.slice(0, stageIndex("received") + 1).forEach((st) => { done[st.key] ||= iso(TODAY); });
           return withAudit({
@@ -5415,7 +5443,7 @@ export default function App() {
             skus: p.skus.map((r) => ({ ...r, receivedQty: r.units, receiptState: "full" })),
           }, session, `Received in full against ${p.po}`);
         }
-        if (missingIds.includes(p.id)) {
+        if (returned.includes(p.id)) {
           const done = { ...p.done };
           delete done.production; delete done.received;   // those stages didn't happen
           return withAudit({ ...p, stage: "ordered", po: null, done }, session,
@@ -5423,13 +5451,21 @@ export default function App() {
         }
         return p;
       });
-      next.filter((p) => [...gotIds, ...missingIds].includes(p.id)).forEach(persist);
+      next.filter((p) => appliedIds.includes(p.id)).forEach(persist);
       return next;
     });
     const bits = [];
-    if (gotIds.length)     bits.push(`${gotIds.length} received`);
-    if (missingIds.length) bits.push(`${missingIds.length} back to Ordered for a new PO`);
+    if (received.length) bits.push(`${received.length} received`);
+    if (returned.length) bits.push(`${returned.length} back to Ordered for a new PO`);
     saved(bits.join(" · "));
+    if (blocked.length || stale.length) {
+      const skipped = [
+        ...blocked.map(({ model, reason }) => `${model.brand} ${model.name}: ${reason}`),
+        ...stale.map((p) => `${p.brand} ${p.name}: no longer in Production`),
+      ];
+      say(`Warning: Skipped ${skipped.join("; ")}`);
+    }
+    return { appliedIds };
   };
 
   /* Assign one PO number to several models at once */
