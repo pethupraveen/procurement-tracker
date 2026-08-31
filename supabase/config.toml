@@ -1,0 +1,6 @@
+# CORS preflight requests do not carry a bearer token. Let this function's own
+# explicit Supabase Auth and profile-role checks handle every POST instead of
+# having the gateway reject OPTIONS before the handler can return its CORS
+# headers. This exception applies only to the report endpoint.
+[functions.send-stp-report]
+verify_jwt = false

@@ -61,6 +61,9 @@ create trigger phones_updated_at
 alter table users  enable row level security;
 alter table phones enable row level security;
 
+-- These anonymous policies are the pre-Auth arrangement. Run schema-auth.sql
+-- after this file: it drops them, adds the profiles table, and restricts the
+-- data to signed-in users. See AUTH-SETUP.md.
 create policy "anon full access users"  on users  for all using (true) with check (true);
 create policy "anon full access phones" on phones for all using (true) with check (true);
 
