@@ -120,7 +120,9 @@ sequenceDiagram
 
 Every save uses an <code>updated_at</code> version check before writing. This
 prevents one person's browser from silently overwriting a colleague's newer
-changes.
+changes. The app refreshes when it regains focus and every 90 seconds only when
+no detail editor or unresolved save conflict is open; manual refresh remains
+available when the user is ready to discard local drafts and reload.
 
 Progress, delays, stock, sales, and runway are calculated from the saved model
 data on every render rather than stored separately.

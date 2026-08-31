@@ -5103,6 +5103,7 @@ export default function App() {
   const [dbOnline, setDbOnline] = useState(false);
   const [dbError, setDbError]   = useState("");
   const [conflictedIds, setConflictedIds] = useState(() => new Set());
+  const conflictedIdsRef = useRef(conflictedIds);
   const [showDbSetup, setShowDbSetup] = useState(false);
   const writeState = useRef(new Map());
 
@@ -5118,6 +5119,7 @@ export default function App() {
   const [phones, setPhones] = useState(EMPTY);
   const [loading, setLoading] = useState(false);
   const [openId, setOpenId]   = useState(null);
+  const openIdRef = useRef(openId);
   const [adding, setAdding]   = useState(false);
   const [view, setView]       = useState("dashboard");
   const [theme, setTheme]     = useState("dark");
@@ -5127,11 +5129,23 @@ export default function App() {
   const [compact, setCompact] = useState(false);
   const [syncedAt, setSyncedAt] = useState(null);
 
+  openIdRef.current = openId;
+  conflictedIdsRef.current = conflictedIds;
+
   /* ── load data from Supabase on mount & after login ── */
-  const loadFromDB = async () => {
+  const loadFromDB = async ({ background = false } = {}) => {
     if (!dbGetConfig()) return;
+    const shouldKeepLocalEdits = () =>
+      background && (openIdRef.current || conflictedIdsRef.current.size);
+    /* A background reload replaces the entire phone list. Never replace an
+       active editor's model or a conflicted local edit behind the user's back.
+       The manual refresh button remains the explicit discard-and-reload path. */
+    if (shouldKeepLocalEdits()) return;
     setLoading(true);
     const [up, ph] = await Promise.all([dbLoadUsers(), dbLoadPhones()]);
+    /* The user may have opened an editor or hit a conflict while this request
+       was in flight. Do not apply an automatic response over that local state. */
+    if (shouldKeepLocalEdits()) { setLoading(false); return; }
     if (up.error || ph.error) {
       setDbOnline(false); setDbError(up.error || ph.error);
     } else {
@@ -5151,6 +5165,7 @@ export default function App() {
       }
       if (ph.data)         setPhones(ph.data);
       writeState.current.clear();
+      conflictedIdsRef.current = new Set();
       setConflictedIds(new Set());
     }
     setLoading(false);
@@ -5164,7 +5179,7 @@ export default function App() {
      while it is in view.                                                */
   useEffect(() => {
     if (!dbOnline) return;
-    const refresh = () => { if (!document.hidden) loadFromDB(); };
+    const refresh = () => { if (!document.hidden) loadFromDB({ background: true }); };
     const timer = setInterval(refresh, 90000);
     window.addEventListener("focus", refresh);
     return () => { clearInterval(timer); window.removeEventListener("focus", refresh); };
@@ -5207,6 +5222,7 @@ export default function App() {
         : await dbUpsertPhone(updatedPhone);
       if (result.conflict) {
         state.conflicted = true;
+        conflictedIdsRef.current = new Set(conflictedIdsRef.current).add(id);
         setConflictedIds((ids) => new Set(ids).add(id));
         say("Save conflict — someone else changed this model. Refresh before editing it again.");
         return { conflict: true };
@@ -5817,7 +5833,7 @@ export default function App() {
         {view === "reports"   && <Reports models={liveModels} />}
       </div>
 
-      {open   && <Detail model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onMove={move} onResearchSave={CAN.editResearch(role) ? saveResearch : null} onSKUSave={CAN.editSKUs(role) ? saveSKU : null} onSTPUpdate={CAN.updateSTP(role) ? updateSTP : null} onReceiptSave={CAN.saveReceipt(role) ? saveReceipt : null} onPOSave={CAN.savePO(role) ? savePO : null} onListingSave={CAN.saveListing(role) ? saveListings : null} onSalesLog={logSale} canLog={CAN.logSales(role)} role={role}
+      {open   && <Detail key={`${open.id}:${open.updatedAt || ""}`} model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onMove={move} onResearchSave={CAN.editResearch(role) ? saveResearch : null} onSKUSave={CAN.editSKUs(role) ? saveSKU : null} onSTPUpdate={CAN.updateSTP(role) ? updateSTP : null} onReceiptSave={CAN.saveReceipt(role) ? saveReceipt : null} onPOSave={CAN.savePO(role) ? savePO : null} onListingSave={CAN.saveListing(role) ? saveListings : null} onSalesLog={logSale} canLog={CAN.logSales(role)} role={role}
                       onAddNote={addNote} onDeleteNote={deleteNote}
                       onAddAttachment={addAttachment} onDeleteAttachment={deleteAttachment}
                       onArchive={CAN.archive(role) ? setArchived : null} />}
