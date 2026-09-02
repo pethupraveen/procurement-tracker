@@ -71,12 +71,12 @@ flowchart LR
     Warehouse[Warehouse] -->|Move to production<br/>and update STP status| Production[Production]
     Catalog[Catalog] -->|Decide STP requirement,<br/>receive stock, list SKUs| Live[Live]
     Sales[Sales] -->|Record sales| Metrics[Sales and stock metrics]
-    Admin[Admin] -->|Manage every stage,<br/>send the STP report| All[All workflow work]
+    Admin[Admin] -->|Manage every stage and users| All[All workflow work]
 ~~~
 
 | Role | Main responsibilities |
 | --- | --- |
-| Admin | Full workflow access, and reset/configuration actions. Accounts and roles are managed in the Supabase Dashboard, not in the app — see [AUTH-SETUP.md](AUTH-SETUP.md) |
+| Admin | Full workflow access, user management, and reset/configuration actions |
 | Procurement | Create models, research, maintain SKUs, assign POs, and move work through planned, ordered, and production stages |
 | Warehouse | Move models into production and update supplier STP-file status |
 | Catalog | Create models, decide whether an STP file is required, receive stock, maintain listings, and move work from production to received to live |
@@ -134,16 +134,14 @@ flowchart TB
     Browser[Browser]
     App[src/App.jsx<br/>UI, permissions, workflow gates,<br/>derived metrics, Supabase access]
     Entry[src/main.jsx<br/>Mounts the app]
-    Auth[(Supabase Auth<br/>email + password accounts)]
-    DB[(Supabase<br/>phones + profiles<br/>+ stage_summary)]
+    DB[(Supabase<br/>users + phones + stage_summary)]
     Schema[schema.sql<br/>Tables, view, trigger, seed users]
     Deploy[GitHub Actions]
     Pages[GitHub Pages]
 
     Browser --> App
     Entry --> App
-    App -->|Sign in, refresh token| Auth
-    App <-->|Access token on every call| DB
+    App <--> DB
     Schema --> DB
     Deploy --> Pages
 ~~~
@@ -153,10 +151,8 @@ flowchart TB
 | <code>src/App.jsx</code> | The application: UI, business rules, permissions, derived data, and database calls |
 | <code>src/main.jsx</code> | React entry point |
 | <code>schema.sql</code> | Full Supabase schema, view, trigger, and seed users |
-| <code>schema-auth.sql</code> | Auth migration: <code>profiles</code>, the approved-account allowlist, and authenticated-only access |
 | <code>schema-phase3.sql</code> | Additional database migration script |
 | <code>schema-compatibility.sql</code> | Compatibility migration script |
-| <code>AUTH-SETUP.md</code> | Dashboard steps for the Auth accounts and their initial passwords |
 | <code>.github/workflows/deploy.yml</code> | Builds and publishes the app when <code>main</code> is pushed |
 
 ## Run locally
@@ -185,53 +181,13 @@ VITE_SUPABASE_URL=https://<project>.supabase.co
 VITE_SUPABASE_ANON_KEY=<anon-or-publishable-key>
 ~~~
 
-Without these values, the app opens the **DB Setup** screen, where the same
-values can be entered and stored in that browser's local storage. That screen is
-not role-gated when it appears before sign-in — there is no session yet to check
-a role against, and neither value is a secret. Afterwards it is reachable only
-from the Admin's ⚙ button.
+Without these values, the app opens the Admin-only **DB Setup** screen. The
+same values can be entered there and stored in that browser's local storage.
 
 To create the database, run [schema.sql](schema.sql) in the Supabase SQL editor.
 
 > Warning: <code>schema.sql</code> drops its tables before recreating them. Do
 > not run it against a populated production database.
-
-For a populated project, do not run [schema-auth.sql](schema-auth.sql) until the
-Auth-capable browser build is live: it removes anonymous access, so the old
-name/PIN build will otherwise be blocked. [AUTH-SETUP.md](AUTH-SETUP.md) gives
-the required cutover order — configure Auth URLs, publish the Auth build, apply
-the migration, create and verify the approved accounts, then deploy and verify
-the secured report function.
-
-## Sign in
-
-~~~mermaid
-sequenceDiagram
-    participant User
-    participant App as Tracker
-    participant Auth as Supabase Auth
-    participant DB as profiles
-
-    User->>App: Email and password
-    App->>Auth: Sign in
-    Auth-->>App: Access token + refresh token
-    App->>DB: Read my profile
-    DB-->>App: Name, role, avatar
-    App-->>User: Tracker, with that role's permissions
-~~~
-
-Sign-in is a Supabase Auth email and password. The tokens are kept in this
-browser's local storage, so a reload keeps you signed in; the access token is
-refreshed before it expires and travels on every database and report call.
-
-The role comes from the caller's row in <code>profiles</code>, re-read on every
-refresh — an Auth account with no profile is not approved and cannot open the
-tracker, whatever its password is.
-
-There is no account creation, no self-service password reset, and no user
-management screen in the app. All three would need a service-role key, which a
-page served to the public cannot keep secret. The Admin does them in the Supabase
-Dashboard; [AUTH-SETUP.md](AUTH-SETUP.md) has the procedure.
 
 ## Deploy
 
@@ -257,24 +213,7 @@ app to work from the <code>/procurement-tracker/</code> project subpath.
 ## Security note
 
 The Supabase public key is included in the browser bundle, which is normal for
-a browser-only Supabase client.
-
-[schema-auth.sql](schema-auth.sql) removes anonymous access to the database, so
-the public key stops being a credential on its own: reads and writes require a
-signed-in Supabase Auth user, and roles come from the server-side
-<code>profiles</code> table rather than from browser-editable data.
-
-The app signs in against Supabase Auth and sends that session's access token on
-every database call, so the browser no longer decides for itself who is signed
-in or what role they hold.
-
-One limit remains: the per-stage rules are enforced only in the browser. Any
-signed-in user can write any phone row through a direct HTTP call — the database
-policies allow every authenticated caller to read and write <code>phones</code>.
-Server-side enforcement of individual workflow transitions is still outstanding.
-
-The report-email Edge Function verifies the caller's bearer token and looks up
-the caller's role in <code>profiles</code> with its server-only credential.
-Only an Admin can send mail; recipients and report contents are validated and
-the browser CORS origin is restricted. Configure its secrets and run the manual
-send checks in [AUTH-SETUP.md](AUTH-SETUP.md#6-deploy-the-secured-report-email-function).
+a browser-only Supabase client. The current schema grants broad anonymous access
+and the name/PIN login is only a simple client-side check, not real
+authentication. Use Supabase Auth and restrictive RLS policies before storing
+sensitive or production-critical data.
