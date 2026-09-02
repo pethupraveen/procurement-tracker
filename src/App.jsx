@@ -393,15 +393,33 @@ function problemsOf(model) {
 
 
 /* ── USERS, ROLES & PERMISSIONS ──────────────────────────────────
-   Who you are is a Supabase Auth account; what you may do is the
-   role on your row in the `profiles` table. Both live server-side:
-   the browser never holds a credential it could check itself, and
-   never holds a role it could edit.
+   Each user has a name, role, and a PIN (stored as a simple hash
+   so the plain text is never kept in state).
 
-   Accounts and roles are managed in the Supabase Dashboard —
-   see AUTH-SETUP.md. An Auth account with no profile row is not
-   approved and cannot open the tracker.
+   Default accounts — change PINs via the Admin panel:
+     admin       / 1234
+     procurement / 1111
+     warehouse   / 2222
+     catalog     / 3333
+     sales       / 4444
+
+   PINs are hashed with a tiny djb2 function — good enough to avoid
+   storing plain text; not a security guarantee for production use.
    ─────────────────────────────────────────────────────────────── */
+
+const hashPin = (pin) => {
+  let h = 5381;
+  for (let i = 0; i < pin.length; i++) h = (h * 33) ^ pin.charCodeAt(i);
+  return (h >>> 0).toString(36);
+};
+
+const DEFAULT_USERS = [
+  { id: "u1", name: "Arjun (Admin)",       role: "admin",       pin: hashPin("1234"), avatar: "A" },
+  { id: "u2", name: "Priya (Procurement)", role: "procurement", pin: hashPin("1111"), avatar: "P" },
+  { id: "u3", name: "Ravi (Warehouse)",    role: "warehouse",   pin: hashPin("2222"), avatar: "R" },
+  { id: "u4", name: "Sunita (Catalog)",    role: "catalog",     pin: hashPin("3333"), avatar: "S" },
+  { id: "u5", name: "Kiran (Sales)",       role: "sales",       pin: hashPin("4444"), avatar: "K" },
+];
 
 const ROLES = [
   { key: "admin",       label: "Admin",       color: "var(--bad)"    },
@@ -447,6 +465,7 @@ const CAN = {
   saveReceipt: (r) => ["admin","catalog"].includes(r),
   saveListing: (r) => ["admin","catalog"].includes(r),
   logSales:    (r) => ["admin","sales"].includes(r),
+  manageUsers: (r) => r === "admin",
   reset:       (r) => r === "admin",
 };
 
@@ -615,9 +634,8 @@ const EMPTY_FILTERS = { q: "", needsAction: false, lateOnly: false, soonOnly: fa
 
 /* ── DATABASE LAYER ──────────────────────────────────────────────
    Supabase REST API called directly — no npm package required.
-   URL and anon key say which project to talk to; they are stored in
-   localStorage and managed through the DB Setup screen. They are not
-   credentials — see the auth section below for those.             */
+   URL and anon key are stored in localStorage and managed through
+   the DB Setup screen (Admin only).                              */
 
 const DB_CONFIG_KEY = "proc_tracker_sb";
 
@@ -642,149 +660,29 @@ function dbSaveConfig(url, key) {
 }
 function dbClearConfig() { localStorage.removeItem(DB_CONFIG_KEY); }
 
-/* ── SUPABASE AUTH SESSION ───────────────────────────────────────
-   Sign-in is an email and password checked by Supabase Auth, which
-   hands back an access token (short-lived) and a refresh token. Both
-   are kept in localStorage so a page reload doesn't kick you back to
-   the login screen, and the access token is what travels on every
-   REST and Edge Function call — the public key is an identifier for
-   the project, not a credential.
+/* ── SESSION PERSISTENCE ─────────────────────────────────────────
+   The logged-in user is written to localStorage so a page refresh
+   doesn't kick you back to the login screen. Sessions expire after
+   12 hours so a shared machine doesn't stay signed in forever.   */
 
-   Accounts are created and passwords reset in the Supabase Dashboard.
-   There is deliberately no sign-up or reset here: either would need a
-   service-role key, which a page served to the public cannot keep
-   secret. See AUTH-SETUP.md.                                      */
+const SESSION_KEY  = "proc_tracker_session";
+const SESSION_HRS  = 12;
 
-const AUTH_KEY = "proc_tracker_auth";
-/* Refresh this far ahead of expiry, so a request never leaves holding
-   a token that dies while it is in flight. */
-const TOKEN_SKEW_MS = 60000;
-
-function authRead() {
+function loadSession() {
   try {
-    const raw = JSON.parse(localStorage.getItem(AUTH_KEY) || "null");
-    if (!raw?.accessToken || !raw?.refreshToken) return null;
-    return raw;
+    const raw = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+    if (!raw?.user || !raw?.at) return null;
+    const ageHrs = (Date.now() - raw.at) / 3600000;
+    if (ageHrs > SESSION_HRS) { localStorage.removeItem(SESSION_KEY); return null; }
+    return raw.user;
   } catch { return null; }
 }
-function authWrite(s) {
-  authSession = s;
-  try { localStorage.setItem(AUTH_KEY, JSON.stringify(s)); }
-  catch { /* private browsing — the session just won't survive a reload */ }
+function saveSession(user) {
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user, at: Date.now() })); }
+  catch { /* private browsing — session just won't persist */ }
 }
-function authForget() {
-  authSession = null;
-  try { localStorage.removeItem(AUTH_KEY); } catch {}
-}
-
-/* The live session. Module state rather than React state because the
-   database layer needs the token on every call, including calls made
-   from outside a component. */
-let authSession = authRead();
-/* One refresh at a time. Several requests can find the token stale at
-   the same moment, and a refresh token is single-use — a second,
-   concurrent exchange would fail and sign a working session out. */
-let authRefreshing = null;
-/* Set by App so a session the server has rejected takes the UI back to
-   the login screen, wherever in the app that is discovered. */
-let onAuthLost = () => {};
-function setAuthLostHandler(fn) { onAuthLost = fn || (() => {}); }
-
-const authFromToken = (j) => ({
-  accessToken:  j.access_token,
-  refreshToken: j.refresh_token,
-  /* expires_at is an absolute stamp in seconds; expires_in is a
-     duration. Prefer the stamp, compute one when it is missing. */
-  expiresAt: j.expires_at ? j.expires_at * 1000 : Date.now() + (j.expires_in || 3600) * 1000,
-  userId: j.user?.id || null,
-  email:  j.user?.email || "",
-});
-
-async function authPost(path, body) {
-  const cfg = dbGetConfig();
-  if (!cfg) return { error: "No database configured" };
-  try {
-    const r = await fetch(`${cfg.url}/auth/v1/${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", apikey: cfg.key },
-      body: JSON.stringify(body),
-    });
-    const text = await r.text();
-    let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
-    if (!r.ok) return {
-      status: r.status,
-      error: data?.error_description || data?.msg || data?.error || `HTTP ${r.status}`,
-    };
-    return { data };
-  } catch (e) { return { error: e.message }; }
-}
-
-async function authSignIn(email, password) {
-  const { data, error } = await authPost("token?grant_type=password",
-    { email: email.trim(), password });
-  if (error) return { error };
-  const s = authFromToken(data || {});
-  if (!s.accessToken || !s.refreshToken || !s.userId)
-    return { error: "Sign-in returned no session" };
-  authWrite(s);
-  return { session: s };
-}
-
-function authRefresh() {
-  if (authRefreshing) return authRefreshing;
-  const token = authSession?.refreshToken;
-  if (!token) return Promise.resolve({ error: "Not signed in" });
-  authRefreshing = authPost("token?grant_type=refresh_token", { refresh_token: token })
-    .then(({ data, error, status }) => {
-      if (error) {
-        /* A 4xx means the refresh token is spent, revoked, or its account
-           is gone — there is nothing to retry. A network failure is not
-           that: keep the session so the next call can try again. */
-        if (status >= 400 && status < 500) { authForget(); onAuthLost(); }
-        return { error };
-      }
-      const s = authFromToken(data || {});
-      if (!s.accessToken) return { error: "Refresh returned no token" };
-      authWrite(s);
-      return { session: s };
-    })
-    .finally(() => { authRefreshing = null; });
-  return authRefreshing;
-}
-
-/* The token to send, refreshed if it is stale. `force` re-exchanges even
-   a token that still looks current — for when the server disagrees. */
-async function authAccessToken({ force = false } = {}) {
-  if (!authSession) return null;
-  if (!force && Date.now() < authSession.expiresAt - TOKEN_SKEW_MS)
-    return authSession.accessToken;
-  const { session } = await authRefresh();
-  return session?.accessToken || null;
-}
-
-async function authSignOut() {
-  const cfg = dbGetConfig();
-  const token = authSession?.accessToken;
-  /* Drop the local session first: signing out must not depend on the
-     network being there. */
-  authForget();
-  if (!cfg || !token) return;
-  try {
-    await fetch(`${cfg.url}/auth/v1/logout`, {
-      method: "POST",
-      headers: { apikey: cfg.key, Authorization: `Bearer ${token}` },
-    });
-  } catch { /* the session is already gone from this browser */ }
-}
-
-/* Supabase phrases a bad password as a developer message. Say it the way
-   the person at the keyboard would. */
-function authMessage(error) {
-  if (/invalid login credentials/i.test(error)) return "Wrong email or password.";
-  if (/email not confirmed/i.test(error))
-    return "This account is not confirmed yet — the Admin confirms it in the Supabase Dashboard.";
-  return error;
+function clearSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch {}
 }
 
 function dbClient() {
@@ -792,36 +690,25 @@ function dbClient() {
   if (!cfg?.url || !cfg?.key) return null;
   const base = cfg.url + "/rest/v1";
 
-  /* Supabase REST rules:
-     - apikey names the project; Authorization carries the signed-in
-       user's access token, which is what the policies actually check
-     - POST to /<table>?on_conflict=<col> for an upsert
+  /* Supabase REST upsert rules:
+     - POST to /<table>?on_conflict=<col>
      - Prefer header must be EXACTLY "resolution=merge-duplicates"
-       (adding return=representation causes 409 on some Supabase versions) */
-  const send = (method, path, body, extra, token) => fetch(base + path, {
-    method,
-    headers: {
-      "Content-Type":  "application/json",
-      "apikey":        cfg.key,
-      "Authorization": "Bearer " + token,
-      ...(extra || {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
+       (adding return=representation causes 409 on some Supabase versions)
+     - apikey + Authorization both required               */
+  const hdrs = (extra) => ({
+    "Content-Type":  "application/json",
+    "apikey":        cfg.key,
+    "Authorization": "Bearer " + cfg.key,
+    ...(extra || {}),
   });
 
   const req = async (method, path, body, extra) => {
     try {
-      let token = await authAccessToken();
-      if (!token) return { data: null, error: "Not signed in" };
-      let r = await send(method, path, body, extra, token);
-      /* A token can be refused even when it looked current — a clock that
-         drifted, or a session revoked in the Dashboard. Exchange it once
-         and try again before calling the request failed. */
-      if (r.status === 401) {
-        token = await authAccessToken({ force: true });
-        if (!token) return { data: null, error: "Session expired — sign in again" };
-        r = await send(method, path, body, extra, token);
-      }
+      const r = await fetch(base + path, {
+        method,
+        headers: hdrs(extra),
+        body: body ? JSON.stringify(body) : undefined,
+      });
       const text = await r.text();
       const data = text ? JSON.parse(text) : null;
       if (!r.ok) return { data: null, error: data?.message || data?.hint || "HTTP " + r.status };
@@ -859,29 +746,13 @@ const rowToPhone = (r) => repairSkuRids({
   audit: r.audit || [], archived: !!r.archived,
 });
 
-/* Checks the project URL and public key, and nothing else. It has to work
-   before anyone has signed in, so it cannot touch a table — every table now
-   needs a session. Auth's own settings endpoint answers with the public key
-   alone, and rejects a key that does not belong to the project. */
-async function dbPing() {
-  const cfg = dbGetConfig(); if (!cfg) return { ok: false, error: "Not configured" };
-  try {
-    const r = await fetch(`${cfg.url}/auth/v1/settings`, { headers: { apikey: cfg.key } });
-    if (r.ok) return { ok: true, error: null };
-    if (r.status === 401 || r.status === 403)
-      return { ok: false, error: "The project refused this key — check the anon / public key" };
-    return { ok: false, error: `HTTP ${r.status} from ${cfg.url}` };
-  } catch (e) { return { ok: false, error: e.message }; }
-}
+/* user row <-> app shape (identical, just snake_case alias) */
+const userToRow = (u) => ({ id: u.id, name: u.name, role: u.role, pin: u.pin, avatar: u.avatar });
 
-/* The caller's own profile row. This is where the role comes from: an Auth
-   account with no profile is not approved for the tracker, and there is
-   nothing the browser can do about that. */
-async function dbLoadProfile(userId) {
-  const c = dbClient(); if (!c) return { data: null, error: "Not configured" };
-  const { data, error } = await c.get(`/profiles?select=id,name,role,avatar&id=eq.${userId}`);
-  if (error) return { data: null, error };
-  return { data: data?.[0] || null, error: null };
+async function dbPing() {
+  const c = dbClient(); if (!c) return { ok: false, error: "Not configured" };
+  const { error } = await c.get("/phones?limit=1");
+  return { ok: !error, error };
 }
 async function dbLoadPhones() {
   const c = dbClient(); if (!c) return { data: null, error: "Not configured" };
@@ -946,24 +817,18 @@ async function dbSendReport({ subject, intro, headers, rows }) {
   if (!cfg) return { error: "No database configured — the mail function lives in your Supabase project" };
   const to = mailGetRecipients();
   if (!to.length) return { error: "No recipients set — add MD / Factory addresses first" };
-  /* The function decides who may send a report by reading this token, so a
-     stale one is a refusal rather than a mail nobody asked for. */
-  const token = await authAccessToken();
-  if (!token) return { error: "Not signed in" };
   try {
     const res = await fetch(`${cfg.url}/functions/v1/send-stp-report`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         apikey: cfg.key,
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${cfg.key}`,
       },
       body: JSON.stringify({ to, subject, intro, headers, rows }),
     });
     if (res.status === 404)
       return { error: "Mail function not deployed yet — run: supabase functions deploy send-stp-report" };
-    if (res.status === 401) return { error: "Session expired — sign in again and resend" };
-    if (res.status === 403) return { error: "Only an Admin can send this report" };
     const body = await res.text();
     if (!res.ok) return { error: `Mail failed (${res.status}): ${body.slice(0, 200)}` };
     return { ok: true, sent: to.length };
@@ -979,6 +844,19 @@ async function dbDeletePhone(id) {
 async function dbDeleteAllPhones() {
   const c = dbClient(); if (!c) return { error: "Not configured" };
   return c.del("/phones?id=gt.0");
+}
+async function dbLoadUsers() {
+  const c = dbClient(); if (!c) return { data: null, error: "Not configured" };
+  const { data, error } = await c.get("/users?order=created_at");
+  return { data: error ? null : data, error };
+}
+async function dbUpsertUser(user) {
+  const c = dbClient(); if (!c) return { error: "Not configured" };
+  return c.upsert("/users?on_conflict=id", userToRow(user));
+}
+async function dbDeleteUser(id) {
+  const c = dbClient(); if (!c) return { error: "Not configured" };
+  return c.del("/users?id=eq." + id);
 }
 
 /* ── 6. STYLES ───────────────────────────────────────────────────
@@ -4154,7 +4032,7 @@ const STP_CYCLE  = { und: true, req: false, no: null };
 const CELL_TEXT   = { req: "Required", no: "Not required", und: "— decide —", mixed: "Mixed", na: "" };
 const CELL_REPORT = { req: "Required", no: "Not required", und: "Not decided", mixed: "Mixed", na: "—" };
 
-function STPRequirement({ models, onSetRequired, canEdit, canEmail, onEmail, emailState }) {
+function STPRequirement({ models, onSetRequired, canEdit, onEmail, emailState }) {
   const queue = models
     .filter((m) => ["ordered", "production"].includes(m.stage) && allSkus(m).length)
     .sort(byUrgency);
@@ -4286,14 +4164,10 @@ function STPRequirement({ models, onSetRequired, canEdit, canEmail, onEmail, ema
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
         <button className="btn" onClick={() => exportReq("csv")}>↓ CSV</button>
         <button className="btn" onClick={() => exportReq("excel")}>↓ Excel</button>
-        {canEmail ? (
-          <button className="btn" data-primary="1" disabled={emailState === "sending"}
-            onClick={() => onEmail(REPORT_HEADERS, reportRows())}>
-            {emailState === "sending" ? "Sending…" : "✉ Email MD / Factory"}
-          </button>
-        ) : (
-          <span style={{ fontSize: 12, color: "var(--dim)" }}>Only an Admin can email this report.</span>
-        )}
+        <button className="btn" data-primary="1" disabled={emailState === "sending"}
+          onClick={() => onEmail(REPORT_HEADERS, reportRows())}>
+          {emailState === "sending" ? "Sending…" : "✉ Email MD / Factory"}
+        </button>
         {undecided > 0 && <Tag tone="warn">{undecided} SKUs still undecided</Tag>}
       </div>
     </div>
@@ -4304,7 +4178,7 @@ function STPRequirement({ models, onSetRequired, canEdit, canEmail, onEmail, ema
 /* Two halves of the same Catalog job, behind one nav entry: book the
    stock in, and decide what the factory owes us a file for. */
 function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
-                         canReceive, canSetStp, canSendReport, role, onNotify }) {
+                         canReceive, canSetStp, role, onNotify }) {
   const [tab, setTab] = useState("inward");
   const [emailState, setEmailState] = useState("idle");
   const [mailText, setMailText] = useState(() => mailGetRecipients().join(", "));
@@ -4319,7 +4193,6 @@ function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
   };
 
   const sendEmail = async (headers, rows) => {
-    if (!canSendReport) { onNotify("⚠ Only an Admin can email this report"); return; }
     if (!rows.length) { onNotify("⚠ Nothing to send"); return; }
     setEmailState("sending");
     const result = await dbSendReport({
@@ -4341,7 +4214,7 @@ function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
             {label}
           </button>
         ))}
-        {tab === "stp" && canSendReport && (
+        {tab === "stp" && (
           <button className="btn" style={{ marginLeft: "auto", fontSize: 11 }}
             onClick={() => setMailOpen((o) => !o)}>
             ✉ Recipients ({mailGetRecipients().length})
@@ -4368,7 +4241,7 @@ function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
         ? <InwardStock models={models} onSaveReceipt={onSaveReceipt} onOpen={onOpen}
             onMove={onMove} canEdit={canReceive} role={role} />
         : <STPRequirement models={models} onSetRequired={onSetRequired}
-            canEdit={canSetStp} canEmail={canSendReport} onEmail={sendEmail} emailState={emailState} />}
+            canEdit={canSetStp} onEmail={sendEmail} emailState={emailState} />}
     </div>
   );
 }
@@ -4897,19 +4770,142 @@ function Reports({ models }) {
 
 
 
-/* ── DB SETUP SCREEN ─────────────────────────────────────────────
-   Shown when this browser has no saved Supabase configuration, and
-   from the ⚙ button afterwards (Admin only, since by then there is a
-   session to check a role against).
+/* ── USER MANAGER — Admin only ───────────────────────────────────
+   Create, rename, change role and reset PIN for any user.
+   Shown in a modal when Admin clicks "Manage Users".             */
 
-   The URL and public key are not secrets — they ship in the bundle of
-   any deployment that sets the build-time variables. They only say
-   which project to talk to; who you are is the Auth session.        */
+function UserManager({ users, onSave, onClose }) {
+  const [list, setList] = useState(users.map(u => ({ ...u })));
+  const [editing, setEditing] = useState(null);   // user id being edited
+  const [form, setForm]       = useState({});
+  const [newPin, setNewPin]   = useState("");
+  const [msg, setMsg]         = useState("");
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
-function DBSetupScreen({ onDone, onCancel }) {
-  const saved = dbGetConfig();
-  const [url, setUrl]     = useState(saved?.url || "");
-  const [key, setKey]     = useState(saved?.key || "");
+  const startEdit = (u) => { setEditing(u.id); setForm({ name: u.name.split(" (")[0], role: u.role }); setNewPin(""); setMsg(""); };
+  const cancelEdit = () => { setEditing(null); setNewPin(""); setMsg(""); };
+
+  const saveUser = (id) => {
+    if (!form.name?.trim()) return;
+    const name = form.name.trim();
+    setList(l => l.map(u => u.id !== id ? u : {
+      ...u,
+      name: name + " (" + ROLES.find(r => r.key === form.role)?.label + ")",
+      role: form.role,
+      /* the badge letter follows the name, or it keeps showing the old one */
+      avatar: name.charAt(0).toUpperCase() || u.avatar,
+      ...(newPin.length >= 4 ? { pin: hashPin(newPin) } : {}),
+    }));
+    setMsg("Saved"); setTimeout(() => setMsg(""), 1500);
+    setEditing(null); setNewPin("");
+  };
+
+  const addUser = () => {
+    const id = "u" + Date.now();
+    const u = { id, name: "New User (Procurement)", role: "procurement", pin: hashPin("0000"), avatar: "N" };
+    setList(l => [...l, u]);
+    startEdit(u);
+  };
+
+  const removeUser = (id) => {
+    if (list.length <= 1) return;
+    setList(l => l.filter(u => u.id !== id));
+    if (editing === id) cancelEdit();
+  };
+
+  return (
+    <>
+      <div className="shade" style={{ zIndex: 60 }} onClick={onClose} />
+      <div style={{ position: "fixed", zIndex: 61, top: "50%", left: "50%",
+        transform: "translate(-50%, -50%)", background: "var(--card)",
+        border: "1px solid var(--line)", borderRadius: 14, padding: 24,
+        width: "min(520px, 94vw)", maxHeight: "85vh", overflowY: "auto",
+        display: "flex", flexDirection: "column", gap: 16 }}>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ flex: 1, fontSize: 15, fontWeight: 650 }}>User accounts</div>
+          <button className="btn" style={{ padding: "4px 8px" }} onClick={addUser}>
+            <Plus size={13} />New user
+          </button>
+          <button className="btn btn-icon" onClick={onClose}><X size={14} /></button>
+        </div>
+
+        {list.map((u) => {
+          const r = ROLES.find(x => x.key === u.role);
+          const isEditing = editing === u.id;
+          return (
+            <div key={u.id} className="card" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {!isEditing ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{ width: 34, height: 34, borderRadius: "50%", background: r?.color || "var(--accent)",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    fontSize: 14, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
+                    {u.avatar}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>{u.name.split(" (")[0]}</div>
+                    <div style={{ fontSize: 11, color: "var(--dim)" }}>{r?.label}</div>
+                  </div>
+                  <button className="btn" style={{ fontSize: 11, padding: "4px 8px" }}
+                    onClick={() => startEdit(u)}>Edit</button>
+                  {list.length > 1 && (
+                    <button className="btn" style={{ fontSize: 11, padding: "4px 8px", color: "var(--bad)" }}
+                      onClick={() => removeUser(u.id)}>Remove</button>
+                  )}
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: "var(--accent)" }}>Editing account</div>
+                  <div className="two">
+                    <Field label="Display name">
+                      <input value={form.name || ""} placeholder="Name"
+                        onChange={(e) => set("name", e.target.value)} />
+                    </Field>
+                    <Field label="Role">
+                      <select value={form.role} onChange={(e) => set("role", e.target.value)}>
+                        {ROLES.map(r => <option key={r.key} value={r.key}>{r.label}</option>)}
+                      </select>
+                    </Field>
+                  </div>
+                  <Field label="New PIN (leave blank to keep current — min 4 digits)"
+                    hint={newPin.length >= 4 ? "✓ PIN will be updated" : ""}>
+                    <input type="password" value={newPin} placeholder="New PIN"
+                      maxLength={6} style={{ fontFamily: "var(--mono)", letterSpacing: 3 }}
+                      onChange={(e) => setNewPin(e.target.value.replace(/\D/g,""))} />
+                  </Field>
+                  <div style={{ fontSize: 11, color: "var(--dim)" }}>
+                    Avatar letter is the first letter of the name.
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn" data-primary="1" onClick={() => saveUser(u.id)}
+                      style={{ opacity: form.name?.trim() ? 1 : 0.4 }}>
+                      {msg || "Save"}
+                    </button>
+                    <button className="btn" onClick={cancelEdit}>Cancel</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        <button className="btn" data-primary="1" onClick={() => { onSave(list); onClose(); }}>
+          Save all and close
+        </button>
+      </div>
+    </>
+  );
+}
+
+
+
+/* ── DB SETUP SCREEN — Admin only ───────────────────────────────
+   Shown when the app is not yet connected to a Supabase project.
+   Admin pastes the URL and anon key from the Supabase dashboard. */
+
+function DBSetupScreen({ onDone, onSkip }) {
+  const [url, setUrl]     = useState(dbGetConfig()?.url || "");
+  const [key, setKey]     = useState(dbGetConfig()?.key || "");
   const [status, setStatus] = useState("idle");   // idle | testing | ok | error
   const [errMsg, setErrMsg] = useState("");
 
@@ -4919,19 +4915,10 @@ function DBSetupScreen({ onDone, onCancel }) {
     dbSaveConfig(url, key);
     const { ok, error } = await dbPing();
     if (ok) { setStatus("ok"); }
-    else {
-      setStatus("error");
-      setErrMsg(error || "Could not reach Supabase. Check URL and key.");
-      /* Put back whatever was working before rather than leaving the browser
-         pointed at a project it just failed to reach. */
-      if (saved) dbSaveConfig(saved.url, saved.key); else dbClearConfig();
-    }
+    else { setStatus("error"); setErrMsg(error || "Could not reach Supabase. Check URL and key."); dbClearConfig(); }
   };
 
-  const save = () => {
-    dbSaveConfig(url, key);
-    onDone(url.trim().replace(/\/$/, "") !== (saved?.url || ""));
-  };
+  const save = () => { dbSaveConfig(url, key); onDone(); };
 
   return (
     <div className="app" data-theme="dark" style={{ minHeight: "100vh", display: "flex",
@@ -4981,23 +4968,19 @@ function DBSetupScreen({ onDone, onCancel }) {
                 Save and continue →
               </button>
             )}
-            {onCancel && (
-              <button className="btn" onClick={onCancel}>Cancel</button>
-            )}
           </div>
         </div>
 
         <div className="card" style={{ fontSize: 12, color: "var(--dim)", lineHeight: 1.7 }}>
           <strong style={{ color: "var(--text)" }}>Setup steps:</strong><br />
           1. Create a free Supabase project at <strong>supabase.com</strong><br />
-          2. Run <strong>schema.sql</strong>, then <strong>schema-auth.sql</strong>, in the SQL Editor<br />
-          3. Create the sign-in accounts — see <strong>AUTH-SETUP.md</strong><br />
-          4. Go to <strong>Settings → API</strong> and copy the Project URL and anon key<br />
-          5. Paste both above and click Test connection<br />
+          2. Run <strong>schema.sql</strong> in the SQL Editor<br />
+          3. Go to <strong>Settings → API</strong> and copy the Project URL and anon key<br />
+          4. Paste both above and click Test connection<br />
           <br />
-          Without a connection there is nothing to sign in against: accounts,
-          roles and data all live in the project. This browser cannot work
-          offline.
+          <button className="btn" style={{ fontSize: 11 }} onClick={onSkip}>
+            Skip — use local memory only (data won't be saved)
+          </button>
         </div>
       </div>
     </div>
@@ -5006,30 +4989,26 @@ function DBSetupScreen({ onDone, onCancel }) {
 
 
 /* ── LOGIN SCREEN ────────────────────────────────────────────────
-   Email and password, checked by Supabase Auth.
+   Shown when no session is active. Pick a user, enter PIN.
+   Admin can also reach User Management from the nav bar.          */
 
-   No account list: naming everyone who can sign in, to anyone who
-   loads the page, is exactly what the old account-picker did. No
-   sign-up and no "forgot password" either — the Admin creates
-   accounts and resets passwords in the Supabase Dashboard.        */
-
-function LoginScreen({ onSignIn, theme, onTheme, onConfigure }) {
-  const [email, setEmail]       = useState("");
-  const [password, setPassword] = useState("");
-  const [showPw, setShowPw]     = useState(false);
-  const [busy, setBusy]         = useState(false);
+function LoginScreen({ users, onLogin, theme, onTheme }) {
+  const [selected, setSelected] = useState(null);
+  const [pin, setPin]           = useState("");
   const [error, setError]       = useState("");
+  const [showPin, setShowPin]   = useState(false);
 
-  const ready = !!email.trim() && !!password && !busy;
-
-  const attempt = async () => {
-    if (!ready) return;
-    setBusy(true); setError("");
-    const result = await onSignIn(email, password);
-    /* On success this component unmounts, so only the failure path has
-       any state left to set. */
-    if (result?.error) { setError(result.error); setPassword(""); setBusy(false); }
+  const attempt = () => {
+    if (!selected) return;
+    if (hashPin(pin) === selected.pin) {
+      setError(""); onLogin(selected);
+    } else {
+      setError("Wrong PIN. Try again.");
+      setPin("");
+    }
   };
+
+  const roleInfo = selected ? ROLES.find(r => r.key === selected.role) : null;
 
   return (
     <div className="app" data-theme={theme} style={{ minHeight: "100vh",
@@ -5041,69 +5020,75 @@ function LoginScreen({ onSignIn, theme, onTheme, onConfigure }) {
         <div style={{ textAlign: "center", marginBottom: 8 }}>
           <Package size={28} style={{ color: "var(--accent)", marginBottom: 8 }} />
           <h1 style={{ margin: "0 0 4px", fontSize: 22 }}>Procurement Tracker</h1>
-          <div className="sub">Sign in with your work email</div>
+          <div className="sub">Select your account to continue</div>
         </div>
 
-        <div className="card" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <Field label="Email">
-            <input
-              type="email"
-              value={email}
-              placeholder="you@sprig.store"
-              autoFocus
-              autoComplete="username"
-              disabled={busy}
-              style={{ width: "100%" }}
-              onChange={(e) => { setEmail(e.target.value); setError(""); }}
-              onKeyDown={(e) => e.key === "Enter" && attempt()}
-            />
-          </Field>
+        {/* user grid */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          {users.map((u) => {
+            const r = ROLES.find(x => x.key === u.role);
+            const active = selected?.id === u.id;
+            return (
+              <button key={u.id} className="btn card"
+                style={{ flexDirection: "column", gap: 8, padding: "14px 12px", textAlign: "center",
+                  border: active ? "2px solid var(--accent)" : "1px solid var(--line)",
+                  background: active ? "var(--card)" : undefined }}
+                onClick={() => { setSelected(u); setPin(""); setError(""); }}>
+                <div style={{ width: 40, height: 40, borderRadius: "50%", background: r?.color || "var(--accent)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 17, fontWeight: 700, color: "#fff", margin: "0 auto" }}>
+                  {u.avatar}
+                </div>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{u.name.split(" (")[0]}</div>
+                  <div style={{ fontSize: 11, color: "var(--dim)" }}>{r?.label}</div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
 
-          {/* Not a <Field>: the reveal button sits beside the input, and a
-              button inside a label is asking for trouble. */}
-          <div className="field">
-            <span className="field-l">Password</span>
+        {/* PIN entry */}
+        {selected && (
+          <div className="card" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>
+              Sign in as <span style={{ color: "var(--accent)" }}>{selected.name.split(" (")[0]}</span>
+              <span style={{ fontSize: 11, color: "var(--dim)", marginLeft: 8, fontWeight: 400 }}>
+                {roleInfo?.label}
+              </span>
+            </div>
             <div style={{ display: "flex", gap: 8 }}>
-              <input
-                type={showPw ? "text" : "password"}
-                value={password}
-                placeholder="Password"
-                autoComplete="current-password"
-                disabled={busy}
-                style={{ flex: 1 }}
-                onChange={(e) => { setPassword(e.target.value); setError(""); }}
-                onKeyDown={(e) => e.key === "Enter" && attempt()}
-              />
-              <button className="btn" title={showPw ? "Hide" : "Show"}
+              <div style={{ flex: 1, position: "relative" }}>
+                <input
+                  type={showPin ? "text" : "password"}
+                  value={pin}
+                  placeholder="Enter PIN"
+                  autoFocus
+                  style={{ fontFamily: "var(--mono)", fontSize: 15, letterSpacing: 4, width: "100%" }}
+                  onChange={(e) => { setPin(e.target.value.replace(/\D/g,"")); setError(""); }}
+                  onKeyDown={(e) => e.key === "Enter" && attempt()}
+                  maxLength={6}
+                />
+              </div>
+              <button className="btn" title={showPin ? "Hide" : "Show"}
                 style={{ padding: "0 12px" }}
-                onClick={() => setShowPw(v => !v)}>
-                {showPw ? "🙈" : "👁"}
+                onClick={() => setShowPin(v => !v)}>
+                {showPin ? "🙈" : "👁"}
               </button>
             </div>
+            {error && <div style={{ fontSize: 12, color: "var(--bad)" }}>{error}</div>}
+            <button className="btn" data-primary="1" onClick={attempt}
+              style={{ opacity: pin.length >= 4 ? 1 : 0.4 }}>
+              Sign in
+            </button>
           </div>
+        )}
 
-          {error && <div style={{ fontSize: 12, color: "var(--bad)", lineHeight: 1.5 }}>{error}</div>}
-
-          <button className="btn" data-primary="1" onClick={attempt}
-            style={{ opacity: ready ? 1 : 0.4 }}>
-            {busy ? "Signing in…" : "Sign in"}
-          </button>
-
-          <div style={{ fontSize: 11, color: "var(--dim)", lineHeight: 1.6 }}>
-            Accounts and passwords are managed in the Supabase Dashboard. Ask
-            the Admin for an account, or to reset your password.
-          </div>
-        </div>
-
-        {/* theme toggle, and a way back to the connection settings for a
-            browser pointed at the wrong project — nobody can sign in to fix
-            that from inside the app. */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
-          <button className="btn btn-icon" onClick={onTheme} aria-label="Switch theme">
+        {/* theme toggle at bottom */}
+        <div style={{ textAlign: "center" }}>
+          <button className="btn btn-icon" onClick={onTheme} aria-label="Switch theme"
+            style={{ margin: "0 auto" }}>
             {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
-          </button>
-          <button className="btn" style={{ fontSize: 11 }} onClick={onConfigure}>
-            Connection settings
           </button>
         </div>
       </div>
@@ -5114,24 +5099,18 @@ function LoginScreen({ onSignIn, theme, onTheme, onConfigure }) {
 
 export default function App() {
   /* ── DB config state ── */
+  const [dbReady, setDbReady]   = useState(() => !!dbGetConfig());
   const [dbOnline, setDbOnline] = useState(false);
   const [dbError, setDbError]   = useState("");
   const [conflictedIds, setConflictedIds] = useState(() => new Set());
   const conflictedIdsRef = useRef(conflictedIds);
-  /* Nothing — not even the sign-in — can reach Supabase without a project
-     URL and public key, so a browser that has neither starts here. */
-  const [showDbSetup, setShowDbSetup] = useState(() => !dbGetConfig());
+  const [showDbSetup, setShowDbSetup] = useState(false);
   const writeState = useRef(new Map());
 
-  /* ── session state ──
-     `session` is the signed-in caller's profile: id, name, role, avatar and
-     email, all of it read from the server. The tokens behind it live in the
-     auth layer above, not in React state. */
-  const [session, setSession] = useState(null);
-  /* A stored Auth session has to be revalidated before the UI can decide
-     between the app and the login screen. Don't flash the login screen at
-     someone who is still signed in. */
-  const [authBooting, setAuthBooting] = useState(() => !!authSession);
+  /* ── session state ── */
+  const [users, setUsers]     = useState(DEFAULT_USERS);
+  const [session, setSession] = useState(() => loadSession());
+  const [manageUsers, setManageUsers] = useState(false);
 
   const role = session?.role ?? "none";
   const currentUser = session;
@@ -5153,9 +5132,9 @@ export default function App() {
   openIdRef.current = openId;
   conflictedIdsRef.current = conflictedIds;
 
-  /* ── load data from Supabase, after sign-in and on every refresh ── */
+  /* ── load data from Supabase on mount & after login ── */
   const loadFromDB = async ({ background = false } = {}) => {
-    if (!dbGetConfig() || !authSession) return;
+    if (!dbGetConfig()) return;
     const shouldKeepLocalEdits = () =>
       background && (openIdRef.current || conflictedIdsRef.current.size);
     /* A background reload replaces the entire phone list. Never replace an
@@ -5163,25 +5142,27 @@ export default function App() {
        The manual refresh button remains the explicit discard-and-reload path. */
     if (shouldKeepLocalEdits()) return;
     setLoading(true);
-    /* The profile comes along on every read: the role is the server's to
-       change, and a Dashboard edit — or a withdrawn approval — should reach
-       this tab without waiting for the next sign-in. */
-    const [pr, ph] = await Promise.all([dbLoadProfile(authSession.userId), dbLoadPhones()]);
+    const [up, ph] = await Promise.all([dbLoadUsers(), dbLoadPhones()]);
     /* The user may have opened an editor or hit a conflict while this request
        was in flight. Do not apply an automatic response over that local state. */
     if (shouldKeepLocalEdits()) { setLoading(false); return; }
-    if (pr.error || ph.error) {
-      setDbOnline(false); setDbError(pr.error || ph.error);
-    } else if (!pr.data) {
-      /* The profile is gone: this account is no longer approved for the
-         tracker. It keeps its Auth login and loses the app. */
-      await authSignOut();
-      setSession(null); setOpenId(null); setAdding(false);
-      setDbOnline(false);
-      setDbError("This account is no longer approved for the tracker");
+    if (up.error || ph.error) {
+      setDbOnline(false); setDbError(up.error || ph.error);
     } else {
       setDbOnline(true); setDbError(""); setSyncedAt(new Date());
-      setSession((cur) => cur ? { ...cur, ...pr.data } : cur);
+      if (up.data?.length) {
+        setUsers(up.data);
+        /* Re-validate a restored session against the live user list —
+           the account may have been renamed, re-roled or deleted while
+           this browser was closed.                                    */
+        setSession((cur) => {
+          if (!cur) return cur;
+          const fresh = up.data.find((u) => u.id === cur.id);
+          if (!fresh) { clearSession(); return null; }      // account removed
+          saveSession(fresh);
+          return fresh;                                     // pick up role/name changes
+        });
+      }
       if (ph.data)         setPhones(ph.data);
       writeState.current.clear();
       conflictedIdsRef.current = new Set();
@@ -5190,53 +5171,7 @@ export default function App() {
     setLoading(false);
   };
 
-  /* ── restore a stored Auth session on load ──
-     The tokens survive a reload; the profile does not. Refresh the access
-     token if it went stale while the tab was closed, then read the role
-     back from the server. */
-  useEffect(() => {
-    let cancelled = false;
-    if (!authSession) return undefined;
-    (async () => {
-      const token  = await authAccessToken();
-      const userId = authSession?.userId;
-      let restored = null;
-      if (token && userId) {
-        const { data: profile, error } = await dbLoadProfile(userId);
-        if (profile) restored = { ...profile, email: authSession.email };
-        /* No profile and no error is a definite answer — approval was
-           withdrawn. An error is not: keep the tokens and let the next
-           attempt decide. */
-        else if (!error) await authSignOut();
-      }
-      if (cancelled) return;
-      setSession(restored);
-      setAuthBooting(false);
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
-  /* A refresh token the server rejects ends this browser's session, wherever
-     in the app that happens to be discovered. */
-  useEffect(() => {
-    setAuthLostHandler(() => {
-      setSession(null); setOpenId(null); setAdding(false);
-      setDbOnline(false);
-      setDbError("Session expired — sign in again");
-    });
-    return () => setAuthLostHandler(null);
-  }, []);
-
-  /* Read the tracker as soon as there is somebody to read it as. */
-  useEffect(() => { if (session) loadFromDB(); }, [session?.id]);
-
-  /* Keep the access token ahead of its expiry while the tab sits open, so an
-     idle morning doesn't end in a save that fails on the first attempt. */
-  useEffect(() => {
-    if (!session) return undefined;
-    const timer = setInterval(() => { authAccessToken(); }, 60000);
-    return () => clearInterval(timer);
-  }, [session?.id]);
+  useEffect(() => { loadFromDB(); }, []);   // on mount
 
   /* Everyone shares one database, and a save writes the whole phone row.
      A tab left open all morning would happily overwrite work it never saw,
@@ -5305,36 +5240,13 @@ export default function App() {
     return state.queue;
   };
 
-  /* Signing in is two steps: Auth says who you are, the profile says what you
-     may do. An account without a profile is authenticated and still not
-     allowed in — so drop the tokens again rather than leave a half-session
-     sitting in this browser. Returns { error } for the login screen. */
-  const signIn = async (email, password) => {
-    const { session: auth, error } = await authSignIn(email, password);
-    if (error) return { error: authMessage(error) };
-
-    const { data: profile, error: profileError } = await dbLoadProfile(auth.userId);
-    if (profileError) {
-      await authSignOut();
-      return { error: `Signed in, but the profile lookup failed: ${profileError}` };
-    }
-    if (!profile) {
-      await authSignOut();
-      return { error: "This account is not approved for the tracker. Ask the Admin to add it." };
-    }
-    setSession({ ...profile, email: auth.email });
-    return {};
+  const login = (user) => {
+    saveSession(user);
+    setSession(user);
   };
-
-  const signOut = async () => {
-    await authSignOut();
+  const logout = () => {
+    clearSession();
     setSession(null); setOpenId(null); setAdding(false);
-    /* One shared machine, several people: the next person at this keyboard
-       must not find the last one's data still on screen. */
-    setPhones(EMPTY); setDbOnline(false); setSyncedAt(null); setDbError("");
-    writeState.current.clear();
-    conflictedIdsRef.current = new Set();
-    setConflictedIds(new Set());
   };
 
   const say = (text) => { setToast(text); setTimeout(() => setToast((t) => (t === text ? null : t)), 2500); };
@@ -5717,38 +5629,21 @@ export default function App() {
     saved(`${data.brand} ${data.name} added and tracking`);
   };
 
-  /* ── DB setup flow ──
-     Before anyone signs in this screen belongs to whoever is at the browser:
-     there is no session yet, so there is no role to gate it with, and the URL
-     and public key it collects are not secrets. Once someone is signed in it
-     is Admin-only again. */
-  if (showDbSetup && (!session || CAN.reset(role))) return (
+  /* ── DB setup flow: Admin must configure Supabase first ── */
+  if (showDbSetup && CAN.reset(role)) return (
     <DBSetupScreen
-      onDone={(changed) => {
-        setShowDbSetup(false);
-        /* Tokens are issued by one project and mean nothing to another. */
-        if (session && changed) signOut(); else loadFromDB();
-      }}
-      onCancel={dbGetConfig() ? () => setShowDbSetup(false) : null}
+      onDone={() => { setShowDbSetup(false); setDbReady(true); loadFromDB(); }}
+      onSkip={() => setShowDbSetup(false)}
     />
-  );
-
-  /* ── restoring a stored session — a blank moment, not the login screen ── */
-  if (authBooting) return (
-    <div className="app" data-theme={theme} style={{ minHeight: "100vh", display: "flex",
-      alignItems: "center", justifyContent: "center" }}>
-      <style>{CSS}</style>
-      <div className="card" style={{ padding: "24px 36px", fontSize: 14 }}>Signing in…</div>
-    </div>
   );
 
   /* ── show login screen when no session ── */
   if (!session) return (
     <LoginScreen
-      onSignIn={signIn}
+      users={users}
+      onLogin={login}
       theme={theme}
       onTheme={() => setTheme(t => t === "dark" ? "light" : "dark")}
-      onConfigure={() => setShowDbSetup(true)}
     />
   );
 
@@ -5841,8 +5736,14 @@ export default function App() {
                 <div style={{ fontSize: 12, fontWeight: 600 }}>{currentUser?.name?.split(" (")[0]}</div>
                 <div style={{ fontSize: 10, color: "var(--dim)" }}>{ROLES.find(r => r.key === role)?.label}</div>
               </div>
+              {CAN.manageUsers(role) && (
+                <button className="btn" style={{ fontSize: 11, padding: "4px 8px" }}
+                  onClick={() => setManageUsers(true)}>
+                  Users
+                </button>
+              )}
               <button className="btn" style={{ fontSize: 11, padding: "4px 8px" }}
-                onClick={signOut} title={currentUser?.email ? `Signed in as ${currentUser.email}` : "Sign out"}>
+                onClick={logout} title="Sign out">
                 Sign out
               </button>
             </div>
@@ -5923,9 +5824,9 @@ export default function App() {
           </div>
         )}
         {view === "inward"    && <CatalogInward models={liveModels} onSaveReceipt={saveReceipt}
-          onSetRequired={setStpRequired} onOpen={setOpenId} onMove={move}
-          canReceive={CAN.saveReceipt(role)} canSetStp={CAN.setStpRequired(role)} canSendReport={role === "admin"}
-          role={role} onNotify={say} />}
+                                  onSetRequired={setStpRequired} onOpen={setOpenId} onMove={move}
+                                  canReceive={CAN.saveReceipt(role)} canSetStp={CAN.setStpRequired(role)}
+                                  role={role} onNotify={say} />}
         {view === "listing"   && <CatalogQueue models={liveModels} onSetListing={saveListings}
                                   onOpen={setOpenId} canEdit={CAN.saveListing(role)} />}
         {view === "calendar"  && <Calendar models={liveModels} onOpen={setOpenId} role={role} />}
@@ -5971,6 +5872,32 @@ export default function App() {
             Loading from database…
           </div>
         </div>
+      )}
+      {manageUsers && CAN.manageUsers(role) && (
+        <UserManager
+          users={users}
+          onSave={async (updated) => {
+            /* accounts the admin removed in the dialog — they have to be
+               deleted in the DB too, or they come back on the next load
+               and can still sign in from another browser meanwhile */
+            const removed = users.filter((u) => !updated.some((n) => n.id === u.id));
+            setUsers(updated);
+            const me = updated.find(u => u.id === session?.id);
+            if (me) { setSession(me); saveSession(me); }
+            if (dbOnline) {
+              await Promise.all([
+                ...updated.map(dbUpsertUser),
+                ...removed.map((u) => dbDeleteUser(u.id)),
+              ]);
+            }
+            /* an admin who deleted their own account is signed out */
+            if (!me) { setManageUsers(false); logout(); return; }
+            saved(removed.length
+              ? `Users saved · ${removed.length} account${removed.length === 1 ? "" : "s"} removed`
+              : "Users saved");
+          }}
+          onClose={() => setManageUsers(false)}
+        />
       )}
       {toast  && <div className="toast">{toast}</div>}
     </div>
