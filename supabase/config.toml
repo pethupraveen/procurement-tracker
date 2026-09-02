@@ -1,0 +1,5 @@
+[functions.request-stp-report-approval]
+verify_jwt = false
+
+[functions.send-stp-report]
+verify_jwt = false

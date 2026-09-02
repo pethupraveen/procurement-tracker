@@ -793,49 +793,28 @@ async function dbUpdatePhone(phone, expectedUpdatedAt) {
    See supabase/functions/send-stp-report/index.ts; until that is
    deployed this reports the failure rather than pretending.        */
 
-const REPORT_MAIL_KEY = "proc_tracker_report_mail";
-
-function mailGetRecipients() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(REPORT_MAIL_KEY) || "null");
-    return Array.isArray(raw) ? raw : [];
-  } catch { return []; }
-}
-function mailSaveRecipients(list) {
-  localStorage.setItem(REPORT_MAIL_KEY, JSON.stringify(list));
-}
-/* "a@b.com, c@d.com" -> ["a@b.com", "c@d.com"], rejecting anything that
-   plainly is not an address so the failure happens here, not at the API. */
-function parseRecipients(text) {
-  const parts = String(text || "").split(/[,;\s]+/).map((s) => s.trim()).filter(Boolean);
-  const bad = parts.filter((p) => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(p));
-  return { list: parts, bad };
-}
-
-async function dbSendReport({ subject, intro, headers, rows }) {
+async function reportRequest(path, body = {}) {
   const cfg = dbGetConfig();
   if (!cfg) return { error: "No database configured — the mail function lives in your Supabase project" };
-  const to = mailGetRecipients();
-  if (!to.length) return { error: "No recipients set — add MD / Factory addresses first" };
   try {
-    const res = await fetch(`${cfg.url}/functions/v1/send-stp-report`, {
+    const res = await fetch(`${cfg.url}/functions/v1/${path}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         apikey: cfg.key,
-        Authorization: `Bearer ${cfg.key}`,
       },
-      body: JSON.stringify({ to, subject, intro, headers, rows }),
+      body: JSON.stringify(body),
     });
-    if (res.status === 404)
-      return { error: "Mail function not deployed yet — run: supabase functions deploy send-stp-report" };
-    const body = await res.text();
-    if (!res.ok) return { error: `Mail failed (${res.status}): ${body.slice(0, 200)}` };
-    return { ok: true, sent: to.length };
+    const responseBody = await res.text();
+    let data = null; try { data = responseBody ? JSON.parse(responseBody) : null; } catch {}
+    if (!res.ok) return { error: data?.error || `Report request failed (${res.status})` };
+    return { data };
   } catch (e) {
     return { error: e.message };
   }
 }
+const dbRequestReportApproval = () => reportRequest("request-stp-report-approval");
+const dbSendReport = (approvalId, code) => reportRequest("send-stp-report", { approvalId, code });
 
 async function dbDeletePhone(id) {
   const c = dbClient(); if (!c) return { error: "Not configured" };
@@ -4164,9 +4143,9 @@ function STPRequirement({ models, onSetRequired, canEdit, onEmail, emailState })
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
         <button className="btn" onClick={() => exportReq("csv")}>↓ CSV</button>
         <button className="btn" onClick={() => exportReq("excel")}>↓ Excel</button>
-        <button className="btn" data-primary="1" disabled={emailState === "sending"}
-          onClick={() => onEmail(REPORT_HEADERS, reportRows())}>
-          {emailState === "sending" ? "Sending…" : "✉ Email MD / Factory"}
+        <button className="btn" data-primary="1" disabled={emailState === "sending" || emailState === "requesting"}
+          onClick={onEmail}>
+          {emailState === "sending" ? "Sending…" : emailState === "requesting" ? "Requesting…" : "✉ Email MD / Factory"}
         </button>
         {undecided > 0 && <Tag tone="warn">{undecided} SKUs still undecided</Tag>}
       </div>
@@ -4181,27 +4160,24 @@ function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
                          canReceive, canSetStp, role, onNotify }) {
   const [tab, setTab] = useState("inward");
   const [emailState, setEmailState] = useState("idle");
-  const [mailText, setMailText] = useState(() => mailGetRecipients().join(", "));
-  const [mailOpen, setMailOpen] = useState(false);
+  const [approval, setApproval] = useState(null);
+  const [approvalCode, setApprovalCode] = useState("");
 
-  const saveRecipients = () => {
-    const { list, bad } = parseRecipients(mailText);
-    if (bad.length) { onNotify(`⚠ Not an email address: ${bad[0]}`); return; }
-    mailSaveRecipients(list);
-    onNotify(list.length ? `Report goes to ${list.length} recipient${list.length === 1 ? "" : "s"}` : "Recipients cleared");
-    setMailOpen(false);
-  };
-
-  const sendEmail = async (headers, rows) => {
-    if (!rows.length) { onNotify("⚠ Nothing to send"); return; }
-    setEmailState("sending");
-    const result = await dbSendReport({
-      subject: `STP file requirement — ${rows.length} model/material rows`,
-      intro: "Model-wise and material-wise STP file requirement, as marked by the catalog team.",
-      headers, rows,
-    });
+  const requestApproval = async () => {
+    setEmailState("requesting");
+    const result = await dbRequestReportApproval();
     setEmailState("idle");
-    onNotify(result.error ? `⚠ ${result.error}` : `Report emailed to ${result.sent} recipient${result.sent === 1 ? "" : "s"}`);
+    if (result.error) return onNotify(`⚠ ${result.error}`);
+    setApproval(result.data); setApprovalCode("");
+    onNotify("Approval code sent to the configured approver");
+  };
+  const sendEmail = async () => {
+    if (!approval?.approvalId || !/^[A-HJ-NP-Z2-9]{8}$/.test(approvalCode)) return onNotify("⚠ Enter the 8-character approval code");
+    setEmailState("sending");
+    const result = await dbSendReport(approval.approvalId, approvalCode);
+    setEmailState("idle");
+    if (result.error) return onNotify(`⚠ ${result.error}`);
+    setApproval(null); setApprovalCode(""); onNotify("Report emailed to the configured recipients");
   };
 
   const TABS = [["inward", "Inward stock"], ["stp", "STP requirement"]];
@@ -4214,25 +4190,19 @@ function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
             {label}
           </button>
         ))}
-        {tab === "stp" && (
-          <button className="btn" style={{ marginLeft: "auto", fontSize: 11 }}
-            onClick={() => setMailOpen((o) => !o)}>
-            ✉ Recipients ({mailGetRecipients().length})
-          </button>
-        )}
       </div>
 
-      {tab === "stp" && mailOpen && (
+      {tab === "stp" && approval && (
         <div className="card" style={{ marginBottom: 12 }}>
           <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 8, lineHeight: 1.5 }}>
-            Who receives the STP requirement report — MD, the factory team, anyone else.
-            Comma separated. Stored in this browser, not in the database.
+            An approval code was sent to the configured approver. Enter it to send the current server-generated report.
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <input value={mailText} onChange={(e) => setMailText(e.target.value)}
-              placeholder="md@example.com, factory@example.com"
-              style={{ flex: 1, minWidth: 240, fontSize: 12 }} />
-            <button className="btn" data-primary="1" onClick={saveRecipients}>Save</button>
+            <input value={approvalCode} onChange={(e) => setApprovalCode(e.target.value.toUpperCase().replace(/[^A-HJ-NP-Z2-9]/g, "").slice(0, 8))}
+              placeholder="8-character code" style={{ flex: 1, minWidth: 180, fontFamily: "var(--mono)", letterSpacing: 2 }} />
+            <button className="btn" data-primary="1" disabled={emailState === "sending"} onClick={sendEmail}>
+              {emailState === "sending" ? "Sending…" : "Send approved report"}
+            </button>
           </div>
         </div>
       )}
@@ -4241,7 +4211,7 @@ function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
         ? <InwardStock models={models} onSaveReceipt={onSaveReceipt} onOpen={onOpen}
             onMove={onMove} canEdit={canReceive} role={role} />
         : <STPRequirement models={models} onSetRequired={onSetRequired}
-            canEdit={canSetStp} onEmail={sendEmail} emailState={emailState} />}
+            canEdit={canSetStp} onEmail={requestApproval} emailState={emailState} />}
     </div>
   );
 }
