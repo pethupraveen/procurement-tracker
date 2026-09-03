@@ -3799,6 +3799,7 @@ const INWARD_STAGES = ["ordered", "production", "received"];
 function InwardStock({ models, onSaveReceipt, onOpen, onMove, canEdit, role }) {
   const [draft, setDraft] = useState({});     // rid -> { received, state }
   const [onlyPending, setOnlyPending] = useState(false);
+  const [selected, setSelected] = useState(() => new Set());
 
   const queue = models
     .filter((m) => INWARD_STAGES.includes(m.stage) && allSkus(m).length)
@@ -3844,6 +3845,17 @@ function InwardStock({ models, onSaveReceipt, onOpen, onMove, canEdit, role }) {
   const pendingN  = allRows.filter((r) => valueOf(r).state == null).length;
   const shortN    = allRows.filter((r) => valueOf(r).state === "short").length;
   const noneN     = allRows.filter((r) => valueOf(r).state === "none").length;
+  const readyModels = queue.filter((m) =>
+    m.stage === "production" && !gateBlock(m) && moveStatus(m, role, "received").ok);
+  const selectedReady = readyModels.filter((m) => selected.has(m.id));
+  const toggleSelected = (id) => setSelected((ids) => {
+    const next = new Set(ids); next.has(id) ? next.delete(id) : next.add(id); return next;
+  });
+  const selectAllReady = () => setSelected(new Set(readyModels.map((m) => m.id)));
+  const bulkInward = () => {
+    selectedReady.forEach((m) => onMove(m.id, "received"));
+    setSelected(new Set());
+  };
 
   const exportInward = (fmt) => {
     const headers = ["Brand", "Model", "Stage", "PO", "SKU", "Material",
@@ -3906,6 +3918,22 @@ function InwardStock({ models, onSaveReceipt, onOpen, onMove, canEdit, role }) {
         </div>
       )}
 
+      {canEdit && readyModels.length > 0 && (
+        <div className="card" style={{ marginBottom: 12, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ fontSize: 11, color: "var(--dim)" }}>
+            Bulk inward: {readyModels.length} model{readyModels.length === 1 ? "" : "s"} ready
+          </span>
+          <button className="btn" style={{ fontSize: 11, padding: "3px 8px" }} onClick={selectAllReady}>
+            Select all ready
+          </button>
+          <button className="btn" data-primary="1" style={{ fontSize: 11, padding: "3px 8px" }}
+            disabled={!selectedReady.length || touched > 0} onClick={bulkInward}>
+            Inward {selectedReady.length || ""} selected model{selectedReady.length === 1 ? "" : "s"}
+          </button>
+          {touched > 0 && <Tag tone="warn">Save receipt changes before bulk inwarding</Tag>}
+        </div>
+      )}
+
       {queue.map((m) => {
         const rows  = allSkus(m).filter((r) => !onlyPending || valueOf(r).state == null);
         if (!rows.length) return null;
@@ -3919,6 +3947,12 @@ function InwardStock({ models, onSaveReceipt, onOpen, onMove, canEdit, role }) {
           <div className="card" key={m.id} style={{ marginBottom: 10 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
               <strong style={{ cursor: "pointer" }} onClick={() => onOpen(m.id)}>{m.brand} {m.name}</strong>
+              {readyModels.some((ready) => ready.id === m.id) && canEdit && (
+                <label style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 11, color: "var(--dim)" }}>
+                  <input type="checkbox" checked={selected.has(m.id)} onChange={() => toggleSelected(m.id)} />
+                  Bulk inward
+                </label>
+              )}
               <Tag>{STAGES[m.index].label}</Tag>
               {m.po && <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--dim)" }}>{m.po}</span>}
               <span style={{ fontSize: 11, color: "var(--dim)", fontFamily: "var(--mono)" }}>
