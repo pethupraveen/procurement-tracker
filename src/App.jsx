@@ -1,5 +1,9 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
-import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, LayoutGrid, List, BarChart2, FileText } from "lucide-react";
+/* CalendarDays and Inbox are aliased on import: the local components below are
+   already called Calendar and Table, and Calendar/Inward previously reused the
+   Dashboard and Orders icons, so two pairs of tabs were visually identical. */
+import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, LayoutGrid, List, BarChart2, FileText,
+         CalendarDays as CalendarIcon, Inbox as InboxIcon } from "lucide-react";
 
 /* ═══════════════════════════════════════════════════════════════
    NEW MODEL PROCUREMENT TRACKER — simple version
@@ -425,6 +429,21 @@ const DEFAULT_USERS = [
   { id: "u3", name: "Ravi (Warehouse)",    role: "warehouse",   pin: hashPin("2222"), avatar: "R" },
   { id: "u4", name: "Sunita (Catalog)",    role: "catalog",     pin: hashPin("3333"), avatar: "S" },
   { id: "u5", name: "Kiran (Sales)",       role: "sales",       pin: hashPin("4444"), avatar: "K" },
+];
+
+/* The view tabs, as data. These were eight hand-written <button> blocks that
+   had drifted apart — two pairs shared an icon and the active state was a
+   faint border tint. One list keeps them consistent and makes the strip
+   easy to reorder. `badge` names the pending-count this tab should show. */
+const VIEWS = [
+  { key: "dashboard", label: "Dashboard", Icon: BarChart2    },
+  { key: "board",     label: "Board",     Icon: LayoutGrid   },
+  { key: "table",     label: "List",      Icon: List         },
+  { key: "calendar",  label: "Calendar",  Icon: CalendarIcon },
+  { key: "orders",    label: "Orders",    Icon: Package      },
+  { key: "inward",    label: "Inward",    Icon: InboxIcon,     badge: "inward"  },
+  { key: "listing",   label: "Listing",   Icon: CheckCircle2,  badge: "listing" },
+  { key: "reports",   label: "Reports",   Icon: FileText     },
 ];
 
 const ROLES = [
@@ -886,7 +905,67 @@ const CSS = `
 
 .app .wrap { max-width: 1280px; margin: 0 auto; padding: 20px; }
 .app .row { display: flex; align-items: center; gap: 12px; }
-.app .head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+
+/* ── header ──────────────────────────────────────────────────────
+   Sticky, so the view tabs and the DB status dot stay reachable when
+   you are deep in a long board or list. It was previously scrolled
+   away with the content and there was no way back without scrolling up. */
+.app .head {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 18px;
+  position: sticky; top: 0; z-index: 30;
+  padding: 12px 20px; margin-left: -20px; margin-right: -20px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  border-bottom: 1px solid var(--line);
+}
+/* backdrop-filter is progressive: without support the 88% background above
+   is already opaque enough to stay readable. */
+@supports (backdrop-filter: blur(8px)) {
+  .app .head { backdrop-filter: blur(10px) saturate(1.3); }
+}
+
+/* ── view tabs ───────────────────────────────────────────────────
+   One scrollable row rather than an eight-button block that wrapped onto
+   four lines on a phone. scroll-snap keeps a tab aligned after a swipe. */
+.app .nav {
+  display: flex; align-items: center; gap: 10px;
+  margin-left: auto; flex-wrap: wrap; justify-content: flex-end;
+}
+.app .nav-tabs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.app .nav-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.app .nav-tabs .btn[aria-current="page"] {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.app .nav-tabs .btn[aria-current="page"]:hover { color: #fff; }
+.app .nav-badge {
+  margin-left: 5px; background: var(--warn); color: #000; border-radius: 9px;
+  padding: 0 6px; font-size: 10px; font-weight: 700; font-family: var(--mono);
+}
+/* On the filled active tab the amber-on-white badge loses its contrast. */
+.app .nav-tabs .btn[aria-current="page"] .nav-badge { background: #fff; color: var(--accent); }
+
+@media (max-width: 900px) {
+  /* The tabs become a single swipeable strip, and the status/account cluster
+     drops to its own row. The negative margins let the strip bleed to the
+     screen edge so it reads as scrollable rather than clipped. */
+  .app .nav { width: 100%; margin-left: 0; justify-content: flex-start; }
+  .app .nav-tabs {
+    flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    margin: 0 -20px; padding: 2px 20px; width: 100%;
+  }
+  .app .nav-tabs::-webkit-scrollbar { display: none; }
+  .app .nav-tabs .btn { flex: 0 0 auto; scroll-snap-align: start; }
+  .app .nav-meta { width: 100%; justify-content: flex-start; }
+  .app .head { padding: 10px 16px; margin-left: -16px; margin-right: -16px; }
+}
+@media (max-width: 640px) {
+  .app .wrap { padding: 16px; }
+  /* The strapline is the first thing to go — it is explanatory, not
+     operational, and it costs a whole row on a phone. */
+  .app .head .sub { display: none; }
+  .app h1 { font-size: 17px; }
+}
 .app h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -.02em; }
 .app .sub { font-size: 13px; color: var(--dim); margin-top: 3px; }
 .app h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); margin: 0 0 10px; font-weight: 600; }
@@ -907,6 +986,16 @@ const CSS = `
 .app .btn[data-primary="1"]:hover { opacity: .9; color: #fff; }
 .app .btn[data-on="1"] { border-color: var(--accent); color: var(--accent); }
 .app .btn-icon { padding: 8px; }
+/* A disabled button must stop LOOKING pressable. Without this it still took
+   the accent hover treatment and read as clickable. */
+.app .btn:disabled, .app .btn[aria-disabled="true"] {
+  opacity: .45; cursor: not-allowed;
+}
+.app .btn:disabled:hover, .app .btn[aria-disabled="true"]:hover {
+  border-color: var(--line); color: var(--text);
+}
+.app .btn[data-primary="1"]:disabled:hover { color: #fff; border-color: var(--accent); }
+.app .btn { transition: border-color .12s ease, color .12s ease, background .12s ease; }
 
 .app .tag {
   display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 20px;
@@ -943,6 +1032,20 @@ const CSS = `
 .app td { padding: 11px 12px; border-bottom: 1px solid var(--line); }
 .app tbody tr { cursor: pointer; }
 .app tbody tr:hover { background: var(--bg); }
+/* Rows are focusable (see Table), so they need a visible focus state of
+   their own — the generic outline gets clipped by overflow-x on the wrapper. */
+.app tbody tr:focus-visible {
+  outline: none; background: var(--bg);
+  box-shadow: inset 2px 0 0 var(--accent), inset -2px 0 0 var(--accent);
+}
+/* Sort control fills its header cell so the whole cell stays clickable. */
+.app .th-sort {
+  display: flex; align-items: center; gap: 4px; width: 100%;
+  padding: 9px 12px; background: none; border: 0; cursor: pointer;
+  font: inherit; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--dim); font-weight: 600; user-select: none;
+}
+.app .th-sort:hover { color: var(--accent); }
 
 /* slide-in panel, used by both detail and the add form */
 .app .shade { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 40; }
@@ -1015,7 +1118,15 @@ const CSS = `
   position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 60;
   background: var(--card); border: 1px solid var(--line); border-radius: 10px;
   padding: 10px 16px; font-size: 13px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.28);
+  max-width: calc(100vw - 32px); text-align: center;
+  animation: toastin .18s ease-out;
 }
+@keyframes toastin { from { transform: translate(-50%, 8px); opacity: 0; } }
+/* Always-mounted live region for the toast. It is only a wrapper — the
+   .toast inside is position:fixed and centres itself — so this must not
+   add geometry of its own. */
+.app .toast-live { position: static; }
 .app :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (max-width: 640px) { .app .two { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { .app * { animation: none !important; transition: none !important; } }
@@ -1070,6 +1181,84 @@ const CSS = `
 
 
 /* ── 7. SMALL PIECES ─────────────────────────────────────────── */
+
+/* Escape closes the topmost layer, and focus goes back where it came from.
+   Detail and AddForm each had their own copy of the keydown effect; the user
+   manager and the reset confirmation had none, so the only way out of them
+   was to find and hit Cancel. One hook, used by all four.
+
+   `active` lets a caller opt out — a nested confirm step inside a dialog
+   should swallow Escape itself rather than closing the whole dialog. */
+/* A destructive confirmation. Pulled out of App's render so it can hold the
+   dismiss hook, and so the focus lands on Cancel rather than on the button
+   that deletes everything — the previous inline version put focus nowhere and
+   left Escape doing nothing at all. */
+function ConfirmDialog({ title, body, confirmLabel, onConfirm, onCancel, tone = "bad" }) {
+  const cancelRef = useRef(null);
+  useDismiss(onCancel);
+  useEffect(() => { cancelRef.current?.focus(); }, []);
+
+  return (
+    <>
+      <div className="shade" style={{ zIndex: 50 }} onClick={onCancel} />
+      <div role="dialog" aria-modal="true" aria-labelledby="confirm-title"
+        aria-describedby="confirm-body"
+        style={{
+          position: "fixed", zIndex: 51, top: "50%", left: "50%",
+          transform: "translate(-50%, -50%)",
+          background: "var(--card)", border: `1px solid var(--${tone})`,
+          borderRadius: 14, padding: 28, width: "min(380px, 90vw)",
+          display: "flex", flexDirection: "column", gap: 14,
+        }}>
+        <div id="confirm-title" style={{ fontSize: 16, fontWeight: 640 }}>{title}</div>
+        <div id="confirm-body" style={{ fontSize: 13, color: "var(--dim)", lineHeight: 1.6 }}>
+          {body}
+        </div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button className="btn" ref={cancelRef} onClick={onCancel}>Cancel</button>
+          <button className="btn" data-primary="1"
+            style={{ background: `var(--${tone})`, borderColor: `var(--${tone})` }}
+            onClick={onConfirm}>
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function useDismiss(onClose, active = true) {
+  /* Callers pass an inline arrow, so `onClose` has a new identity on every
+     render. Holding it in a ref keeps it out of the effect deps — otherwise
+     the listener is torn down and rebuilt constantly, and the focus restore
+     below would fire on every parent render and yank focus out from under
+     whatever the user was typing into. */
+  const cb = useRef(onClose);
+  cb.current = onClose;
+
+  /* Remember what had focus, and put it back once this layer is gone —
+     otherwise focus falls to <body> and keyboard users lose their place.
+     Mount/unmount only, deliberately: this must not run on re-render. */
+  useEffect(() => {
+    const prev = document.activeElement;
+    return () => {
+      if (prev && typeof prev.focus === "function" && document.contains(prev)) {
+        prev.focus();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      cb.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active]);
+}
 
 const Tag   = ({ tone, children }) => <span className="tag" data-tone={tone}>{children}</span>;
 const Meter = ({ value, tone }) => <div className="meter" data-tone={tone}><i style={{ width: value + "%" }} /></div>;
@@ -1374,16 +1563,26 @@ function Table({ models, allModels, onOpen, onAdvance, role, filters }) {
     return list.sort((a, b) => cmp(a, b) * dir);
   }, [models, sortKey, asc]);
 
-  const Th = ({ label, sk, align }) => (
-    <th onClick={() => flip(sk)}
-      style={{ cursor: "pointer", userSelect: "none", textAlign: align, whiteSpace: "nowrap" }}
-      title={`Sort by ${label.toLowerCase()}`}>
-      {label}
-      <span style={{ opacity: sortKey === sk ? 0.9 : 0.22, marginLeft: 4, fontSize: 10 }}>
-        {sortKey === sk ? (asc ? "▲" : "▼") : "▲"}
-      </span>
-    </th>
-  );
+  /* The header cell itself used to carry the onClick, so sorting was
+     mouse-only and the current sort was conveyed by an arrow glyph alone.
+     The button makes it reachable by keyboard; aria-sort states the
+     direction without relying on seeing ▲/▼. */
+  const Th = ({ label, sk, align }) => {
+    const on = sortKey === sk;
+    return (
+      <th scope="col" aria-sort={on ? (asc ? "ascending" : "descending") : "none"}
+        style={{ padding: 0, textAlign: align, whiteSpace: "nowrap" }}>
+        <button type="button" className="th-sort" onClick={() => flip(sk)}
+          style={{ justifyContent: align === "center" ? "center" : "flex-start" }}
+          title={`Sort by ${label.toLowerCase()}`}>
+          {label}
+          <span aria-hidden="true" style={{ opacity: on ? 0.9 : 0.22, fontSize: 10 }}>
+            {on ? (asc ? "▲" : "▼") : "▲"}
+          </span>
+        </button>
+      </th>
+    );
+  };
 
   const anyFilter = filters.q || filters.needsAction || filters.lateOnly || filters.soonOnly || filters.brand;
 
@@ -1404,7 +1603,7 @@ function Table({ models, allModels, onOpen, onAdvance, role, filters }) {
             <Th label="Stage"   sk="stage" />
             <Th label="Units"   sk="units" />
             <Th label="Status"  sk="urgency" />
-            <th style={{ width: 60, textAlign: "center" }}>Move</th>
+            <th scope="col" style={{ width: 60, textAlign: "center" }}>Move</th>
           </tr>
         </thead>
         <tbody>
@@ -2518,11 +2717,7 @@ function ResearchEditor({ model, onSave }) {
 }
 
 function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave, onSalesLog, canLog, role, onAddNote, onDeleteNote, onAddAttachment, onDeleteAttachment, onArchive }) {
-  useEffect(() => {
-    const onKey = (e) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  useDismiss(onClose);
 
   const isLast = model.terminal || model.index === PIPELINE.length - 1;
   const isFirst = model.index === 0;
@@ -2530,7 +2725,8 @@ function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, o
   return (
     <>
       <div className="shade" onClick={onClose} />
-      <aside className="panel" role="dialog" aria-label={`${model.brand} ${model.name}`}>
+      <aside className="panel" role="dialog" aria-modal="true"
+        aria-label={`${model.brand} ${model.name}`}>
         <div className="panel-head">
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 17, fontWeight: 640 }}>{model.brand} {model.name}</div>
@@ -3082,12 +3278,9 @@ function AddForm({ onClose, onSave, onImport, existing = [] }) {
   const [bulkErr, setBulkErr] = useState("");
   const update = (patch) => setForm((f) => ({ ...f, ...patch }));
 
-  useEffect(() => {
-    const onKey = (e) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
+  /* While the bulk-paste box is open Escape closes just that, not the whole
+     form along with everything typed into it. */
+  useDismiss(onClose, !bulkOpen);
 
   const daysLeft = form.launch ? daysFromToday(form.launch) : null;
 
@@ -3125,7 +3318,7 @@ function AddForm({ onClose, onSave, onImport, existing = [] }) {
   return (
     <>
       <div className="shade" onClick={onClose} />
-      <aside className="panel" role="dialog" aria-label="Add a phone">
+      <aside className="panel" role="dialog" aria-modal="true" aria-label="Add a phone">
         <div className="panel-head">
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: 17, fontWeight: 640 }}>Add a phone</div>
@@ -4816,6 +5009,11 @@ function UserManager({ users, onSave, onClose }) {
   const [msg, setMsg]         = useState("");
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
+  /* Escape only backs out of the row being edited while one is open — the
+     whole dialog closing and discarding every pending change would be a
+     nasty surprise mid-edit. */
+  useDismiss(onClose, !editing);
+
   const startEdit = (u) => { setEditing(u.id); setForm({ name: u.name.split(" (")[0], role: u.role }); setNewPin(""); setMsg(""); };
   const cancelEdit = () => { setEditing(null); setNewPin(""); setMsg(""); };
 
@@ -4850,18 +5048,21 @@ function UserManager({ users, onSave, onClose }) {
   return (
     <>
       <div className="shade" style={{ zIndex: 60 }} onClick={onClose} />
-      <div style={{ position: "fixed", zIndex: 61, top: "50%", left: "50%",
+      <div role="dialog" aria-modal="true" aria-labelledby="usermgr-title"
+        style={{ position: "fixed", zIndex: 61, top: "50%", left: "50%",
         transform: "translate(-50%, -50%)", background: "var(--card)",
         border: "1px solid var(--line)", borderRadius: 14, padding: 24,
         width: "min(520px, 94vw)", maxHeight: "85vh", overflowY: "auto",
         display: "flex", flexDirection: "column", gap: 16 }}>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ flex: 1, fontSize: 15, fontWeight: 650 }}>User accounts</div>
+          <div id="usermgr-title" style={{ flex: 1, fontSize: 15, fontWeight: 650 }}>User accounts</div>
           <button className="btn" style={{ padding: "4px 8px" }} onClick={addUser}>
             <Plus size={13} />New user
           </button>
-          <button className="btn btn-icon" onClick={onClose}><X size={14} /></button>
+          <button className="btn btn-icon" onClick={onClose} aria-label="Close user accounts">
+            <X size={14} />
+          </button>
         </div>
 
         {list.map((u) => {
@@ -5139,10 +5340,16 @@ function LoginScreen({ users, onLogin, theme, onTheme, warning = "" }) {
                   maxLength={6}
                 />
               </div>
-              <button className="btn" title={showPin ? "Hide" : "Show"}
+              {/* Emoji are the button's only content, so without a label this
+                  announces as "see-no-evil monkey". type=button also stops it
+                  submitting on Enter from the PIN field. */}
+              <button className="btn" type="button"
+                title={showPin ? "Hide PIN" : "Show PIN"}
+                aria-label={showPin ? "Hide PIN" : "Show PIN"}
+                aria-pressed={showPin}
                 style={{ padding: "0 12px" }}
                 onClick={() => setShowPin(v => !v)}>
-                {showPin ? "🙈" : "👁"}
+                <span aria-hidden="true">{showPin ? "🙈" : "👁"}</span>
               </button>
             </div>
             {error && <div style={{ fontSize: 12, color: "var(--bad)" }}>{error}</div>}
@@ -5756,43 +5963,28 @@ export default function App() {
             <h1>New Model Procurement Tracker</h1>
             <div className="sub">Track new phones from the day you spot them until covers are selling.</div>
           </div>
-          <div className="row" style={{ marginLeft: "auto", flexWrap: "wrap" }}>
-            <button className="btn" data-on={view === "dashboard" ? "1" : "0"} onClick={() => setView("dashboard")}>
-              <BarChart2 size={14} />Dashboard
-            </button>
-            <button className="btn" data-on={view === "board" ? "1" : "0"} onClick={() => setView("board")}>
-              <LayoutGrid size={14} />Board
-            </button>
-            <button className="btn" data-on={view === "table" ? "1" : "0"} onClick={() => setView("table")}>
-              <List size={14} />List
-            </button>
-            <button className="btn" data-on={view === "calendar" ? "1" : "0"} onClick={() => setView("calendar")}>
-              <BarChart2 size={14} />Calendar
-            </button>
-            <button className="btn" data-on={view === "orders" ? "1" : "0"} onClick={() => setView("orders")}>
-              <Package size={14} />Orders
-            </button>
-            <button className="btn" data-on={view === "inward" ? "1" : "0"} onClick={() => setView("inward")}>
-              <Package size={14} />Inward
-              {pendingInward > 0 && (
-                <span style={{ marginLeft: 5, background: "var(--warn)", color: "#000",
-                  borderRadius: 9, padding: "0 6px", fontSize: 10, fontWeight: 700 }}>
-                  {pendingInward}
-                </span>
-              )}
-            </button>
-            <button className="btn" data-on={view === "listing" ? "1" : "0"} onClick={() => setView("listing")}>
-              <CheckCircle2 size={14} />Listing
-              {pendingListings > 0 && (
-                <span style={{ marginLeft: 5, background: "var(--warn)", color: "#000",
-                  borderRadius: 9, padding: "0 6px", fontSize: 10, fontWeight: 700 }}>
-                  {pendingListings}
-                </span>
-              )}
-            </button>
-            <button className="btn" data-on={view === "reports" ? "1" : "0"} onClick={() => setView("reports")}>
-              <FileText size={14} />Reports
-            </button>
+          <div className="nav">
+            {/* A real <nav> with aria-current, so assistive tech can say which
+                view you are on. The active tab is now filled rather than
+                border-tinted — the tint was easy to miss at a glance. */}
+            <nav className="nav-tabs" aria-label="Views">
+              {VIEWS.map(({ key, label, Icon, badge }) => {
+                const count = badge === "inward" ? pendingInward
+                            : badge === "listing" ? pendingListings : 0;
+                const on = view === key;
+                return (
+                  <button key={key} className="btn" onClick={() => setView(key)}
+                    data-on={on ? "1" : "0"}
+                    aria-current={on ? "page" : undefined}>
+                    <Icon size={14} />{label}
+                    {count > 0 && (
+                      <span className="nav-badge" aria-label={`${count} pending`}>{count}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </nav>
+            <div className="nav-meta">
             {/* DB status indicator */}
             <div title={conflictedIds.size ? "A newer version exists in the database — refresh required" : dbOnline
                 ? (syncedAt ? `Last read from the database at ${syncedAt.toLocaleTimeString()}` : "Database connected")
@@ -5806,16 +5998,20 @@ export default function App() {
                     ? "synced " + syncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
                     : "DB live")
                 : "Local only"}
+              {/* These read as "↻" and "⚙" to a screen reader without a label,
+                  and title alone is not a reliable accessible name. */}
               {dbOnline && (
                 <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
-                  onClick={loadFromDB} title="Re-read everything from the database">
-                  ↻
+                  onClick={loadFromDB} title="Re-read everything from the database"
+                  aria-label="Refresh from database">
+                  <span aria-hidden="true">↻</span>
                 </button>
               )}
               {CAN.reset(role) && (
                 <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
-                  onClick={() => setShowDbSetup(true)} title="Configure database">
-                  ⚙
+                  onClick={() => setShowDbSetup(true)} title="Configure database"
+                  aria-label="Configure database connection">
+                  <span aria-hidden="true">⚙</span>
                 </button>
               )}
             </div>
@@ -5855,16 +6051,17 @@ export default function App() {
                 Reset
               </button>
             )}
-            {CAN.addPhone(role) ? (
-              <button className="btn" data-primary="1" onClick={() => setAdding(true)}>
-                <Plus size={14} />Add phone
-              </button>
-            ) : (
-              <button className="btn" style={{ opacity: 0.35, cursor: "not-allowed" }}
-                title={`${ROLES.find(r=>r.key===role)?.label} cannot add phones`}>
-                <Plus size={14} />Add phone
-              </button>
-            )}
+            {/* One button, properly disabled. The old fallback was a separate
+                enabled button faked with opacity:0.35 — it took focus, fired
+                nothing on click, and read as enabled to a screen reader. */}
+            <button className="btn" data-primary={CAN.addPhone(role) ? "1" : undefined}
+              onClick={() => setAdding(true)}
+              disabled={!CAN.addPhone(role)}
+              title={CAN.addPhone(role) ? "Add a phone"
+                : `${ROLES.find(r => r.key === role)?.label} cannot add phones`}>
+              <Plus size={14} />Add phone
+            </button>
+            </div>
           </div>
         </div>
 
@@ -5938,30 +6135,13 @@ export default function App() {
       {adding && <AddForm onClose={() => setAdding(false)} onSave={addPhone}
                       onImport={importPhones} existing={phones} />}
       {confirmReset && (
-        <>
-          <div className="shade" style={{ zIndex: 50 }} onClick={() => setConfirmReset(false)} />
-          <div style={{
-            position: "fixed", zIndex: 51, top: "50%", left: "50%",
-            transform: "translate(-50%, -50%)",
-            background: "var(--card)", border: "1px solid var(--bad)",
-            borderRadius: 14, padding: 28, width: "min(380px, 90vw)",
-            display: "flex", flexDirection: "column", gap: 14
-          }}>
-            <div style={{ fontSize: 16, fontWeight: 640 }}>Delete all phones?</div>
-            <div style={{ fontSize: 13, color: "var(--dim)", lineHeight: 1.6 }}>
-              This will permanently delete every phone and all their data.
-              The list will be empty. There is no undo.
-            </div>
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-              <button className="btn" onClick={() => setConfirmReset(false)}>Cancel</button>
-              <button className="btn" data-primary="1"
-                style={{ background: "var(--bad)", borderColor: "var(--bad)" }}
-                onClick={resetAll}>
-                Yes, delete all
-              </button>
-            </div>
-          </div>
-        </>
+        <ConfirmDialog
+          title="Delete all phones?"
+          body="This will permanently delete every phone and all their data. The list will be empty. There is no undo."
+          confirmLabel="Yes, delete all"
+          onConfirm={resetAll}
+          onCancel={() => setConfirmReset(false)}
+        />
       )}
       {/* Background re-reads (every 90s, and on refocus) are routine and must
           not interrupt anyone. This replaces the old dimming, click-blocking
@@ -6003,7 +6183,12 @@ export default function App() {
           onClose={() => setManageUsers(false)}
         />
       )}
-      {toast  && <div className="toast">{toast}</div>}
+      {/* The live region stays mounted whether or not there is a toast. A
+          region inserted at the same moment as its text is unreliable —
+          screen readers often miss the change entirely. */}
+      <div className="toast-live" role="status" aria-live="polite" aria-atomic="true">
+        {toast && <div className="toast">{toast}</div>}
+      </div>
     </div>
   );
 }
