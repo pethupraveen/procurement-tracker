@@ -24,7 +24,13 @@ import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, Layou
    Everything is a plain "YYYY-MM-DD" string. No date library.      */
 
 const TODAY = new Date(); TODAY.setHours(0, 0, 0, 0);
-const iso   = (d) => d.toISOString().slice(0, 10);
+/* Local calendar date, NOT toISOString(). toISOString() converts to UTC, so
+   local midnight in any zone ahead of UTC (IST is +5:30) slices back to
+   YESTERDAY — every stage date, sales date and deadline landed a day early. */
+const iso   = (d) => {
+  const t = d instanceof Date ? d : new Date(d);
+  return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`;
+};
 const shift = (date, days) => { const d = new Date(date); d.setDate(d.getDate() + days); return iso(d); };
 const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
 const daysFromToday = (date) => daysBetween(iso(TODAY), date);
@@ -639,6 +645,9 @@ const EMPTY_FILTERS = { q: "", needsAction: false, lateOnly: false, soonOnly: fa
 
 const DB_CONFIG_KEY = "proc_tracker_sb";
 
+/* Hard ceiling on any single Supabase request. */
+const DB_TIMEOUT_MS = 12000;
+
 /* Build-time fallback. Set VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY
    (GitHub Actions secrets, or a local .env) and every visitor gets a
    working connection without touching DB Setup. A config saved in this
@@ -702,18 +711,32 @@ function dbClient() {
     ...(extra || {}),
   });
 
+  /* Every request is time-boxed. Without this a request that never settles
+     (dead project, DNS black hole, captive wifi) leaves the caller awaiting
+     forever — which is what pinned the "Loading from database…" screen on
+     screen with no way out. On timeout we surface a real error instead.   */
   const req = async (method, path, body, extra) => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), DB_TIMEOUT_MS);
     try {
       const r = await fetch(base + path, {
         method,
         headers: hdrs(extra),
         body: body ? JSON.stringify(body) : undefined,
+        signal: ctl.signal,
       });
       const text = await r.text();
-      const data = text ? JSON.parse(text) : null;
-      if (!r.ok) return { data: null, error: data?.message || data?.hint || "HTTP " + r.status };
+      let data = null;
+      /* A proxy or error page can answer with non-JSON; don't let JSON.parse
+         throw a misleading "Unexpected token" over the real HTTP status. */
+      try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+      if (!r.ok) return { data: null, error: data?.message || data?.hint || `HTTP ${r.status} ${r.statusText || ""}`.trim() };
       return { data, error: null };
-    } catch(e) { return { data: null, error: e.message }; }
+    } catch (e) {
+      if (e?.name === "AbortError")
+        return { data: null, error: `Database did not respond within ${Math.round(DB_TIMEOUT_MS / 1000)}s` };
+      return { data: null, error: e.message || "Network error" };
+    } finally { clearTimeout(timer); }
   };
 
   return {
@@ -929,6 +952,13 @@ const CSS = `
   display: flex; flex-direction: column; animation: slide .25s ease-out;
 }
 @keyframes slide { from { transform: translateX(30px); opacity: 0; } }
+@keyframes bootslide { 0% { transform: translateX(-100%); } 100% { transform: translateX(350%); } }
+@keyframes syncpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+/* Respect the OS "reduce motion" setting rather than animating regardless. */
+@media (prefers-reduced-motion: reduce) {
+  @keyframes bootslide { 0%,100% { transform: translateX(120%); } }
+  @keyframes syncpulse { 0%,100% { opacity: 1; } }
+}
 .app .panel-head { padding: 16px 18px; border-bottom: 1px solid var(--line); display: flex; gap: 12px; align-items: flex-start; }
 .app .panel-body { padding: 18px; overflow-y: auto; flex: 1; display: grid; gap: 18px; }
 .app .panel-foot { padding: 14px 18px; border-top: 1px solid var(--line); display: flex; gap: 8px; }
@@ -4996,7 +5026,27 @@ function DBSetupScreen({ onDone, onSkip }) {
    Shown when no session is active. Pick a user, enter PIN.
    Admin can also reach User Management from the nav bar.          */
 
-function LoginScreen({ users, onLogin, theme, onTheme }) {
+/* ── BOOT SCREEN ─────────────────────────────────────────────────
+   Shown for the single first read only, never for a background sync.
+   It is a real screen rather than an overlay, so nothing sits half-drawn
+   underneath a grey wash. DB_TIMEOUT_MS bounds how long it can last. */
+function BootScreen({ theme }) {
+  return (
+    <div className="app" data-theme={theme} style={{ minHeight: "100vh",
+      display: "flex", flexDirection: "column", alignItems: "center",
+      justifyContent: "center", gap: 14 }}>
+      <style>{CSS}</style>
+      <Package size={26} style={{ color: "var(--accent)" }} />
+      <div style={{ fontSize: 13, color: "var(--dim)" }}>Connecting to the database…</div>
+      <div style={{ width: 160, height: 3, borderRadius: 3, background: "var(--line)", overflow: "hidden" }}>
+        <div style={{ width: "40%", height: "100%", background: "var(--accent)",
+          animation: "bootslide 1.1s ease-in-out infinite" }} />
+      </div>
+    </div>
+  );
+}
+
+function LoginScreen({ users, onLogin, theme, onTheme, warning = "" }) {
   const [selected, setSelected] = useState(null);
   const [pin, setPin]           = useState("");
   const [error, setError]       = useState("");
@@ -5004,6 +5054,7 @@ function LoginScreen({ users, onLogin, theme, onTheme }) {
 
   const attempt = () => {
     if (!selected) return;
+    if (pin.length < 4) { setError("PIN is at least 4 digits."); return; }
     if (hashPin(pin) === selected.pin) {
       setError(""); onLogin(selected);
     } else {
@@ -5026,6 +5077,20 @@ function LoginScreen({ users, onLogin, theme, onTheme }) {
           <h1 style={{ margin: "0 0 4px", fontSize: 22 }}>Procurement Tracker</h1>
           <div className="sub">Select your account to continue</div>
         </div>
+
+        {/* A failed first read used to be invisible here — you simply got the
+            built-in demo accounts with no hint that the DB was down. */}
+        {warning && (
+          <div className="card" style={{ fontSize: 12, color: "var(--warn)",
+            display: "flex", gap: 8, alignItems: "flex-start", lineHeight: 1.5 }}>
+            <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+            <span>{warning}<br />
+              <span style={{ color: "var(--dim)" }}>
+                Showing built-in accounts only. Changes will not be saved.
+              </span>
+            </span>
+          </div>
+        )}
 
         {/* user grid */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -5081,8 +5146,12 @@ function LoginScreen({ users, onLogin, theme, onTheme }) {
               </button>
             </div>
             {error && <div style={{ fontSize: 12, color: "var(--bad)" }}>{error}</div>}
+            {/* Was dimmed to 0.4 but still clickable, so a short PIN read as
+                "Wrong PIN. Try again." instead of "keep typing". */}
             <button className="btn" data-primary="1" onClick={attempt}
-              style={{ opacity: pin.length >= 4 ? 1 : 0.4 }}>
+              disabled={pin.length < 4}
+              style={{ opacity: pin.length >= 4 ? 1 : 0.4,
+                cursor: pin.length >= 4 ? "pointer" : "not-allowed" }}>
               Sign in
             </button>
           </div>
@@ -5103,7 +5172,6 @@ function LoginScreen({ users, onLogin, theme, onTheme }) {
 
 export default function App() {
   /* ── DB config state ── */
-  const [dbReady, setDbReady]   = useState(() => !!dbGetConfig());
   const [dbOnline, setDbOnline] = useState(false);
   const [dbError, setDbError]   = useState("");
   const [conflictedIds, setConflictedIds] = useState(() => new Set());
@@ -5121,7 +5189,14 @@ export default function App() {
 
   /* ── app state ── */
   const [phones, setPhones] = useState(EMPTY);
-  const [loading, setLoading] = useState(false);
+  /* Two different things used to share one `loading` flag, which is why a
+     routine 90-second background re-read threw up the same full-screen,
+     click-blocking overlay as the very first load.
+       booting — the one first read, before we know who the users are
+       syncing — every later re-read; must never block the UI            */
+  const [booting, setBooting] = useState(() => !!dbGetConfig());
+  const [syncing, setSyncing] = useState(false);
+  const syncingRef = useRef(false);
   const [openId, setOpenId]   = useState(null);
   const openIdRef = useRef(openId);
   const [adding, setAdding]   = useState(false);
@@ -5135,21 +5210,22 @@ export default function App() {
 
   openIdRef.current = openId;
   conflictedIdsRef.current = conflictedIds;
+  syncingRef.current = syncing;
 
   /* ── load data from Supabase on mount & after login ── */
   const loadFromDB = async ({ background = false } = {}) => {
-    if (!dbGetConfig()) return;
+    if (!dbGetConfig()) { setBooting(false); return; }
     const shouldKeepLocalEdits = () =>
       background && (openIdRef.current || conflictedIdsRef.current.size);
     /* A background reload replaces the entire phone list. Never replace an
        active editor's model or a conflicted local edit behind the user's back.
        The manual refresh button remains the explicit discard-and-reload path. */
     if (shouldKeepLocalEdits()) return;
-    setLoading(true);
+    setSyncing(true);
     const [up, ph] = await Promise.all([dbLoadUsers(), dbLoadPhones()]);
     /* The user may have opened an editor or hit a conflict while this request
        was in flight. Do not apply an automatic response over that local state. */
-    if (shouldKeepLocalEdits()) { setLoading(false); return; }
+    if (shouldKeepLocalEdits()) { setSyncing(false); setBooting(false); return; }
     if (up.error || ph.error) {
       setDbOnline(false); setDbError(up.error || ph.error);
     } else {
@@ -5172,7 +5248,11 @@ export default function App() {
       conflictedIdsRef.current = new Set();
       setConflictedIds(new Set());
     }
-    setLoading(false);
+    /* Always clear both, success or failure — a failed first read must drop
+       you onto the login screen with a warning, not strand you on a
+       spinner. */
+    setSyncing(false);
+    setBooting(false);
   };
 
   useEffect(() => { loadFromDB(); }, []);   // on mount
@@ -5183,7 +5263,12 @@ export default function App() {
      while it is in view.                                                */
   useEffect(() => {
     if (!dbOnline) return;
-    const refresh = () => { if (!document.hidden) loadFromDB({ background: true }); };
+    /* Refocus and the 90s timer can fire at the same moment, stacking two
+       reads — and two "syncing" states — on top of each other. One at a time. */
+    const refresh = () => {
+      if (document.hidden || syncingRef.current) return;
+      loadFromDB({ background: true });
+    };
     const timer = setInterval(refresh, 90000);
     window.addEventListener("focus", refresh);
     return () => { clearInterval(timer); window.removeEventListener("focus", refresh); };
@@ -5636,10 +5721,18 @@ export default function App() {
   /* ── DB setup flow: Admin must configure Supabase first ── */
   if (showDbSetup && CAN.reset(role)) return (
     <DBSetupScreen
-      onDone={() => { setShowDbSetup(false); setDbReady(true); loadFromDB(); }}
-      onSkip={() => setShowDbSetup(false)}
+      onDone={() => { setShowDbSetup(false); setBooting(true); loadFromDB(); }}
+      onSkip={() => { setShowDbSetup(false); setBooting(false); }}
     />
   );
+
+  /* ── first read in progress ──────────────────────────────────────
+     The login screen must not appear before the real user list lands.
+     It used to render instantly against DEFAULT_USERS, so you could sign
+     in as "Arjun (Admin)" with the built-in PIN 1234 — and then be thrown
+     straight back out a second later when the live list arrived and had no
+     such account. Wait out the one first read instead. */
+  if (booting) return <BootScreen theme={theme} />;
 
   /* ── show login screen when no session ── */
   if (!session) return (
@@ -5648,6 +5741,7 @@ export default function App() {
       onLogin={login}
       theme={theme}
       onTheme={() => setTheme(t => t === "dark" ? "light" : "dark")}
+      warning={dbOnline ? "" : (dbError ? "Database unreachable: " + dbError : "")}
     />
   );
 
@@ -5708,7 +5802,7 @@ export default function App() {
               <div style={{ width: 8, height: 8, borderRadius: "50%",
                 background: conflictedIds.size ? "var(--bad)" : dbOnline ? "var(--ok)" : "var(--warn)" }} />
               {conflictedIds.size ? "Refresh required" : dbOnline
-                ? (loading ? "syncing…" : syncedAt
+                ? (syncing ? "syncing…" : syncedAt
                     ? "synced " + syncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
                     : "DB live")
                 : "Local only"}
@@ -5869,12 +5963,18 @@ export default function App() {
           </div>
         </>
       )}
-      {loading && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)",
-          zIndex: 80, display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <div className="card" style={{ padding: "24px 36px", fontSize: 14 }}>
-            Loading from database…
-          </div>
+      {/* Background re-reads (every 90s, and on refocus) are routine and must
+          not interrupt anyone. This replaces the old dimming, click-blocking
+          modal with a small corner pill that cannot be clicked through. */}
+      {syncing && (
+        <div style={{ position: "fixed", bottom: 16, left: 16, zIndex: 80,
+          pointerEvents: "none", display: "flex", alignItems: "center", gap: 8,
+          padding: "7px 12px", borderRadius: 999, fontSize: 11,
+          background: "var(--card)", border: "1px solid var(--line)",
+          color: "var(--dim)", boxShadow: "0 2px 10px rgba(0,0,0,0.25)" }}>
+          <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--accent)",
+            animation: "syncpulse 1s ease-in-out infinite" }} />
+          Syncing…
         </div>
       )}
       {manageUsers && CAN.manageUsers(role) && (
