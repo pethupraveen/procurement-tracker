@@ -14,7 +14,7 @@ drop table if exists users   cascade;
 create table users (
   id          text        not null,
   name        text        not null,
-  role        text        not null check (role in ('admin','procurement','warehouse','catalog','sales')),
+  role        text        not null check (role in ('admin','procurement','warehouse','catalog','sales','customer_care')),
   pin         text        not null,
   avatar      text        not null default 'U',
   created_at  timestamptz not null default now(),
@@ -82,13 +82,18 @@ order by array_position(
 
 -- ── Default users ───────────────────────────────────────────────
 -- PINs hashed with djb2 (same as the app):
---   admin=1234  procurement=1111  warehouse=2222  catalog=3333  sales=4444
+--   admin=1234  procurement=1111  warehouse=2222  catalog=3333
+--   sales=4444  customer_care=5555
+-- These were out of date: they matched no version of hashPin() in the app, so
+-- a database seeded from this file could not be signed into with any of the
+-- PINs above. Regenerated from the current djb2 implementation.
 insert into users (id, name, role, pin, avatar) values
-  ('u1', 'Arjun (Admin)',       'admin',       '1vnp9v', 'A'),
-  ('u2', 'Priya (Procurement)', 'procurement', '11ky2l', 'P'),
-  ('u3', 'Ravi (Warehouse)',    'warehouse',   '11kp2h', 'R'),
-  ('u4', 'Sunita (Catalog)',    'catalog',     '11kq2i', 'S'),
-  ('u5', 'Kiran (Sales)',       'sales',       '11kr2j', 'K')
+  ('u1', 'Arjun (Admin)',        'admin',         'yhvold', 'A'),
+  ('u2', 'Priya (Procurement)',  'procurement',   'yhvpdx', 'P'),
+  ('u3', 'Ravi (Warehouse)',     'warehouse',     'yhwepx', 'R'),
+  ('u4', 'Sunita (Catalog)',     'catalog',       'yhx77p', 'S'),
+  ('u5', 'Kiran (Sales)',        'sales',         'yhrx8l', 'K'),
+  ('u6', 'Meena (Customer Care)','customer_care', 'yhspqd', 'M')
 on conflict (id) do update
   set name   = excluded.name,
       role   = excluded.role,
