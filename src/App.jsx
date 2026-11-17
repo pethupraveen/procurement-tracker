@@ -4,7 +4,8 @@ import { PERM_KEYS, PERM_LABELS, DEFAULT_PERMS, LOCKED_TO_ADMIN,
 /* The Phase 1 audit fixes that are worth asserting live in rules.js so the
    existing zero-dependency self-check can run them — see roles.selfcheck.mjs. */
 import { exportCell, safeUrl as safeUrlOf, wouldStrandAdmins, isLastAdmin,
-         materialColumns as materialColumnsOf, materialHeader } from "./rules.js";
+         materialColumns as materialColumnsOf, materialHeader,
+         projectRef as dbProjectRef, isConfigOverride } from "./rules.js";
 /* CalendarDays and Inbox are aliased on import: the local components below are
    already called Calendar and Table, and Calendar/Inward previously reused the
    Dashboard and Orders icons, so two pairs of tabs were visually identical. */
@@ -707,6 +708,22 @@ function dbSaveConfig(url, key) {
   localStorage.setItem(DB_CONFIG_KEY, JSON.stringify({ url: url.trim().replace(/\/$/, ""), key: key.trim() }));
 }
 function dbClearConfig() { localStorage.removeItem(DB_CONFIG_KEY); }
+
+/* Is this browser pointed somewhere other than the build's own configuration?
+   Used to label the header, because the whole point of overriding the
+   connection is to work against a test project — and the one mistake that
+   costs real data is not noticing which project you are looking at. */
+function dbConfigIsOverride() {
+  try {
+    return isConfigOverride(JSON.parse(localStorage.getItem(DB_CONFIG_KEY) || "null"), ENV_DB_CONFIG);
+  } catch { return false; }   // storage blocked or unparseable: no override
+}
+
+/* Is there a build-time configuration to fall back to at all? */
+const dbHasEnvConfig = () => !!(ENV_DB_CONFIG.url && ENV_DB_CONFIG.key);
+
+/* dbProjectRef (rules.js projectRef) gives the subdomain of a Supabase URL —
+   enough to tell two projects apart on screen, and not a credential. */
 
 /* ── SESSION PERSISTENCE ─────────────────────────────────────────
    The logged-in user is written to localStorage so a page refresh
@@ -5363,6 +5380,11 @@ function DBSetupScreen({ onDone, onSkip }) {
 
   const save = () => { dbSaveConfig(url, key); onDone(); };
 
+  /* Without this there is no way back. dbSaveConfig writes to localStorage,
+     which wins over the build-time config for good, so a browser pointed at a
+     test project stayed pointed at it — and "Skip" only closes the screen. */
+  const useBuiltIn = () => { dbClearConfig(); onDone(); };
+
   return (
     <div className="app" data-theme="dark" style={{ minHeight: "100vh", display: "flex",
       flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
@@ -5406,6 +5428,12 @@ function DBSetupScreen({ onDone, onSkip }) {
               style={{ opacity: url.trim() && key.trim() ? 1 : 0.4 }}>
               Test connection
             </button>
+            {dbHasEnvConfig() && dbConfigIsOverride() && (
+              <button className="btn" onClick={useBuiltIn}
+                title={`Discard this browser's override and use ${dbProjectRef(ENV_DB_CONFIG.url)} again`}>
+                ↩ Back to {dbProjectRef(ENV_DB_CONFIG.url)}
+              </button>
+            )}
             {status === "ok" && (
               <button className="btn" data-primary="1" onClick={save}>
                 Save and continue →
@@ -6313,6 +6341,19 @@ export default function App() {
                     ? "synced " + syncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
                     : "DB live")
                 : "Local only"}
+              {/* The connection is overridden in this browser, so what is on
+                  screen is NOT the project this build ships with. Everything
+                  else in this header looks identical either way, which is how
+                  someone ends up running a destructive test against live
+                  data. */}
+              {dbConfigIsOverride() && (
+                <span title={`This browser is pointed at ${dbProjectRef(dbGetConfig()?.url)}, not the build's own project${dbHasEnvConfig() ? ` (${dbProjectRef(ENV_DB_CONFIG.url)})` : ""}. Use the gear to change it back.`}
+                  style={{ fontSize: 10, fontWeight: 650, letterSpacing: 0.3,
+                    padding: "1px 6px", borderRadius: 999, whiteSpace: "nowrap",
+                    color: "var(--warn)", border: "1px solid var(--warn)" }}>
+                  ⚠ {dbProjectRef(dbGetConfig()?.url) || "override"}
+                </span>
+              )}
               {/* These read as "↻" and "⚙" to a screen reader without a label,
                   and title alone is not a reliable accessible name. */}
               {dbOnline && (

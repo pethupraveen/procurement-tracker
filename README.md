@@ -188,6 +188,33 @@ VITE_SUPABASE_ANON_KEY=<anon-or-publishable-key>
 Without these values, the app opens the Admin-only **DB Setup** screen. The
 same values can be entered there and stored in that browser's local storage.
 
+### Pointing one browser at a different project
+
+`.env.local` and the GitHub Actions secrets configure every visitor, so
+<code>npm run dev</code> talks to whatever project they name — in this
+repository, the same one the live site uses. **Local development is therefore
+production access by default.** Anything destructive you try locally, a bulk
+receive or a reset, lands on real rows.
+
+To work against a throwaway project instead, without touching `.env.local` or
+anyone else's machine:
+
+1. Create a second Supabase project, then run
+   [schema-bootstrap.sql](schema-bootstrap.sql),
+   [schema-roles.sql](schema-roles.sql) and, if you need the emailed report,
+   [schema-report-approval.sql](schema-report-approval.sql) on it.
+2. Sign in as an admin and press the **⚙** button in the header.
+3. Paste the test project's URL and anon key, **Test connection**, then
+   **Save and continue**.
+
+A config saved in a browser always beats the build-time values, so only that
+browser moves. While one is in force the header shows a **⚠ project-ref** pill
+next to the connection dot — if you do not see it, you are on the shipped
+project, which is to say production. **↩ Back to _ref_** on the same screen
+discards the override and returns that browser to the build's own project.
+
+The pill shows the project ref only, never a key.
+
 To create the database, run [schema-bootstrap.sql](schema-bootstrap.sql) in the
 Supabase SQL editor, then [schema-roles.sql](schema-roles.sql). Use
 [schema.sql](schema.sql) only to wipe an existing database and start again.

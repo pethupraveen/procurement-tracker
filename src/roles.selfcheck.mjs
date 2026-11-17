@@ -9,7 +9,7 @@ import {
 } from "./roles.js";
 import {
   exportCell, safeUrl, adminIdsOf, isLastAdmin, wouldStrandAdmins,
-  materialColumns, materialHeader,
+  materialColumns, materialHeader, projectRef, isConfigOverride,
 } from "./rules.js";
 
 const STAGE_KEYS = ["research", "planned", "ordered", "production", "received", "live", "unprocured"];
@@ -150,5 +150,35 @@ assert.deepEqual(materialColumns([], KNOWN), KNOWN);
 assert.deepEqual(materialColumns(null, KNOWN), KNOWN, "no SKUs in view is not a crash");
 assert.equal(materialHeader(""), "(no material)");
 assert.equal(materialHeader("TPU+PC"), "TPU+PC");
+
+/* ── which Supabase project this browser is pointed at ── */
+assert.equal(projectRef("https://abcdefgh.supabase.co"), "abcdefgh");
+assert.equal(projectRef("https://abcdefgh.supabase.co/"), "abcdefgh");
+assert.equal(projectRef("https://abcdefgh.supabase.co/rest/v1/phones"), "abcdefgh",
+  "a URL carrying a path still names its project");
+assert.equal(projectRef("http://localhost:54321"), "localhost",
+  "a local Supabase stack has no project ref, but must not crash");
+assert.equal(projectRef(""), "", "and neither an empty value");
+assert.equal(projectRef(null), "");
+assert.equal(projectRef("not a url"), "", "nor junk");
+
+const ENV = { url: "https://live.supabase.co", key: "live-key" };
+assert.equal(isConfigOverride({ url: "https://test.supabase.co", key: "test-key" }, ENV), true,
+  "a different project is an override");
+assert.equal(isConfigOverride({ url: ENV.url, key: ENV.key }, ENV), false,
+  "the same project and key is not");
+assert.equal(isConfigOverride({ url: ENV.url, key: "rotated-key" }, ENV), true,
+  "same project, different key: still an override");
+assert.equal(isConfigOverride(null, ENV), false, "nothing saved is not an override");
+assert.equal(isConfigOverride({}, ENV), false);
+assert.equal(isConfigOverride({ url: "https://test.supabase.co" }, ENV), false,
+  "half a config cannot connect, so it is not an override");
+assert.equal(isConfigOverride({ key: "test-key" }, ENV), false);
+/* With no build-time config, anything saved IS the connection — and the
+   header must not then cry "override" at the only config there is... but it
+   must still report one, because there is nothing to fall back to. The caller
+   gates on dbHasEnvConfig() for the "back to built-in" button; this stays
+   truthful about the comparison. */
+assert.equal(isConfigOverride({ url: "https://test.supabase.co", key: "k" }, { url: "", key: "" }), true);
 
 console.log("roles.js OK");

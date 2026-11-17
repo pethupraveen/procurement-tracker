@@ -80,3 +80,26 @@ export function materialColumns(present, known) {
 }
 
 export const materialHeader = (mat) => mat || "(no material)";
+
+/* ── Which Supabase project is this browser pointed at? ──────────
+   The app takes its connection from the build (VITE_SUPABASE_URL /
+   VITE_SUPABASE_ANON_KEY) unless a config saved in this browser
+   overrides it, and the saved one always wins. That override is how
+   one machine is pointed at a test project while everything else
+   uses the shipped one — and the mistake it exists to prevent is
+   running a destructive test against live data without noticing,
+   so the app has to be able to say which is in force.           */
+
+/* The project ref: the subdomain of a Supabase URL. Enough to tell
+   two projects apart on screen, and it is not a credential. */
+export function projectRef(url) {
+  try { return new URL(String(url ?? "")).hostname.split(".")[0]; }
+  catch { return ""; }
+}
+
+/* Is `saved` pointing somewhere other than `env`? A saved config
+   missing either half is not a usable override, so it is not one. */
+export function isConfigOverride(saved, env) {
+  if (!saved?.url || !saved?.key) return false;
+  return saved.url !== env?.url || saved.key !== env?.key;
+}
