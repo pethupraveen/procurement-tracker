@@ -891,7 +891,10 @@ async function reportRequest(path, body = {}) {
     });
     const responseBody = await res.text();
     let data = null; try { data = responseBody ? JSON.parse(responseBody) : null; } catch {}
-    if (!res.ok) return { error: data?.error || `Report request failed (${res.status})` };
+    /* retryable means the Edge Function handed the approval code back, so the
+       same code still works — see AUD-029 in send-stp-report/index.ts. */
+    if (!res.ok) return { error: data?.error || `Report request failed (${res.status})`,
+                          retryable: !!data?.retryable };
     return { data };
   } catch (e) {
     return { error: e.message };
@@ -4536,7 +4539,10 @@ function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
     setEmailState("sending");
     const result = await dbSendReport(approval.approvalId, approvalCode);
     setEmailState("idle");
-    if (result.error) return onNotify(`⚠ ${result.error}`);
+    /* The approval and the typed code are deliberately left in place on
+       failure: the server releases an unused code, so Send works again. */
+    if (result.error) return onNotify(`⚠ ${result.error}`
+      + (result.retryable ? " — your code is still valid, press Send again." : ""));
     setApproval(null); setApprovalCode(""); onNotify("Report emailed to the configured recipients");
   };
 

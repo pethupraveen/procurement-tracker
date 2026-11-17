@@ -37,21 +37,45 @@ Deno.serve(async (req: Request) => {
   const claim = await fetch(`${url}/rest/v1/rpc/claim_report_approval`, { method: "POST", headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ p_id: body.approvalId, p_code_hash: codeHash }) });
   if (!claim.ok || await claim.json() !== true) return reply(req, origin, { error: "Invalid or expired approval" }, 403);
 
-  await fetch(`${url}/rest/v1/report_send_log`, { method: "POST", headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ approval_id: body.approvalId, status: "sending", recipient_count: recipients.length }) });
+  // AUD-029: the claim above consumes the approval, so every failure path from
+  // here on has to hand it back or a transient fault burns a code the operator
+  // can only replace three times an hour. release_report_approval refuses once
+  // the send log says 'sent', so this can never un-consume a real send.
+  const release = async () => {
+    await fetch(`${url}/rest/v1/rpc/release_report_approval`, { method: "POST", headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ p_id: body.approvalId }) }).catch(() => {});
+  };
+  const failed = async (message: string, status: number, logError?: string) => {
+    if (logError) await fetch(`${url}/rest/v1/report_send_log?approval_id=eq.${body.approvalId}`, { method: "PATCH", headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ status: "failed", error: logError }) });
+    await release();
+    return reply(req, origin, { error: message, retryable: true }, status);
+  };
+
+  // Upsert, not insert: approval_id is the primary key here, so a retry of a
+  // released approval (AUD-029) hits the existing row. A plain insert failed
+  // silently and left the previous attempt's error text on a row this run then
+  // marked 'sent', so clear it explicitly.
+  await fetch(`${url}/rest/v1/report_send_log?on_conflict=approval_id`, { method: "POST", headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json", Prefer: "resolution=merge-duplicates" }, body: JSON.stringify({ approval_id: body.approvalId, status: "sending", recipient_count: recipients.length, error: null, resend_email_id: null, sent_at: null }) });
   const phonesResponse = await fetch(`${url}/rest/v1/phones?select=brand,name,stage,po,skus&stage=in.(ordered,production)&order=id`, { headers: { apikey: key, Authorization: `Bearer ${key}` } });
   const phones = phonesResponse.ok ? await phonesResponse.json() : null;
-  if (!Array.isArray(phones)) return reply(req, origin, { error: "Could not build report" }, 502);
-  const headers = ["Brand", "Model", "Stage", "PO", "Material", "SKUs", "Units", "STP File"];
+  if (!Array.isArray(phones)) return failed("Could not build report", 502, "Could not read phones");
+  // AUD-013: must match STP_REPORT_HEADERS and materialHeader() in src/rules.js
+  // exactly — this is the copy that reaches the MD and the factory, and it used
+  // to label the PO column "PO" and an unset material "-" where the two
+  // in-app exports said "PO Number" and "(no material)".
+  const headers = ["Brand", "Model", "Stage", "PO Number", "Material", "SKUs", "Units", "STP File"];
   const rows: unknown[][] = phones.flatMap((m) => {
-    const groups = new Map<string, any[]>(); for (const sku of Array.isArray(m.skus) ? m.skus : []) { const material = String(sku?.material || "-"); groups.set(material, [...(groups.get(material) || []), sku]); }
+    const groups = new Map<string, any[]>(); for (const sku of Array.isArray(m.skus) ? m.skus : []) { const material = String(sku?.material || "") || "(no material)"; groups.set(material, [...(groups.get(material) || []), sku]); }
     return [...groups].map(([material, list]) => { const values = new Set(list.map((s) => s.stpRequired === true ? "Required" : s.stpRequired === false ? "Not required" : "Not decided")); return [m.brand, m.name, m.stage === "ordered" ? "Ordered" : "Production", m.po || "", material, list.map((s) => s.sku).filter(Boolean).join(" / "), list.reduce((n, s) => n + (Number(s.units) || 0), 0), values.size === 1 ? [...values][0] : "Mixed"]; });
   }).slice(0, 500);
-  if (!rows.length) return reply(req, origin, { error: "No STP rows to send" }, 422);
+  // Nothing to send is not the operator's mistake and must not cost them the code.
+  if (!rows.length) return failed("No STP rows to send", 422, "No STP rows");
   const table = `<table style="border-collapse:collapse;width:100%;font-family:system-ui">${[headers, ...rows].map((r, i) => `<tr>${r.map((v) => `<${i ? "td" : "th"} style="text-align:left;padding:6px;border-bottom:1px solid #ddd">${esc(v)}</${i ? "td" : "th"}>`).join("")}</tr>`).join("")}</table>`;
   const csv = [headers, ...rows].map((r) => r.map(csvCell).join(",")).join("\n");
   const sent = await fetch("https://api.resend.com/emails", { method: "POST", headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json", "Idempotency-Key": `stp-report/${body.approvalId}` }, body: JSON.stringify({ from, to: recipients, subject: "STP file requirement report", html: `<p>Current model and material STP requirements.</p>${table}`, attachments: [{ filename: "stp_requirement.csv", content: btoa(unescape(encodeURIComponent(csv))) }] }) });
   const result = await sent.text();
-  if (!sent.ok) { await fetch(`${url}/rest/v1/report_send_log?approval_id=eq.${body.approvalId}`, { method: "PATCH", headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ status: "failed", error: `Resend ${sent.status}` }) }); return reply(req, origin, { error: "Could not send report" }, 502); }
+  // The Idempotency-Key above is scoped to the approval id, so retrying with
+  // the same released code cannot send the report twice at Resend.
+  if (!sent.ok) return failed("Could not send report", 502, `Resend ${sent.status}`);
   let messageId = null; try { messageId = JSON.parse(result).id || null; } catch {}
   await fetch(`${url}/rest/v1/report_send_log?approval_id=eq.${body.approvalId}`, { method: "PATCH", headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ status: "sent", resend_email_id: messageId, sent_at: new Date().toISOString() }) });
   return reply(req, origin, { ok: true });
