@@ -207,22 +207,29 @@ flowchart LR
 Every push runs <code>.github/workflows/ci.yml</code>, which installs with
 <code>npm ci</code>, runs the role self-check, and builds <code>dist/</code>.
 
-> There is **no deploy workflow in this repository.** This section previously
-> described a <code>.github/workflows/deploy.yml</code> that publishes
-> <code>dist/</code> to GitHub Pages on a push to <code>main</code>; no such
-> file has ever existed here, so however the live app is being published, it
-> is not from a workflow in this repository. How it is deployed is an open
-> question — see <code>deliverables/BRD.md</code> OQ-10 and audit finding
-> AUD-007. Until that is answered, publish by building locally and uploading
-> <code>dist/</code> the way it is being done today.
+> **There is currently no deploy workflow in this repository, and pushing to
+> <code>main</code> no longer publishes anything.**
+>
+> There was one. <code>.github/workflows/deploy.yml</code> built
+> <code>dist/</code> and published it to GitHub Pages, and its last successful
+> runs were in September 2026. It was deleted in commit <code>afad51c</code>
+> ("Add Customer Care team and move permissions into the database") — a commit
+> about permissions, which suggests the deletion was not intended. Audit
+> finding AUD-007 recorded the absence; this note records how it happened.
+>
+> Recover it with <code>git show 4fa2755:.github/workflows/deploy.yml</code>,
+> the last version before the deletion. Check it before restoring it: the
+> preceding commit is titled "Allow clean manual Pages deployments", so
+> somebody may have been moving to manual deploys on purpose. Until that is
+> settled, publish by building locally and uploading <code>dist/</code>.
 
-To add GitHub Pages publishing later:
-
-1. In **Settings -> Pages -> Source**, select **GitHub Actions**.
-2. Add a deploy job. Note that the app reads its Supabase URL and anon key
-   from the browser's local storage via its own setup screen, not from
-   <code>import.meta.env</code>, so build-time secrets are not what configures
-   it — a fresh deployment asks the first admin for both.
+A restored deploy job should keep the
+<code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> Actions
+secrets. They are read at build time (<code>src/App.jsx</code>,
+<code>ENV_DB_CONFIG</code>) and baked into the bundle, so every visitor gets a
+working connection without being shown the DB Setup screen. A config saved in a
+given browser's local storage still wins over them, which is how an admin
+points one machine at a different project.
 
 <code>vite.config.js</code> uses <code>base: "./"</code>, allowing the deployed
 app to work from the <code>/procurement-tracker/</code> project subpath.
