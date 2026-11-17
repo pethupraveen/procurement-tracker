@@ -399,7 +399,10 @@ function derive(model, all) {
     ...model,
     index,
     terminal,
-    units: allSkus(model).reduce((sum, r) => sum + (r.units || 0), 0),
+    /* A child orders nothing — its stock is the master's — so it reports no
+       planned units whatever is stored on its rows. This also corrects rows
+       saved before children stopped carrying a quantity, without a migration. */
+    units: master ? 0 : allSkus(model).reduce((sum, r) => sum + (r.units || 0), 0),
     progress: terminal ? 0 : Math.round(((index + 1) / PIPELINE.length) * 100),
     runway: runwayOf(model),
     daysToLaunch: daysFromToday(model.launch),
@@ -2141,7 +2144,12 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
       const material = parts[1] || "";
       /* join everything after the material so a pasted "5,000" isn't read as 5 */
       const n = parseInt(parts.slice(2).join("").replace(/[^\d]/g, ""), 10);
-      parsed.push(skuRow(sku, material, Number.isFinite(n) ? n : defaultQtyFor(material)));
+      /* A child is listed from its master's stock, so a quantity against it
+         would be ordered twice or not at all. Paste "SKU, Material" and any
+         third column is ignored rather than silently kept. */
+      parsed.push(model.isChild
+        ? skuRow(sku, material, 0)
+        : skuRow(sku, material, Number.isFinite(n) ? n : defaultQtyFor(material)));
     });
     if (!parsed.length) { setBulkErr("No valid rows found. Each line needs at least a SKU."); return; }
     setDraft((d) => mode === "append"
@@ -2152,13 +2160,19 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
   };
 
   const save = () => {
-    const cleaned = draft.filter((r) => r.sku.trim() || r.material.trim() || r.units > 0);
+    const cleaned = draft
+      .filter((r) => r.sku.trim() || r.material.trim() || r.units > 0)
+      /* Last line of defence: whatever the editor did, a child's SKUs are
+         saved with no quantity. Nothing is ordered against them. */
+      .map((r) => (model.isChild ? { ...r, units: 0 } : r));
     onSave(model.id, cleaned);
     setSaved(true); setTimeout(() => setSaved(false), 2000);
   };
 
   const missingSku = draft.filter((r) => !r.sku.trim()).length;
-  const totalUnits = draft.reduce((s, r) => s + (r.units || 0), 0);
+  const totalUnits = model.isChild ? 0 : draft.reduce((s, r) => s + (r.units || 0), 0);
+  const unmappedChild = model.isChild
+    ? childSkuMappingProblems(draft, allSkus(model.master || {}).map((r) => r.rid)).length : 0;
 
   return (
     <div>
@@ -2175,9 +2189,12 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
           {model.isChild && (
             <div style={{ marginTop: 8, color: "var(--warn)" }}>
               This model is a child of <strong>{model.master?.name}</strong>, so these
-              SKUs are listings, not orders. Units are ignored — nothing is ordered
-              against them. Each one must say which {model.master?.name} SKU it
-              sells from before this model can be listed.
+              are listings, not orders. <strong>Add a SKU code only — no quantity.</strong>{" "}
+              Nothing is ordered against them and the stock is {model.master?.name}'s.
+              Each one must say which {model.master?.name} SKU it sells from.
+              {unmappedChild > 0 && (
+                <> <strong>{unmappedChild} still unmapped.</strong></>
+              )}
             </div>
           )}
         </div>
@@ -2209,6 +2226,10 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
                       <select value={r.material} style={{ fontSize: 12 }}
                         onChange={(e) => {
                           const name = e.target.value;
+                          /* A child orders nothing, so picking a material must
+                             not quietly fill in a quantity behind the hidden
+                             Units column. */
+                          if (model.isChild) { editRow(r.rid, { material: name, units: 0 }); return; }
                           /* fill units only if the buyer hasn't typed their own figure */
                           const untouched = !r.units || r.units === defaultQtyFor(r.material);
                           editRow(r.rid, untouched
@@ -6427,6 +6448,9 @@ export default function App() {
       const u = updated.find((p) => p.id === id); if (u) persist(u);
       return updated;
     });
+    /* Linking clears every mapping, so a model can never be released by the
+       act of linking alone — it becomes ready on the save that maps it, which
+       saveSKU above handles. Nothing to release here. */
     saved(masterId == null ? "Master link cleared"
       : `Child of ${next.brand} ${next.name} — it will be listed from that stock`);
   };
@@ -6437,6 +6461,26 @@ export default function App() {
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit({ ...p, skus }, session, `Saved ${skus.length} SKU${skus.length === 1 ? "" : "s"}`));
       const u = next.find(p => p.id === id); if (u) persist(u);
+      /* The other half of releasing. A master moving to Received takes its
+         ready children with it — but a child that becomes ready AFTER its
+         master already has the stock has no transition to ride on, and would
+         wait at Planned for ever. That is not an edge case: mapping a child
+         the day after the stock lands is the normal way round. Releasing on
+         the child's own save covers it, and the same readiness test decides,
+         so the two routes cannot disagree. */
+      const me = next.find((p) => p.id === id);
+      if (me?.masterId != null) {
+        const master = next.find((p) => p.id === me.masterId);
+        if (master && releasesChildren(master.stage)) {
+          const released = releaseChildrenOf(next, master.id, session);
+          const mine = released.moved.find((p) => p.id === id);
+          if (mine) {
+            persist(mine);
+            say(`Ready to list — moved to ${STAGES[stageIndex(CHILD_RELEASE_STAGE)].label} with ${master.brand} ${master.name}`);
+            return released.list;
+          }
+        }
+      }
       return next;
     });
     saved("SKUs saved");
