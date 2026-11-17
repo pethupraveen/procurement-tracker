@@ -11,7 +11,7 @@ import {
   exportCell, safeUrl, adminIdsOf, isLastAdmin, wouldStrandAdmins,
   materialColumns, materialHeader, projectRef, isConfigOverride,
   isChildModel, childrenOf, isMasterModel, masterLinkProblem, eligibleMasters,
-  childSkuMappingProblems, nextStageKey, prevStageKey,
+  childSkuMappingProblems, nextStageKey, prevStageKey, isReadyToRelease,
 } from "./rules.js";
 
 const STAGE_KEYS = ["research", "planned", "ordered", "production", "received", "live", "unprocured"];
@@ -305,5 +305,33 @@ assert.equal(nextStageKey("planned", true, ORDER, { from: "planned", to: "nowher
     ? ["research", "planned", "received", "live"]
     : ORDER, "the route a model takes through the pipeline");
 });
+
+/* ── which children follow the master when its stock lands ──
+   A child is not separate work. When V70's stock arrives, a ready V70FE goes
+   with it; an unmapped one does not, because it would be offering stock it
+   has no claim on. */
+const MRIDS = ["a", "b"];
+const ready = { masterId: 1, stage: "planned", skus: [{ rid: "x", masterRid: "a" }] };
+
+assert.equal(isReadyToRelease(ready, MRIDS), true);
+assert.equal(isReadyToRelease({ ...ready, skus: [{ rid: "x" }] }, MRIDS), false,
+  "an unmapped SKU holds the whole child back");
+assert.equal(isReadyToRelease({ ...ready, skus: [
+  { rid: "x", masterRid: "a" }, { rid: "y" }] }, MRIDS), false,
+  "one unmapped SKU among several is still not ready");
+assert.equal(isReadyToRelease({ ...ready, skus: [{ rid: "x", masterRid: "zz" }] }, MRIDS), false,
+  "a mapping into a SKU the master no longer has is not ready");
+assert.equal(isReadyToRelease({ ...ready, skus: [] }, MRIDS), false,
+  "a child with no SKUs has nothing to list");
+assert.equal(isReadyToRelease({ ...ready, stage: "received" }, MRIDS), false,
+  "already released — moving it again would re-stamp its timeline");
+assert.equal(isReadyToRelease({ ...ready, stage: "live" }, MRIDS), false);
+assert.equal(isReadyToRelease({ ...ready, stage: "unprocured" }, MRIDS), false,
+  "a model taken out of procurement is not dragged back in by its master");
+assert.equal(isReadyToRelease({ ...ready, masterId: null }, MRIDS), false,
+  "a model with no master is nobody's child");
+assert.equal(isReadyToRelease(null, MRIDS), false);
+assert.equal(isReadyToRelease(ready, []), false,
+  "a master with no SKUs cannot release anything");
 
 console.log("roles.js OK");
