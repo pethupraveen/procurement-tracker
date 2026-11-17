@@ -11,7 +11,7 @@ import {
   exportCell, safeUrl, adminIdsOf, isLastAdmin, wouldStrandAdmins,
   materialColumns, materialHeader, projectRef, isConfigOverride,
   isChildModel, childrenOf, isMasterModel, masterLinkProblem, eligibleMasters,
-  childSkuMappingProblems,
+  childSkuMappingProblems, nextStageKey, prevStageKey,
 } from "./rules.js";
 
 const STAGE_KEYS = ["research", "planned", "ordered", "production", "received", "live", "unprocured"];
@@ -246,5 +246,64 @@ assert.deepEqual(childSkuMappingProblems([], MASTER_RIDS), [],
 assert.deepEqual(childSkuMappingProblems(null, MASTER_RIDS), []);
 assert.equal(childSkuMappingProblems([{ rid: "x", masterRid: "a" }], []).length, 1,
   "a master with no SKUs at all cannot satisfy any mapping");
+
+/* ── which stage a model may move to next ──
+   The bug this guards: advance() knew a child skips Ordered and Production,
+   moveStatus did not, and its "forward moves must be a single step" rule then
+   refused the jump. A linked child had no legal forward move at all and sat
+   at Planned, invisible, never reaching the listing queue. */
+const ORDER = ["research", "planned", "ordered", "production", "received", "live"];
+const SKIP  = { from: "planned", to: "received" };
+
+/* an ordinary model walks the pipeline one stage at a time */
+assert.equal(nextStageKey("research", false, ORDER, SKIP), "planned");
+assert.equal(nextStageKey("planned", false, ORDER, SKIP), "ordered");
+assert.equal(nextStageKey("ordered", false, ORDER, SKIP), "production");
+assert.equal(nextStageKey("production", false, ORDER, SKIP), "received");
+assert.equal(nextStageKey("received", false, ORDER, SKIP), "live");
+assert.equal(nextStageKey("live", false, ORDER, SKIP), null, "nothing after Live");
+
+/* a child skips Ordered and Production — the master is ordered, once */
+assert.equal(nextStageKey("planned", true, ORDER, SKIP), "received",
+  "THE bug: a child at Planned goes straight to Received");
+assert.equal(nextStageKey("research", true, ORDER, SKIP), "planned",
+  "the skip starts at Planned, not before it");
+assert.equal(nextStageKey("received", true, ORDER, SKIP), "live",
+  "after the skip a child behaves normally — listing is its own job");
+assert.equal(nextStageKey("live", true, ORDER, SKIP), null);
+
+/* and back again, mirrored, so stepping back does not land in Production */
+assert.equal(prevStageKey("received", true, ORDER, SKIP), "planned",
+  "a child steps back to Planned, not into a Production it never passed");
+assert.equal(prevStageKey("received", false, ORDER, SKIP), "production");
+assert.equal(prevStageKey("planned", false, ORDER, SKIP), "research");
+assert.equal(prevStageKey("planned", true, ORDER, SKIP), "research");
+assert.equal(prevStageKey("research", false, ORDER, SKIP), null, "nothing before Research");
+assert.equal(prevStageKey("live", true, ORDER, SKIP), "received");
+
+/* junk and edges */
+assert.equal(nextStageKey("unprocured", false, ORDER, SKIP), null,
+  "a terminal stage is not in the pipeline");
+assert.equal(nextStageKey("nonsense", true, ORDER, SKIP), null);
+assert.equal(nextStageKey("planned", true, ORDER, null), "ordered",
+  "no skip configured means no skip");
+assert.equal(nextStageKey("planned", true, [], SKIP), null);
+assert.equal(nextStageKey("planned", true, null, SKIP), null);
+assert.equal(nextStageKey("planned", true, ORDER, { from: "planned", to: "nowhere" }), null,
+  "a skip naming a stage that does not exist is refused, not guessed");
+
+/* The two must agree, or a model can be advanced into a stage it cannot
+   leave — walk the whole pipeline both ways for both kinds of model. */
+[false, true].forEach((kid) => {
+  let k = "research";
+  const seen = [k];
+  while (nextStageKey(k, kid, ORDER, SKIP)) { k = nextStageKey(k, kid, ORDER, SKIP); seen.push(k); }
+  assert.equal(k, "live", `a ${kid ? "child" : "model"} can always reach Live`);
+  while (prevStageKey(k, kid, ORDER, SKIP)) { k = prevStageKey(k, kid, ORDER, SKIP); }
+  assert.equal(k, "research", `a ${kid ? "child" : "model"} can always walk back to Research`);
+  assert.deepEqual(seen, kid
+    ? ["research", "planned", "received", "live"]
+    : ORDER, "the route a model takes through the pipeline");
+});
 
 console.log("roles.js OK");

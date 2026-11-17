@@ -165,3 +165,32 @@ export function childSkuMappingProblems(childSkus, masterRids) {
   });
   return out;
 }
+
+/* ── Which stage a model may move to next ─────────────────────────
+   A child skips the stages between Planned and the point its master
+   releases stock: it is never ordered and never produced. Every
+   forward check has to agree on that, or the board offers a move the
+   gate then refuses — which is exactly what happened: advance() knew
+   about the skip and moveStatus did not, so a linked child had NO
+   legal forward move and sat at Planned invisibly.
+
+   `order` is the ordered list of non-terminal stage keys. `skip` is
+   { from, to }: the stage a child leaves and the one it lands on. */
+
+export function nextStageKey(stageKey, isChild, order, skip) {
+  const keys = order || [];
+  const i = keys.indexOf(stageKey);
+  if (i < 0) return null;
+  if (isChild && skip && stageKey === skip.from)
+    return keys.includes(skip.to) ? skip.to : null;
+  return keys[i + 1] ?? null;
+}
+
+export function prevStageKey(stageKey, isChild, order, skip) {
+  const keys = order || [];
+  const i = keys.indexOf(stageKey);
+  if (i <= 0) return null;
+  if (isChild && skip && stageKey === skip.to)
+    return keys.includes(skip.from) ? skip.from : null;
+  return keys[i - 1];
+}

@@ -7,7 +7,8 @@ import { exportCell, safeUrl as safeUrlOf, wouldStrandAdmins, isLastAdmin,
          materialColumns as materialColumnsOf, materialHeader,
          projectRef as dbProjectRef, isConfigOverride,
          isChildModel, childrenOf, isMasterModel, masterLinkProblem,
-         eligibleMasters, childSkuMappingProblems } from "./rules.js";
+         eligibleMasters, childSkuMappingProblems,
+         nextStageKey, prevStageKey } from "./rules.js";
 /* CalendarDays and Inbox are aliased on import: the local components below are
    already called Calendar and Table, and Calendar/Inward previously reused the
    Dashboard and Orders icons, so two pairs of tabs were visually identical. */
@@ -447,6 +448,11 @@ function problemsOf(model) {
       push("warn", `${unmapped.length} SKU(s) not mapped to a ${model.master?.name || "master"} SKU`);
     else if (!masterIsReady(model.master))
       push("warn", `Waiting on ${model.master?.name} — ${STAGES[stageIndex(model.master.stage)].label}`);
+    else
+      /* Mapped, and the master has the stock in. Nothing said so before, so a
+         ready child sat at Planned with no prompt anywhere and never reached
+         the listing queue. */
+      push("warn", `Ready to list — ${model.master?.name} stock is in, move this to ${STAGES[stageIndex(CHILD_RELEASE_STAGE)].label}`);
   }
 
   /* The master is the thing that is late, but it is the child's launch that
@@ -606,6 +612,28 @@ function applyRoleTables(roles, advance) {
 
 /* The stage a master must reach before its children can be listed. */
 const CHILD_RELEASE_STAGE = "received";
+/* What a child skips: it leaves Planned and lands on the release stage,
+   because Ordered and Production belong to the master. */
+const CHILD_SKIP = { from: "planned", to: CHILD_RELEASE_STAGE };
+const PIPELINE_KEYS = PIPELINE.map((st) => st.key);
+
+/* The one stage this model may move forward to, and the one it steps back to.
+   Everything that decides a forward move goes through these — advanceStatus
+   for the button's label and enablement, moveStatus for the rule, advance()
+   and goBack() for the action. They disagreed once: advance() knew a child
+   skips Ordered and Production while moveStatus's "one step at a time" rule
+   did not, so a linked child had no legal forward move and sat at Planned
+   for ever, never reaching the listing queue. */
+const nextStageOf = (model) => {
+  if (isTerminal(model.stage)) return null;
+  const key = nextStageKey(model.stage, isChildModel(model), PIPELINE_KEYS, CHILD_SKIP);
+  return key ? PIPELINE[stageIndex(key)] : null;
+};
+const prevStageOf = (model) => {
+  if (isTerminal(model.stage)) return PIPELINE[0];
+  const key = prevStageKey(model.stage, isChildModel(model), PIPELINE_KEYS, CHILD_SKIP);
+  return key ? PIPELINE[stageIndex(key)] : null;
+};
 
 const masterIsReady = (master) =>
   !!master && stageIndex(master.stage) >= stageIndex(CHILD_RELEASE_STAGE)
@@ -675,8 +703,14 @@ function gateBlock(model) {
 
   if (model.stage === "received") {
     if (allSkus(model).length === 0) return "No SKUs on this phone";
-    const unconf = allSkus(model).filter((r) => !isConfirmed(r));
-    if (unconf.length) return `${unconf.length} SKU${unconf.length > 1 ? "s" : ""} not confirmed`;
+    /* A child never receives goods — the master does — so its SKUs can never
+       be confirmed receipts and this check would block it for ever. The
+       marketplace check below still applies, and is the whole point: a child
+       exists in order to be listed. */
+    if (!isChildModel(model)) {
+      const unconf = allSkus(model).filter((r) => !isConfirmed(r));
+      if (unconf.length) return `${unconf.length} SKU${unconf.length > 1 ? "s" : ""} not confirmed`;
+    }
     /* Catalog gate: nothing goes Live until every SKU is live on every
        marketplace. The message names the platforms still outstanding. */
     const pending = pendingMarketplaces(model);
@@ -713,7 +747,7 @@ const canEnterStage = (role, stageKey) =>
 function advanceStatus(model, role) {
   if (isTerminal(model.stage))
     return { ok: false, next: null, reason: "Not being procured" };
-  const next = PIPELINE[model.index + 1];
+  const next = nextStageOf(model);
   if (!next) return { ok: false, next: null, reason: "Already live" };
   if (role && role !== "none" && !canEnterStage(role, next.key))
     return { ok: false, next, reason: `${roleLabel(role)} can't move to ${next.label}` };
@@ -763,8 +797,14 @@ function moveStatus(model, role, stageKey) {
     /* role first — "Sales can't move to Live" beats "Move to Ordered first" */
     if (!canEnterStage(role, stageKey))
       return { ok: false, reason: `${roleLabel(role)} can't move to ${STAGES[target].label}` };
-    if (target > model.index + 1)
-      return { ok: false, reason: `Move to ${PIPELINE[model.index + 1].label} first` };
+    /* Exactly one stage forward is legal, and for a child that is Received
+       rather than the next pipeline entry. Computing it from the index here
+       was the bug: it demanded "Move to Ordered first" of a model that is
+       never ordered. */
+    const want = nextStageOf(model);
+    if (!want) return { ok: false, reason: "Nothing to move on to" };
+    if (stageKey !== want.key)
+      return { ok: false, reason: `Move to ${want.label} first` };
     const st = advanceStatus(model, role);
     return { ok: st.ok, reason: st.reason };
   }
@@ -6294,23 +6334,14 @@ export default function App() {
   const advance = (id) => {
     const m = models.find((x) => x.id === id);
     if (!m || m.terminal) return;
-    /* A child has no Ordered and no Production stage — the master is ordered,
-       once, and the child is listed from that stock. So the step after Planned
-       is Received, not the next entry in the pipeline. */
-    const next = m.isChild && m.stage === "planned"
-      ? PIPELINE[stageIndex(CHILD_RELEASE_STAGE)]
-      : PIPELINE[m.index + 1];
+    const next = nextStageOf(m);
     if (next) move(id, next.key);
   };
 
   const goBack = (id) => {
     const m = models.find((x) => x.id === id);
     if (!m) return;
-    /* Mirror of advance(): stepping back from Received on a child returns it
-       to Planned, not into a Production stage it never passed through. */
-    const prev = m.terminal ? PIPELINE[0]
-      : (m.isChild && m.stage === CHILD_RELEASE_STAGE) ? PIPELINE[stageIndex("planned")]
-      : PIPELINE[m.index - 1];
+    const prev = prevStageOf(m);
     if (prev) move(id, prev.key);
   };
 
