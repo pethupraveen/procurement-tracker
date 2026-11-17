@@ -6448,6 +6448,9 @@ export default function App() {
       const u = updated.find((p) => p.id === id); if (u) persist(u);
       return updated;
     });
+    /* Linking clears every mapping, so a model can never be released by the
+       act of linking alone — it becomes ready on the save that maps it, which
+       saveSKU above handles. Nothing to release here. */
     saved(masterId == null ? "Master link cleared"
       : `Child of ${next.brand} ${next.name} — it will be listed from that stock`);
   };
@@ -6458,6 +6461,26 @@ export default function App() {
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit({ ...p, skus }, session, `Saved ${skus.length} SKU${skus.length === 1 ? "" : "s"}`));
       const u = next.find(p => p.id === id); if (u) persist(u);
+      /* The other half of releasing. A master moving to Received takes its
+         ready children with it — but a child that becomes ready AFTER its
+         master already has the stock has no transition to ride on, and would
+         wait at Planned for ever. That is not an edge case: mapping a child
+         the day after the stock lands is the normal way round. Releasing on
+         the child's own save covers it, and the same readiness test decides,
+         so the two routes cannot disagree. */
+      const me = next.find((p) => p.id === id);
+      if (me?.masterId != null) {
+        const master = next.find((p) => p.id === me.masterId);
+        if (master && releasesChildren(master.stage)) {
+          const released = releaseChildrenOf(next, master.id, session);
+          const mine = released.moved.find((p) => p.id === id);
+          if (mine) {
+            persist(mine);
+            say(`Ready to list — moved to ${STAGES[stageIndex(CHILD_RELEASE_STAGE)].label} with ${master.brand} ${master.name}`);
+            return released.list;
+          }
+        }
+      }
       return next;
     });
     saved("SKUs saved");
