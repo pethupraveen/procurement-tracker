@@ -1,7 +1,20 @@
 -- ═══════════════════════════════════════════════════════════════
 -- Procurement Tracker — Supabase Schema  (v3 — fixed upsert)
 --
--- Run this entire file in the Supabase SQL Editor:
+-- ⚠ THIS FILE DESTROYS DATA. The first statements below drop the phones
+--   and users tables with cascade. Every phone, SKU, goods receipt, sales
+--   entry, note, attachment and audit line is gone, and there is no undo.
+--
+--   Run this ONLY to wipe a database and start again.
+--
+--   To create what is missing on a project that already holds data, run
+--   schema-bootstrap.sql instead. It makes no drops and does not touch
+--   existing rows or user accounts.
+--
+--   AUD-030: the application's own setup screen used to tell the operator
+--   to run this file, with no warning, on a screen reachable while a
+--   working database was already configured.
+--
 -- Dashboard → SQL Editor → New query → Paste → Run
 -- ═══════════════════════════════════════════════════════════════
 
@@ -65,6 +78,9 @@ create policy "anon full access users"  on users  for all using (true) with chec
 create policy "anon full access phones" on phones for all using (true) with check (true);
 
 -- ── Stage summary view ──────────────────────────────────────────
+-- AUD-032: nothing in the application reads this view — the same numbers are
+-- derived in the browser. It is kept because an external report or dashboard
+-- may query it; drop it by hand if nothing does.
 create or replace view stage_summary as
 select
   stage,

@@ -5,7 +5,19 @@ const EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 function cors(req: Request, origin: string) { return req.headers.get("origin") === origin ? { "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Headers": "apikey, content-type", "Access-Control-Allow-Methods": "POST, OPTIONS", Vary: "Origin" } : null; }
 function reply(req: Request, origin: string, body: unknown, status = 200) { const headers = cors(req, origin); return new Response(JSON.stringify(body), { status, headers: { ...(headers || {}), "Content-Type": "application/json" } }); }
 function esc(v: unknown) { return String(v ?? "").replace(/[&<>\"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string)); }
-function csvCell(v: unknown) { const s = String(v ?? ""); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; }
+// AUD-006: a spreadsheet runs a cell that opens with = + - @ or a control
+// character as a formula. This attachment is emailed to the MD and the factory,
+// so a SKU typed as `=HYPERLINK(...)` executed in whoever opened it. Prefix
+// those with an apostrophe, which Excel and Sheets read as "this is text";
+// plain numbers are left alone so numeric columns still sum. Mirrors
+// exportCell() in src/App.jsx — keep the two in step.
+function cellText(v: unknown) {
+  const s = String(v ?? "");
+  if (!/^[=+\-@\t\r\u0000-\u001f]/.test(s)) return s;
+  if (s.trim() !== "" && Number.isFinite(Number(s))) return s;
+  return "'" + s;
+}
+function csvCell(v: unknown) { const s = cellText(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; }
 function emails(value: string | undefined) { try { const a = JSON.parse(value || "[]"); return Array.isArray(a) ? [...new Set(a.filter((v) => typeof v === "string" && EMAIL.test(v.trim())).map((v) => v.trim()))].slice(0, 25) : []; } catch { return []; } }
 async function hash(value: string) { const bytes = new TextEncoder().encode(value); const digest = await crypto.subtle.digest("SHA-256", bytes); return [...new Uint8Array(digest)].map((n) => n.toString(16).padStart(2, "0")).join(""); }
 

@@ -1,5 +1,8 @@
 -- Secure STP report approval for the legacy PIN client.
--- Run once in Supabase SQL Editor after schema-pin-login-rollback.sql.
+-- Run once in Supabase SQL Editor, after the tables exist
+-- (schema-bootstrap.sql, or schema.sql on a database you are wiping).
+-- AUD-007: this line used to name schema-pin-login-rollback.sql, which is not
+-- in this repository and never has been. Nothing here depends on it.
 -- No browser role can read these tables; only Edge Functions use service_role.
 
 begin;
