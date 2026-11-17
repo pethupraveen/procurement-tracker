@@ -8,7 +8,7 @@ import { exportCell, safeUrl as safeUrlOf, wouldStrandAdmins, isLastAdmin,
          projectRef as dbProjectRef, isConfigOverride,
          isChildModel, childrenOf, isMasterModel, masterLinkProblem,
          eligibleMasters, childSkuMappingProblems,
-         nextStageKey, prevStageKey } from "./rules.js";
+         nextStageKey, prevStageKey, isReadyToRelease } from "./rules.js";
 /* CalendarDays and Inbox are aliased on import: the local components below are
    already called Calendar and Table, and Calendar/Inward previously reused the
    Dashboard and Orders icons, so two pairs of tabs were visually identical. */
@@ -656,6 +656,45 @@ function childPlannedBlock(model) {
     return `Waiting on ${master.brand} ${master.name} — currently at ${STAGES[stageIndex(master.stage)].label}`;
   return null;
 }
+
+/* A child is not separate work — V70FE rides on V70. So when the master's
+   stock comes in, every child that is ready moves with it instead of sitting
+   at Planned until somebody notices. Catalog then lists both from the listing
+   queue, which is the whole point of a child existing.
+
+   Only READY children move: SKUs present, and every one mapped to a master
+   SKU. An unmapped child in the listing queue would be selling from nothing,
+   so it stays at Planned and keeps saying so on its card.
+
+   The child's Ordered and Production dates are copied FROM THE MASTER. Those
+   events really did happen — on the master — and leaving them blank makes
+   delayOf() score the child as overdue on two stages it never had, so it
+   would read as permanently late the moment it was released. */
+function releaseChildrenOf(list, masterId, user) {
+  const master = list.find((p) => p.id === masterId);
+  if (!master) return { list, moved: [] };
+  const masterRids = (master.skus || []).map((r) => r.rid);
+  const moved = [];
+  const next = list.map((p) => {
+    if (p.masterId !== masterId) return p;
+    if (!isReadyToRelease(p, masterRids)) return p;
+    const done = { ...p.done };
+    done.research ||= todayISO();
+    done.planned  ||= todayISO();
+    ["ordered", "production", CHILD_RELEASE_STAGE].forEach((k) => {
+      done[k] ||= master.done?.[k] || todayISO();
+    });
+    const out = withAudit({ ...p, stage: CHILD_RELEASE_STAGE, done }, user,
+      `Released with ${master.brand} ${master.name} — ready to list`);
+    moved.push(out);
+    return out;
+  });
+  return { list: next, moved };
+}
+
+/* Has this stage got the stock in, so children can be released? */
+const releasesChildren = (stageKey) =>
+  !isTerminal(stageKey) && stageIndex(stageKey) >= stageIndex(CHILD_RELEASE_STAGE);
 
 /* ── ADVANCE LOGIC — one source of truth ─────────────────────────
    gateBlock()     — is the DATA ready to move on? returns a reason or null
@@ -6315,9 +6354,18 @@ export default function App() {
       return withAudit({ ...p, stage: stageKey, done }, session,
         forward ? `Moved to ${label}` : `Moved back to ${label}`);
     });
-    const updated = next.find(p => p.id === id);
+    /* The master just got its stock in, so anything waiting on it goes too. */
+    let out = next;
+    if (releasesChildren(stageKey)) {
+      const released = releaseChildrenOf(next, id, session);
+      out = released.list;
+      released.moved.forEach(persist);
+      if (released.moved.length)
+        say(`${released.moved.length} linked model${released.moved.length === 1 ? "" : "s"} moved to ${STAGES[stageIndex(CHILD_RELEASE_STAGE)].label} — ready to list`);
+    }
+    const updated = out.find(p => p.id === id);
     if (updated) persist(updated);
-    return next;
+    return out;
   });
 
   /* the single gate every stage change passes through */
@@ -6502,7 +6550,20 @@ export default function App() {
         return p;
       });
       next.filter((p) => appliedIds.includes(p.id)).forEach(persist);
-      return next;
+      /* Receiving against a PO is the route most stock actually arrives by,
+         so children have to follow here as well as through moveTo — or the
+         behaviour would depend on which button put the stock in. */
+      let out = next;
+      const releasedAll = [];
+      received.forEach((masterId) => {
+        const r = releaseChildrenOf(out, masterId, session);
+        out = r.list;
+        releasedAll.push(...r.moved);
+      });
+      releasedAll.forEach(persist);
+      if (releasedAll.length)
+        say(`${releasedAll.length} linked model${releasedAll.length === 1 ? "" : "s"} moved to ${STAGES[stageIndex(CHILD_RELEASE_STAGE)].label} — ready to list`);
+      return out;
     });
     const bits = [];
     if (received.length) bits.push(`${received.length} received`);

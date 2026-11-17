@@ -194,3 +194,17 @@ export function prevStageKey(stageKey, isChild, order, skip) {
     return keys.includes(skip.from) ? skip.from : null;
   return keys[i - 1];
 }
+
+/* Is this child ready to be released with its master's stock?
+
+   Called when a master reaches the stage that holds stock. A child that is
+   ready moves with it; one that is not stays at Planned and keeps saying why
+   on its card. An unmapped child in the listing queue would be offering
+   stock it has no claim on, which is worse than it being late to appear. */
+export function isReadyToRelease(child, masterRids, plannedKey) {
+  if (!child || child.masterId == null) return false;
+  if (child.stage !== (plannedKey || "planned")) return false;
+  const rows = child.skus || [];
+  if (!rows.length) return false;
+  return childSkuMappingProblems(rows, masterRids).length === 0;
+}
