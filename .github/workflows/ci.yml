@@ -1,0 +1,38 @@
+# AUD-007: the repository had no workflows directory at all, while README.md
+# described a deploy.yml that builds and publishes the app. Nothing checked a
+# push, so a change that broke the build or the role self-check could reach
+# main unnoticed.
+#
+# This runs the two checks the project actually has. It does not deploy —
+# how the app reaches its users is an open question (BRD OQ-10), and a
+# release workflow should not be invented on its behalf.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches deploy.yml, so a green run here proves what the deploy
+          # job builds. Node 24 is also what local development uses.
+          node-version: 24
+          cache: npm
+
+      # ci, not install: fails loudly if package-lock.json and package.json
+      # have drifted apart, rather than quietly resolving something else.
+      - run: npm ci
+
+      # The role permission rules — the only tested module in the project.
+      - run: npm run check
+
+      - run: npm run build

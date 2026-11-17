@@ -1,5 +1,8 @@
 -- Secure STP report approval for the legacy PIN client.
--- Run once in Supabase SQL Editor after schema-pin-login-rollback.sql.
+-- Run once in Supabase SQL Editor, after the tables exist
+-- (schema-bootstrap.sql, or schema.sql on a database you are wiping).
+-- AUD-007: this line used to name schema-pin-login-rollback.sql, which is not
+-- in this repository and never has been. Nothing here depends on it.
 -- No browser role can read these tables; only Edge Functions use service_role.
 
 begin;
@@ -68,9 +71,40 @@ begin
   return true;
 end; $$;
 
+-- AUD-029: claim_report_approval consumes the code before the send is even
+-- attempted, so a Resend outage, an empty report or a failed phones read burnt
+-- it. The operator then had to ask for another, against a limit of three
+-- requests an hour — a transient failure locked the report for the rest of the
+-- hour. This hands an unused approval back.
+--
+-- Deliberately narrow. It will not resurrect an approval whose send log says
+-- 'sent', so a successful send can never be replayed; and it leaves
+-- `attempts` where it is, so releasing cannot be used to reset the
+-- brute-force counter. An expired approval stays dead, because the expiry is
+-- checked on the next claim.
+create or replace function public.release_report_approval(
+  p_id uuid
+) returns boolean
+language plpgsql security definer set search_path = '' as $$
+declare approval public.report_approvals%rowtype;
+begin
+  select * into approval from public.report_approvals where id = p_id for update;
+  if not found or approval.consumed_at is null then return false; end if;
+
+  if exists (select 1 from public.report_send_log
+             where approval_id = p_id and status = 'sent') then
+    return false;
+  end if;
+
+  update public.report_approvals set consumed_at = null where id = p_id;
+  return true;
+end; $$;
+
 revoke all on function public.create_report_approval(uuid, text, text) from public, anon, authenticated;
 revoke all on function public.claim_report_approval(uuid, text) from public, anon, authenticated;
 grant execute on function public.create_report_approval(uuid, text, text) to service_role;
 grant execute on function public.claim_report_approval(uuid, text) to service_role;
+revoke all on function public.release_report_approval(uuid) from public, anon, authenticated;
+grant execute on function public.release_report_approval(uuid) to service_role;
 
 commit;

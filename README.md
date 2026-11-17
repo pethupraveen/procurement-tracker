@@ -135,7 +135,7 @@ flowchart TB
     App[src/App.jsx<br/>UI, permissions, workflow gates,<br/>derived metrics, Supabase access]
     Entry[src/main.jsx<br/>Mounts the app]
     DB[(Supabase<br/>users + phones + stage_summary)]
-    Schema[schema.sql<br/>Tables, view, trigger, seed users]
+    Schema[schema-bootstrap.sql<br/>Tables, trigger, seed users]
     Deploy[GitHub Actions]
     Pages[GitHub Pages]
 
@@ -150,10 +150,14 @@ flowchart TB
 | --- | --- |
 | <code>src/App.jsx</code> | The application: UI, business rules, permissions, derived data, and database calls |
 | <code>src/main.jsx</code> | React entry point |
-| <code>schema.sql</code> | Full Supabase schema, view, trigger, and seed users |
+| <code>schema.sql</code> | Full Supabase schema, view, trigger, and seed users. <strong>Drops the tables first</strong> |
+| <code>schema-bootstrap.sql</code> | Non-destructive version of the above: creates only what is missing |
+| <code>schema-roles.sql</code> | The <code>role_permissions</code> table behind the admin matrix |
 | <code>schema-phase3.sql</code> | Additional database migration script |
 | <code>schema-compatibility.sql</code> | Compatibility migration script |
-| <code>.github/workflows/deploy.yml</code> | Builds and publishes the app when <code>main</code> is pushed |
+| <code>schema-report-approval.sql</code> | Approval and send-log tables for the emailed STP report |
+| <code>supabase/functions/</code> | Two Edge Functions: request an approval code, send the approved report |
+| <code>.github/workflows/ci.yml</code> | Runs <code>npm ci</code>, <code>npm run check</code> and <code>npm run build</code> on every push |
 
 ## Run locally
 
@@ -184,7 +188,9 @@ VITE_SUPABASE_ANON_KEY=<anon-or-publishable-key>
 Without these values, the app opens the Admin-only **DB Setup** screen. The
 same values can be entered there and stored in that browser's local storage.
 
-To create the database, run [schema.sql](schema.sql) in the Supabase SQL editor.
+To create the database, run [schema-bootstrap.sql](schema-bootstrap.sql) in the
+Supabase SQL editor, then [schema-roles.sql](schema-roles.sql). Use
+[schema.sql](schema.sql) only to wipe an existing database and start again.
 
 > Warning: <code>schema.sql</code> drops its tables before recreating them. Do
 > not run it against a populated production database.
@@ -193,19 +199,37 @@ To create the database, run [schema.sql](schema.sql) in the Supabase SQL editor.
 
 ~~~mermaid
 flowchart LR
-    Push[Push to main] --> Workflow[GitHub Actions workflow]
-    Workflow --> Build[npm run build]
-    Build --> Pages[GitHub Pages]
+    Push[Push to any branch] --> CI[.github/workflows/ci.yml]
+    CI --> Check[npm run check]
+    CI --> Build[npm run build]
 ~~~
 
-Pushing to <code>main</code> runs <code>.github/workflows/deploy.yml</code>,
-which builds <code>dist/</code> and publishes it to GitHub Pages.
+Every push runs <code>.github/workflows/ci.yml</code>, which installs with
+<code>npm ci</code>, runs the role self-check, and builds <code>dist/</code>.
 
-One-time GitHub setup:
+> **There is currently no deploy workflow in this repository, and pushing to
+> <code>main</code> no longer publishes anything.**
+>
+> There was one. <code>.github/workflows/deploy.yml</code> built
+> <code>dist/</code> and published it to GitHub Pages, and its last successful
+> runs were in September 2026. It was deleted in commit <code>afad51c</code>
+> ("Add Customer Care team and move permissions into the database") — a commit
+> about permissions, which suggests the deletion was not intended. Audit
+> finding AUD-007 recorded the absence; this note records how it happened.
+>
+> Recover it with <code>git show 4fa2755:.github/workflows/deploy.yml</code>,
+> the last version before the deletion. Check it before restoring it: the
+> preceding commit is titled "Allow clean manual Pages deployments", so
+> somebody may have been moving to manual deploys on purpose. Until that is
+> settled, publish by building locally and uploading <code>dist/</code>.
 
-1. In **Settings -> Pages -> Source**, select **GitHub Actions**.
-2. In **Settings -> Secrets and variables -> Actions**, add
-   <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code>.
+A restored deploy job should keep the
+<code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> Actions
+secrets. They are read at build time (<code>src/App.jsx</code>,
+<code>ENV_DB_CONFIG</code>) and baked into the bundle, so every visitor gets a
+working connection without being shown the DB Setup screen. A config saved in a
+given browser's local storage still wins over them, which is how an admin
+points one machine at a different project.
 
 <code>vite.config.js</code> uses <code>base: "./"</code>, allowing the deployed
 app to work from the <code>/procurement-tracker/</code> project subpath.

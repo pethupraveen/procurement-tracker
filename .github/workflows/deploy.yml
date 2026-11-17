@@ -1,0 +1,77 @@
+# Restored from 4fa2755, the last version before this file was deleted in
+# afad51c ("Add Customer Care team and move permissions into the database") — a
+# commit about permissions, so the deletion appears to have been accidental.
+# Pushing to main had published nothing since then.
+#
+# Unchanged from that version: the triggers, the Pages permissions, the
+# concurrency group and the deploy target. Four things were added, each noted
+# below.
+
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  # Kept: the commit before the deletion was "Allow clean manual Pages
+  # deployments", so manual dispatch was wanted.
+  workflow_dispatch:
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches ci.yml, so a green CI run proves what this job builds.
+          node-version: 24
+          cache: npm
+
+      # ADDED. Without these the build still succeeds and publishes a bundle
+      # with no Supabase configuration. The app then falls back to
+      # DEFAULT_USERS (src/App.jsx) and the login screen offers
+      # "Arjun (Admin)" with PIN 1234 to every visitor, because it only hides
+      # the built-in accounts when a database is configured to contradict
+      # them. Fail the deploy rather than publish that.
+      - name: Require the Supabase build secrets
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          test -n "$VITE_SUPABASE_URL" \
+            || { echo "::error::VITE_SUPABASE_URL is not set — refusing to publish a build with no database."; exit 1; }
+          test -n "$VITE_SUPABASE_ANON_KEY" \
+            || { echo "::error::VITE_SUPABASE_ANON_KEY is not set — refusing to publish a build with no database."; exit 1; }
+
+      # ADDED: was `npm install`. ci fails loudly when package-lock.json and
+      # package.json have drifted, instead of quietly resolving something the
+      # lockfile never recorded and publishing it.
+      - run: npm ci
+
+      # ADDED: do not publish a build whose own role self-check fails.
+      - run: npm run check
+
+      - run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - uses: actions/deploy-pages@v4
+        id: deployment

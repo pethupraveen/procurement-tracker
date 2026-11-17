@@ -1,6 +1,10 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
 import { PERM_KEYS, PERM_LABELS, DEFAULT_PERMS, LOCKED_TO_ADMIN,
          buildCan, rolesFromRows, rolesToRows } from "./roles.js";
+/* The Phase 1 audit fixes that are worth asserting live in rules.js so the
+   existing zero-dependency self-check can run them — see roles.selfcheck.mjs. */
+import { exportCell, safeUrl as safeUrlOf, wouldStrandAdmins, isLastAdmin,
+         materialColumns as materialColumnsOf, materialHeader } from "./rules.js";
 /* CalendarDays and Inbox are aliased on import: the local components below are
    already called Calendar and Table, and Calendar/Inward previously reused the
    Dashboard and Orders icons, so two pairs of tabs were visually identical. */
@@ -29,7 +33,10 @@ import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, Layou
 /* ── 1. DATE HELPERS ─────────────────────────────────────────────
    Everything is a plain "YYYY-MM-DD" string. No date library.      */
 
-const TODAY = new Date(); TODAY.setHours(0, 0, 0, 0);
+/* AUD-031: this used to be `const TODAY = new Date()`, captured once when the
+   module loaded. A tab left open overnight stamped every stage date, sales date
+   and deadline with yesterday. Read the clock on every call instead — `iso`
+   already works in local time, so no midnight normalisation is needed. */
 /* Local calendar date, NOT toISOString(). toISOString() converts to UTC, so
    local midnight in any zone ahead of UTC (IST is +5:30) slices back to
    YESTERDAY — every stage date, sales date and deadline landed a day early. */
@@ -37,11 +44,11 @@ const iso   = (d) => {
   const t = d instanceof Date ? d : new Date(d);
   return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`;
 };
+const todayISO = () => iso(new Date());
 const shift = (date, days) => { const d = new Date(date); d.setDate(d.getDate() + days); return iso(d); };
 const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
-const daysFromToday = (date) => daysBetween(iso(TODAY), date);
+const daysFromToday = (date) => daysBetween(todayISO(), date);
 const showDate = (d) => d ? new Date(d).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "2-digit" }) : "—";
-const money = (n) => "₹" + Math.round(n).toLocaleString("en-IN");
 const qty   = (n) => Math.round(n).toLocaleString("en-IN");
 
 
@@ -109,9 +116,18 @@ const MATERIAL_NAMES = MATERIALS.map((m) => m.name);
 const defaultQtyFor  = (name) => MATERIALS.find((m) => m.name === name)?.defaultQty ?? 0;
 
 /* SKU ids are persisted, so a counter that restarts on reload can collide
-   with an existing row and update the wrong SKU. */
+   with an existing row and update the wrong SKU.
+
+   AUD-012: the previous scheme was `Date.now() * 1000 + (++seq % 1000)`, which
+   two browsers creating a SKU in the same millisecond could land on
+   simultaneously — the collision then mis-attributed stock and goods receipts.
+   A v4 UUID cannot collide. randomUUID needs a secure context, so the old
+   scheme stays as the fallback for plain http. Existing numeric rids keep
+   working: every rid is only ever compared for equality or used as a key. */
 let _skuSeq = 0;
-const newRid = () => Date.now() * 1000 + (++_skuSeq % 1000);
+const newRid = () => (globalThis.crypto?.randomUUID
+  ? globalThis.crypto.randomUUID()
+  : Date.now() * 1000 + (++_skuSeq % 1000));
 function repairSkuRids(phone) {
   const seen = new Set();
   let changed = false;
@@ -145,7 +161,7 @@ const skuRow = (sku = "", material = "", units = 0) => ({
 const AUDIT_CAP = 200;
 
 const auditEntry = (user, action) => ({
-  rid: Date.now() + Math.random(),
+  rid: newRid(),
   at:   new Date().toISOString(),
   by:   user?.name?.split(" (")[0] || "Unknown",
   role: user?.role || "none",
@@ -158,7 +174,7 @@ const withAudit = (phone, user, action) => ({
 });
 
 const noteEntry = (user, text) => ({
-  rid: Date.now() + Math.random(),
+  rid: newRid(),
   at:  new Date().toISOString(),
   by:  user?.name?.split(" (")[0] || "Unknown",
   role: user?.role || "none",
@@ -167,8 +183,14 @@ const noteEntry = (user, text) => ({
 
 const ATTACHMENT_KINDS = ["PO document", "Invoice", "STP file", "QC photo", "Other"];
 
+/* AUD-006: only http(s) is a file link — the rule itself is in rules.js, this
+   just supplies the page as the base for a relative one. Applied where the
+   link is rendered, not only where it is typed, so rows already stored in the
+   database are covered too. */
+const safeUrl = (value) => safeUrlOf(value, window.location.href);
+
 const attachmentEntry = (user, label, url, kind) => ({
-  rid: Date.now() + Math.random(),
+  rid: newRid(),
   at:  new Date().toISOString(),
   by:  user?.name?.split(" (")[0] || "Unknown",
   label: label.trim(), url: url.trim(), kind,
@@ -287,7 +309,7 @@ function plannedDate(model, stageKey) {
   const days = STAGES[stageIndex(stageKey)]?.daysBeforeLaunch;
   if (days == null) return null;                 // terminal stage — nothing is due
   const fromLaunch = shift(model.launch, -days);
-  const dayAdded   = model.done.research || iso(TODAY);
+  const dayAdded   = model.done.research || todayISO();
   return fromLaunch < dayAdded ? dayAdded : fromLaunch;
 }
 
@@ -297,7 +319,7 @@ function delayOf(model, stageKey) {
   if (!planned) return 0;
   const actual  = model.done[stageKey];
   if (actual) return daysBetween(planned, actual);           // finished: compare to plan
-  const overdue = daysBetween(planned, iso(TODAY));          // not finished: how overdue now
+  const overdue = daysBetween(planned, todayISO());          // not finished: how overdue now
   return overdue > 0 ? overdue : 0;
 }
 
@@ -305,7 +327,7 @@ function delayOf(model, stageKey) {
    Spot a phone 30 days before launch and you're compressed — the app should
    say so rather than silently stacking every deadline onto today.          */
 function runwayOf(model) {
-  const dayAdded = model.done.research || iso(TODAY);
+  const dayAdded = model.done.research || todayISO();
   const have = daysBetween(dayAdded, model.launch);
   return { have, need: STAGES[0].daysBeforeLaunch, isRushed: have < STAGES[0].daysBeforeLaunch };
 }
@@ -703,8 +725,13 @@ function loadSession() {
     return raw.user;
   } catch { return null; }
 }
+/* AUD-005: this used to store the whole user object, PIN hash included, in
+   localStorage — so the credential sat in plain sight on every machine anyone
+   had ever signed in on, long after the session expired. Nothing reads
+   session.pin: the login screen compares against the live users list. */
 function saveSession(user) {
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user, at: Date.now() })); }
+  const { pin, ...safe } = user || {};
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: safe, at: Date.now() })); }
   catch { /* private browsing — session just won't persist */ }
 }
 function clearSession() {
@@ -800,6 +827,14 @@ async function dbLoadPhones() {
   const { data, error } = await c.get("/phones?order=id");
   return { data: error ? null : (data || []).map(rowToPhone), error };
 }
+/* One row, for clearing a single save conflict without discarding the whole
+   list — see the conflict branch in persist(). */
+async function dbLoadPhone(id) {
+  const c = dbClient(); if (!c) return { data: null, error: "Not configured" };
+  const { data, error } = await c.get("/phones?id=eq." + id);
+  if (error) return { data: null, error };
+  return { data: data?.length ? rowToPhone(data[0]) : null, error: null };
+}
 /* Every save writes the WHOLE phone row, so a blind write silently wipes
    anything a colleague changed since this tab loaded. Compare version
    stamps first and refuse rather than clobber.
@@ -856,7 +891,10 @@ async function reportRequest(path, body = {}) {
     });
     const responseBody = await res.text();
     let data = null; try { data = responseBody ? JSON.parse(responseBody) : null; } catch {}
-    if (!res.ok) return { error: data?.error || `Report request failed (${res.status})` };
+    /* retryable means the Edge Function handed the approval code back, so the
+       same code still works — see AUD-029 in send-stp-report/index.ts. */
+    if (!res.ok) return { error: data?.error || `Report request failed (${res.status})`,
+                          retryable: !!data?.retryable };
     return { data };
   } catch (e) {
     return { error: e.message };
@@ -1721,7 +1759,18 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
   const [saved, setSaved] = useState(false);
 
   const addRow    = ()      => setDraft((d) => [...d, skuRow()]);
-  const removeRow = (rid)   => setDraft((d) => d.filter((r) => r.rid !== rid));
+  /* AUD-018: a sales entry names its SKU by rid. Deleting the SKU left those
+     entries pointing at nothing — stockOfSku stopped counting them, so the
+     units silently vanished from sales and reappeared as stock on hand.
+     Saving still drops the row; the operator is now told what it costs. */
+  const removeRow = (rid)   => {
+    const sold = (model.salesEntries || []).filter((e) => e.skuRid === rid);
+    if (sold.length && !window.confirm(
+      `This SKU has ${sold.length} sales entr${sold.length === 1 ? "y" : "ies"} against it. `
+      + `Removing it leaves them counted against the model but against no SKU. Remove it anyway?`
+    )) return;
+    setDraft((d) => d.filter((r) => r.rid !== rid));
+  };
   const editRow   = (rid, patch) =>
     setDraft((d) => d.map((r) => (r.rid === rid ? { ...r, ...patch } : r)));
 
@@ -2320,8 +2369,11 @@ function ModelExtras({ model, onAddNote, onDeleteNote, onAddAttachment, onDelete
     return showDate(iso8601.slice(0,10));
   };
 
+  const [attErr, setAttErr] = useState("");
   const addAtt = () => {
     if (!att.label.trim() || !att.url.trim()) return;
+    if (!safeUrl(att.url)) { setAttErr("Links must start with http:// or https://"); return; }
+    setAttErr("");
     onAddAttachment(model.id, att.label, att.url, att.kind);
     setAtt({ label: "", url: "", kind: ATTACHMENT_KINDS[0] });
   };
@@ -2419,6 +2471,7 @@ function ModelExtras({ model, onAddNote, onDeleteNote, onAddAttachment, onDelete
                 <button className="btn" data-primary="1"
                   style={{ opacity: att.label.trim() && att.url.trim() ? 1 : 0.4 }}
                   onClick={addAtt}>Attach link</button>
+                {attErr && <div style={{ color: "var(--warn)", fontSize: 12, marginTop: 6 }}>{attErr}</div>}
               </div>
             )}
             {atts.length === 0 ? (
@@ -2429,11 +2482,18 @@ function ModelExtras({ model, onAddNote, onDeleteNote, onAddAttachment, onDelete
                   <div key={a.rid} style={{ display: "flex", gap: 9, alignItems: "center",
                     padding: "8px 10px", border: "1px solid var(--line)", borderRadius: 8 }}>
                     <Tag>{a.kind}</Tag>
-                    <a href={a.url} target="_blank" rel="noopener noreferrer"
-                      style={{ fontSize: 13, color: "var(--accent)", textDecoration: "none",
+                    {safeUrl(a.url) ? (
+                      <a href={safeUrl(a.url)} target="_blank" rel="noopener noreferrer"
+                        style={{ fontSize: 13, color: "var(--accent)", textDecoration: "none",
+                          flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {a.label}
+                      </a>
+                    ) : (
+                      <span title={a.url} style={{ fontSize: 13, color: "var(--warn)",
                         flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {a.label}
-                    </a>
+                        {a.label} - link blocked, not http(s)
+                      </span>
+                    )}
                     <span style={{ fontSize: 10, color: "var(--dim)" }}>{a.by} · {when(a.at)}</span>
                     {canWrite && (
                       <button className="btn" title="Remove link"
@@ -2480,7 +2540,7 @@ function ModelExtras({ model, onAddNote, onDeleteNote, onAddAttachment, onDelete
 function SalesTracker({ model, onSave, canLog }) {
   const rows = allSkus(model);
   const [form, setForm] = useState({
-    date: iso(TODAY), marketplace: "Flipkart", skuRid: rows[0]?.rid ?? "",
+    date: todayISO(), marketplace: "Flipkart", skuRid: rows[0]?.rid ?? "",
     units: "", revenue: "", returns: "", notes: "",
   });
   const [saved, setSaved] = useState(false);
@@ -3069,7 +3129,7 @@ function CSVImport({ existing, onImport, onDone }) {
     const headers = ["Brand", "Model", "Launch Date", "Segment"];
     /* shift() already hands back an ISO string — wrapping it in iso()
        again throws, which used to kill both template buttons */
-    const d = (days) => shift(iso(TODAY), days);
+    const d = (days) => shift(todayISO(), days);
     const rows = [
       ["Samsung", "Galaxy A57 5G",  d(120), "Mid Range"],
       ["Redmi",   "Note 15 Pro 5G", d(95),  "Budget"],
@@ -3083,10 +3143,10 @@ function CSVImport({ existing, onImport, onDone }) {
   const readFile = (file) => {
     if (!file) return;
     setFileErr("");
-    /* The app's Excel template is tab-delimited text with an .xls extension.
+    /* The app's Excel template is tab-delimited text with a .tsv extension.
        Native .xlsx workbooks still need to be saved as CSV first. */
     if (!/\.(csv|txt|tsv|xls)$/i.test(file.name)) {
-      setFileErr("Pick a .csv, .tsv, .txt or Excel-compatible .xls file. Save .xlsx workbooks as CSV first.");
+      setFileErr("Pick a .csv, .tsv, .txt or .xls file. Save .xlsx workbooks as CSV first.");
       return;
     }
     if (file.size > 2_000_000) { setFileErr("That file is over 2 MB — too large to import."); return; }
@@ -3332,7 +3392,7 @@ function AddForm({ onClose, onSave, onImport, existing = [] }) {
       skus: [],   // SKUs are added in the Planned stage
       stage: "research",
       po: null,
-      done: { research: iso(TODAY) },
+      done: { research: todayISO() },
     });
   };
 
@@ -3455,16 +3515,19 @@ function saveFile(filename, content, mime, ext) {
   setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 2000);
 }
 
+/* AUD-035: the second format is tab-separated text, so it is written as .tsv.
+   It used to claim an .xls extension it had no right to, which makes current
+   Excel open it behind a "the file format does not match" warning.      */
 function downloadReport(filename, headers, rows, fmt) {
   const isCSV = fmt === "csv";
   const lines = [headers, ...rows].map((r) =>
     isCSV
-      ? r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")
-      : r.map((v) => String(v ?? "").replace(/[\t\r\n]+/g, " ")).join("\t")
+      ? r.map((v) => `"${exportCell(v).replace(/"/g, '""')}"`).join(",")
+      : r.map((v) => exportCell(v).replace(/[\t\r\n]+/g, " ")).join("\t")
   ).join("\r\n");
   saveFile(filename, lines,
-    isCSV ? "text/csv" : "application/vnd.ms-excel",
-    isCSV ? ".csv" : ".xls");
+    isCSV ? "text/csv" : "text/tab-separated-values",
+    isCSV ? ".csv" : ".tsv");
 }
 
 /* Planned report — every phone at Planned stage with cover details */
@@ -3499,13 +3562,17 @@ function productionReport(models, fmt) {
     "STP Required", "STP Status"
   ];
   const rows = [];
+  /* AUD-013: this column used to be hardcoded "YES", so a SKU Catalog had
+     explicitly marked "Not required" still reported as owing a file — while
+     the same report reached from the Reports tab read the stored decision.
+     Both now read stpLabel, the one place that decision is spelled out. */
   models.filter((m) => m.stage === "production").forEach((m) =>
     allSkus(m).forEach((r) => {
-      const stpRequired = (!r.material || !r.sku) ? "YES — missing data" : "YES";
+      const missing = (!r.material || !r.sku) ? " — missing data" : "";
       rows.push([
         m.brand, m.name, m.segment, m.launch, m.po || "",
         r.sku || "MISSING", r.material || "MISSING", r.units,
-        stpRequired, r.stpStatus || "Not Sent"
+        stpLabel(r) + missing, r.stpStatus || "Not Sent"
       ]);
     })
   );
@@ -4285,22 +4352,50 @@ function InwardStock({ models, onSaveReceipt, onOpen, onMove, canEdit, role }) {
    Click a cell to cycle: not decided → required → not required.     */
 
 const STP_CYCLE  = { und: true, req: false, no: null };
+
+/* every SKU of one material inside one model — the unit a matrix cell acts on.
+   "" is a real group: a bulk-pasted SKU with no material still needs deciding. */
+const cellSkus  = (m, mat) => allSkus(m).filter((r) => (r.material || "") === mat);
+const cellState = (list) => {
+  if (!list.length) return "na";
+  const vals = new Set(list.map((r) => r.stpRequired === true ? "req" : r.stpRequired === false ? "no" : "und"));
+  return vals.size > 1 ? "mixed" : [...vals][0];
+};
+
+/* AUD-013: the matrix columns used to be MATERIAL_NAMES, the four materials
+   hardcoded in this bundle, so a SKU whose material came from a bulk paste or
+   a typo had no cell to decide it in — while the Reports tab and the emailed
+   report both grouped by the material actually stored. The column rule is in
+   rules.js; this feeds it the materials these models really carry. */
+const materialColumns = (models) =>
+  materialColumnsOf(models.flatMap(allSkus).map((r) => r.material || ""), MATERIAL_NAMES);
 /* how a cell reads on screen, and in the report that leaves the building */
 const CELL_TEXT   = { req: "Required", no: "Not required", und: "— decide —", mixed: "Mixed", na: "" };
 const CELL_REPORT = { req: "Required", no: "Not required", und: "Not decided", mixed: "Mixed", na: "—" };
+
+/* AUD-013: the Catalog screen's export and the Reports tab each built this
+   report their own way and disagreed about which materials appear. One builder
+   now serves both, grouping on exactly the cell the matrix shows. The emailed
+   copy is generated server-side and groups the same way — see
+   supabase/functions/send-stp-report/index.ts. Model-wise then material-wise,
+   the shape the MD and the factory asked for. */
+const STP_REPORT_HEADERS = ["Brand", "Model", "Stage", "PO Number", "Material", "SKUs", "Units", "STP File"];
+const stpRequirementRows = (models) => models.flatMap((m) =>
+  materialColumns([m]).map((mat) => [mat, cellSkus(m, mat)])
+    .filter(([, list]) => list.length)
+    .map(([mat, list]) => [
+      m.brand, m.name, STAGES[m.index].label, m.po || "", materialHeader(mat),
+      list.map((r) => r.sku).filter(Boolean).join(" / "),
+      list.reduce((sum, r) => sum + (r.units || 0), 0),
+      CELL_REPORT[cellState(list)],
+    ]));
 
 function STPRequirement({ models, onSetRequired, canEdit, onEmail, emailState }) {
   const queue = models
     .filter((m) => ["ordered", "production"].includes(m.stage) && allSkus(m).length)
     .sort(byUrgency);
 
-  /* every SKU of one material inside one model — the unit a cell acts on */
-  const cellSkus  = (m, mat) => allSkus(m).filter((r) => (r.material || "") === mat);
-  const cellState = (list) => {
-    if (!list.length) return "na";
-    const vals = new Set(list.map((r) => r.stpRequired === true ? "req" : r.stpRequired === false ? "no" : "und"));
-    return vals.size > 1 ? "mixed" : [...vals][0];
-  };
+  const columns = materialColumns(queue);
 
   const setCell = (m, mat, value) => {
     const list = cellSkus(m, mat);
@@ -4320,19 +4415,9 @@ function STPRequirement({ models, onSetRequired, canEdit, onEmail, emailState })
   const undecided = allRows.filter(stpUndecided).length;
   const required  = allRows.filter(stpNeeded).length;
 
-  /* model-wise then material-wise — the shape MD and the factory asked for */
-  const reportRows = () => queue.flatMap((m) =>
-    MATERIAL_NAMES.filter((mat) => cellSkus(m, mat).length).map((mat) => {
-      const list = cellSkus(m, mat);
-      return [m.brand, m.name, STAGES[m.index].label, m.po || "", mat,
-        list.map((r) => r.sku).filter(Boolean).join(" / "),
-        list.reduce((s, r) => s + (r.units || 0), 0),
-        CELL_REPORT[cellState(list)]];
-    }));
-  const REPORT_HEADERS = ["Brand", "Model", "Stage", "PO", "Material", "SKUs", "Units", "STP File"];
-
   const exportReq = (fmt) =>
-    downloadReport("STP_requirement_model_material", REPORT_HEADERS, reportRows(), fmt);
+    downloadReport("STP_requirement_model_material", STP_REPORT_HEADERS,
+      stpRequirementRows(queue), fmt);
 
   const cellStyle = (st) => ({
     cursor: canEdit && st !== "na" ? "pointer" : "default",
@@ -4369,19 +4454,19 @@ function STPRequirement({ models, onSetRequired, canEdit, onEmail, emailState })
           <thead>
             <tr>
               <th>Model</th><th>PO</th>
-              {MATERIAL_NAMES.map((mat) => <th key={mat} style={{ textAlign: "center" }}>{mat}</th>)}
+              {columns.map((mat) => <th key={mat} style={{ textAlign: "center" }}>{materialHeader(mat)}</th>)}
               {canEdit && <th style={{ textAlign: "center" }}>Whole model</th>}
             </tr>
             {canEdit && (
               <tr>
                 <th colSpan={2} style={{ fontWeight: 400, fontSize: 10, color: "var(--dim)" }}>set column →</th>
-                {MATERIAL_NAMES.map((mat) => (
+                {columns.map((mat) => (
                   <th key={mat} style={{ textAlign: "center", fontWeight: 400 }}>
                     <button className="btn" style={{ fontSize: 10, padding: "2px 5px" }}
-                      title={`Every model needs an STP file for ${mat}`}
+                      title={`Every model needs an STP file for ${materialHeader(mat)}`}
                       onClick={() => setMaterial(mat, true)}>Req</button>
                     <button className="btn" style={{ fontSize: 10, padding: "2px 5px", marginLeft: 3 }}
-                      title={`No model needs an STP file for ${mat}`}
+                      title={`No model needs an STP file for ${materialHeader(mat)}`}
                       onClick={() => setMaterial(mat, false)}>No</button>
                   </th>
                 ))}
@@ -4394,7 +4479,7 @@ function STPRequirement({ models, onSetRequired, canEdit, onEmail, emailState })
               <tr key={m.id} style={{ cursor: "default" }}>
                 <td style={{ fontWeight: 550, fontSize: 12 }}>{m.brand} {m.name}</td>
                 <td style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--dim)" }}>{m.po || "—"}</td>
-                {MATERIAL_NAMES.map((mat) => {
+                {columns.map((mat) => {
                   const st = cellState(cellSkus(m, mat));
                   return (
                     <td key={mat} style={cellStyle(st)}
@@ -4454,7 +4539,10 @@ function CatalogInward({ models, onSaveReceipt, onSetRequired, onOpen, onMove,
     setEmailState("sending");
     const result = await dbSendReport(approval.approvalId, approvalCode);
     setEmailState("idle");
-    if (result.error) return onNotify(`⚠ ${result.error}`);
+    /* The approval and the typed code are deliberately left in place on
+       failure: the server releases an unused code, so Send works again. */
+    if (result.error) return onNotify(`⚠ ${result.error}`
+      + (result.retryable ? " — your code is still valid, press Send again." : ""));
     setApproval(null); setApprovalCode(""); onNotify("Report emailed to the configured recipients");
   };
 
@@ -4881,25 +4969,12 @@ function buildReportRows(reportKey, models) {
           r.sku || "MISSING", r.material || "MISSING", r.units,
           stpLabel(r), r.stpStatus || "Not Sent"])),
     };
-    /* Model-wise then material-wise — the shape MD and the factory asked for.
-       One row per material per model, collapsing the SKUs that share it. */
-    case "stp-requirement": {
-      const inPlay = models.filter((m) => ["ordered", "production"].includes(m.stage));
-      return {
-        headers: ["Brand", "Model", "Stage", "PO Number", "Material", "SKUs", "Units", "STP File"],
-        rows: inPlay.flatMap((m) => {
-          const byMaterial = {};
-          allSkus(m).forEach((r) => { (byMaterial[r.material || "—"] ||= []).push(r); });
-          return Object.entries(byMaterial).map(([mat, list]) => {
-            const decided = new Set(list.map((r) => stpLabel(r)));
-            return [m.brand, m.name, STAGES[m.index].label, m.po || "", mat,
-              list.map((r) => r.sku).filter(Boolean).join(" / "),
-              list.reduce((s, r) => s + (r.units || 0), 0),
-              decided.size > 1 ? "Mixed" : [...decided][0]];
-          });
-        }),
-      };
-    }
+    /* AUD-013: built by the one shared builder, so this agrees cell for cell
+       with the Catalog screen's export and with the emailed copy. */
+    case "stp-requirement": return {
+      headers: STP_REPORT_HEADERS,
+      rows: stpRequirementRows(models.filter((m) => ["ordered", "production"].includes(m.stage))),
+    };
     case "received": return {
       headers: ["Brand", "Model", "Segment", "Launch Date", "PO Number", "SKU", "Material", "Planned Qty", "Received Qty", "Short By", "Status"],
       rows: models.filter((m) => m.stage === "received").flatMap((m) =>
@@ -4983,7 +5058,7 @@ function Reports({ models }) {
             <button className="btn" data-primary="1" onClick={() => download("csv")}
               style={{ fontSize: 12 }}>↓ Download CSV</button>
             <button className="btn" onClick={() => download("excel")}
-              style={{ fontSize: 12 }}>↓ Download Excel (.xls)</button>
+              style={{ fontSize: 12 }}>↓ Download Excel (.tsv)</button>
           </div>
         </div>
 
@@ -5056,8 +5131,17 @@ function UserManager({ users, perms, onSave, onSavePerms, onClose }) {
   const startEdit = (u) => { setEditing(u.id); setForm({ name: u.name.split(" (")[0], role: u.role }); setNewPin(""); setMsg(""); };
   const cancelEdit = () => { setEditing(null); setNewPin(""); setMsg(""); };
 
+  /* AUD-011: the only guard here used to be `list.length <= 1`, which counts
+     users, not admins. Demoting the last admin, or removing it while any other
+     account existed, left nobody able to open this dialog or the role matrix —
+     manageUsers and reset are locked to admin (see LOCKED_TO_ADMIN in
+     roles.js), so there was no way back in through the application at all.
+     Recovery meant editing the users table by hand.                        */
+  const LAST_ADMIN_MSG = "This is the last admin — promote another account first, or nobody can manage users.";
+
   const saveUser = (id) => {
     if (!form.name?.trim()) return;
+    if (wouldStrandAdmins(list, id, form.role)) { setMsg(LAST_ADMIN_MSG); return; }
     const name = form.name.trim();
     setList(l => l.map(u => u.id !== id ? u : {
       ...u,
@@ -5080,6 +5164,7 @@ function UserManager({ users, perms, onSave, onSavePerms, onClose }) {
 
   const removeUser = (id) => {
     if (list.length <= 1) return;
+    if (isLastAdmin(list, id)) { setMsg(LAST_ADMIN_MSG); return; }
     setList(l => l.filter(u => u.id !== id));
     if (editing === id) cancelEdit();
   };
@@ -5332,9 +5417,21 @@ function DBSetupScreen({ onDone, onSkip }) {
         <div className="card" style={{ fontSize: 12, color: "var(--dim)", lineHeight: 1.7 }}>
           <strong style={{ color: "var(--text)" }}>Setup steps:</strong><br />
           1. Create a free Supabase project at <strong>supabase.com</strong><br />
-          2. Run <strong>schema.sql</strong> in the SQL Editor<br />
+          2. Run <strong>schema-bootstrap.sql</strong> in the SQL Editor, then{" "}
+          <strong>schema-roles.sql</strong><br />
           3. Go to <strong>Settings → API</strong> and copy the Project URL and anon key<br />
           4. Paste both above and click Test connection<br />
+          {/* AUD-030: this screen is reachable while a working database is
+              already configured, and it used to say "Run schema.sql" — the
+              file that opens by dropping the phones and users tables. An
+              operator following the instruction wiped live data. */}
+          <br />
+          <span style={{ color: "var(--warn)" }}>
+            Do not run <strong>schema.sql</strong> on a database that holds anything
+            you want to keep. It drops the phones and users tables first, and there
+            is no undo. It is the wipe-and-start-again file;{" "}
+            <strong>schema-bootstrap.sql</strong> creates only what is missing.
+          </span><br />
           <br />
           <button className="btn" style={{ fontSize: 11 }} onClick={onSkip}>
             Skip — use local memory only (data won't be saved)
@@ -5528,6 +5625,9 @@ export default function App() {
   /* How many saves are still in the air. A refresh during that window used to
      drop the edit without a word, because the success toast had already fired. */
   const pendingWrites = useRef(0);
+  /* Bumped on every persist(), so saved() can tell its own writes from writes
+     that were already in writeState before the action started (AUD-017). */
+  const writeSeq = useRef(0);
 
   /* ── session state ── */
   const [users, setUsers]     = useState(DEFAULT_USERS);
@@ -5548,6 +5648,10 @@ export default function App() {
 
   /* ── app state ── */
   const [phones, setPhones] = useState(EMPTY);
+  /* The live list, for handlers that must not classify against a render-time
+     copy of it (AUD-027). */
+  const phonesRef = useRef(phones);
+  phonesRef.current = phones;
   /* Two different things used to share one `loading` flag, which is why a
      routine 90-second background re-read threw up the same full-screen,
      click-blocking overlay as the very first load.
@@ -5638,30 +5742,23 @@ export default function App() {
     return () => { clearInterval(timer); window.removeEventListener("focus", refresh); };
   }, [dbOnline]);
 
-  /* ── write-through helper: update local state + persist ── */
-  const persistLegacy = async (updatedPhone) => {
-    if (!dbOnline) return;
-    const { error, conflict, updatedAt } = await dbUpsertPhone(updatedPhone);
-
-    if (conflict) {
-      say("⚠ Someone else changed this phone — reloading, please redo your edit");
-      loadFromDB();
-      return;
-    }
-    if (error) { say("⚠ DB save failed: " + error); return; }
-
-    /* hold the new stamp so the next save from this tab compares correctly */
-    if (updatedAt) setPhones((list) => list.map((p) =>
-      p.id === updatedPhone.id ? { ...p, updatedAt } : p));
-  };
-
+  /* ── write-through helper: update local state + persist ──
+     AUD-032: persistLegacy, the un-queued predecessor of this function, used to
+     sit here unreferenced. It had no serialisation and reloaded the whole list
+     on conflict; keeping a second, weaker write path around invited a future
+     caller to use it by mistake. Deleted — git history has it. */
   const persist = (updatedPhone) => {
     if (!dbOnline) return Promise.resolve();
     const id = updatedPhone.id;
     pendingWrites.current++;
     const state = writeState.current.get(id) || {
-      version: updatedPhone.updatedAt, queue: Promise.resolve(), conflicted: false,
+      version: updatedPhone.updatedAt, queue: Promise.resolve(), conflicted: false, seq: 0,
     };
+    /* AUD-017: saved() waits on the writes an action actually started, and this
+       is the mark it compares against. Without it, saved() awaited every entry
+       in writeState, so one model that had ever failed suppressed the success
+       message for every later edit to every other model. */
+    state.seq = ++writeSeq.current;
     writeState.current.set(id, state);
     state.queue = state.queue.then(async () => {
       /* Already lost a race on this phone. Every edit until the next refresh is
@@ -5675,10 +5772,26 @@ export default function App() {
         ? await dbUpdatePhone(updatedPhone, state.version)
         : await dbUpsertPhone(updatedPhone);
       if (result.conflict) {
-        state.conflicted = true;
-        conflictedIdsRef.current = new Set(conflictedIdsRef.current).add(id);
-        setConflictedIds((ids) => new Set(ids).add(id));
-        say("Save conflict — someone else changed this model. Refresh before editing it again.");
+        /* AUD-008: this used to set a latch that only a full manual reload
+           cleared — and because loadFromDB skips any background read while a
+           conflict is outstanding, one lost race froze the 90-second sync for
+           every other model until someone noticed. Re-read just this row
+           instead: that is the newer version the write was refused against,
+           so applying it both resolves the conflict and leaves the rest of
+           the list syncing normally. The edit itself is still lost, which is
+           what the message has to say. */
+        const fresh = await dbLoadPhone(id);
+        if (fresh.error || !fresh.data) {
+          state.conflicted = true;
+          conflictedIdsRef.current = new Set(conflictedIdsRef.current).add(id);
+          setConflictedIds((ids) => new Set(ids).add(id));
+          say("Save conflict, and the newer version could not be read — refresh before editing this model again.");
+          return { conflict: true };
+        }
+        state.version = fresh.data.updatedAt;
+        state.conflicted = false;
+        setPhones((list) => list.map((p) => p.id === id ? fresh.data : p));
+        say("Not saved — someone else changed this model first. It has been reloaded; redo your edit.");
         return { conflict: true };
       }
       if (result.error) { say("DB save failed: " + result.error); return result; }
@@ -5715,8 +5828,10 @@ export default function App() {
     /* persist() runs inside the setPhones updater, which React may not have run
        yet, so give it a tick to register before waiting on the write queue.
        persist() already toasts its own failures; only success speaks here. */
+    const mark = writeSeq.current;
     setTimeout(() => {
-      Promise.allSettled([...writeState.current.values()].map((w) => w.queue))
+      const mine = [...writeState.current.values()].filter((w) => w.seq > mark);
+      Promise.allSettled(mine.map((w) => w.queue))
         .then((results) => {
           if (!results.some((r) => r.value?.error || r.value?.conflict)) say(text);
         });
@@ -5774,15 +5889,16 @@ export default function App() {
       if (isTerminal(stageKey))
         return withAudit({ ...p, stage: stageKey, done }, session, `Marked ${label}`);
       /* Coming back from a terminal stage keeps the timeline it already earned.
-         A phone un-procured at Ordered really did pass Planned and Ordered, and
-         it still holds the PO and SKUs from that run — stripping the dates would
-         leave the record contradicting itself. The forward walk below uses ||=,
-         so nothing gets re-stamped on the way through a second time. */
+         AUD-036: this comment used to describe a phone un-procured at Ordered
+         keeping its PO and SKUs, which moveStatus forbids - only
+         Research -> Un-Procurement and Un-Procurement -> Research pass the
+         gate, so the only stamp to preserve here is the Research date. The
+         forward walk below uses ||= so it is not re-stamped. */
       if (isTerminal(p.stage))
         return withAudit({ ...p, stage: stageKey, done }, session, `Back into procurement at ${label}`);
 
       const forward = target > stageIndex(p.stage);
-      if (forward) PIPELINE.slice(0, target + 1).forEach((s) => { done[s.key] ||= iso(TODAY); });
+      if (forward) PIPELINE.slice(0, target + 1).forEach((s) => { done[s.key] ||= todayISO(); });
       /* moving back: strip the dates for stages that un-happened,
          so the timeline stays honest */
       else PIPELINE.slice(target + 1).forEach((s) => { delete done[s.key]; });
@@ -5820,6 +5936,7 @@ export default function App() {
 
   /* save edited phone details from ResearchEditor */
   const saveResearch = (id, edits) => {
+    if (!CAN.editResearch(role)) { say(`⚠ ${roleLabel(role)} can't edit phone details`); return; }
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit({ ...p, ...edits }, session, "Edited phone details"));
       const u = next.find(p => p.id === id); if (u) persist(u);
@@ -5830,6 +5947,7 @@ export default function App() {
 
   /* save covers array from PlannedSKUEditor */
   const saveSKU = (id, skus) => {
+    if (!CAN.editSKUs(role)) { say(`⚠ ${roleLabel(role)} can't edit SKUs`); return; }
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit({ ...p, skus }, session, `Saved ${skus.length} SKU${skus.length === 1 ? "" : "s"}`));
       const u = next.find(p => p.id === id); if (u) persist(u);
@@ -5841,6 +5959,7 @@ export default function App() {
   /* update STP file status from ProductionSTP */
   /* STP status is set per SKU — rows is a map of rid -> status */
   const updateSTP = (id, statusByRid) => {
+    if (!CAN.updateSTP(role)) { say(`⚠ ${roleLabel(role)} can't update STP status`); return; }
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit({
         ...p, skus: p.skus.map((r) => statusByRid[r.rid] ? { ...r, stpStatus: statusByRid[r.rid] } : r),
@@ -5870,6 +5989,7 @@ export default function App() {
 
   /* listingsByRid = { rid: { Flipkart: "Live", ... } } */
   const saveListings = (id, listingsByRid) => {
+    if (!CAN.saveListing(role)) { say(`⚠ ${roleLabel(role)} can't set listing status`); return; }
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit({
         ...p, skus: p.skus.map((r) => listingsByRid[r.rid]
@@ -5898,7 +6018,12 @@ export default function App() {
     const blocked = [];
     const stale = [];
 
-    phones.forEach((p) => {
+    /* AUD-027: this used to read `phones`, the list captured when the component
+       last rendered. A background sync landing between the render and the click
+       meant the gate was checked against stale stages, so a model someone else
+       had already moved could be received a second time. `phonesRef` always
+       holds what state actually contains now. */
+    phonesRef.current.forEach((p) => {
       if (!wantedGot.has(p.id) && !wantedMissing.has(p.id)) return;
       if (p.stage !== "production") { stale.push(p); return; }
       if (wantedGot.has(p.id)) {
@@ -5924,7 +6049,7 @@ export default function App() {
       const next = list.map((p) => {
         if (received.includes(p.id)) {
           const done = { ...p.done };
-          PIPELINE.slice(0, stageIndex("received") + 1).forEach((st) => { done[st.key] ||= iso(TODAY); });
+          PIPELINE.slice(0, stageIndex("received") + 1).forEach((st) => { done[st.key] ||= todayISO(); });
           return withAudit({
             ...p, stage: "received", done,
             skus: p.skus.map((r) => ({ ...r, receivedQty: r.units, receiptState: "full" })),
@@ -5957,6 +6082,7 @@ export default function App() {
 
   /* Assign one PO number to several models at once */
   const assignPO = (ids, po) => {
+    if (!CAN.savePO(role)) { say(`⚠ ${roleLabel(role)} can't assign a PO`); return; }
     setPhones((list) => {
       const next = list.map((p) => ids.includes(p.id) ? withAudit({ ...p, po: po.trim() }, session, `Added to PO ${po.trim()}`) : p);
       next.filter((p) => ids.includes(p.id)).forEach(persist);
@@ -5966,6 +6092,7 @@ export default function App() {
   };
 
   const savePO = (id, po) => {
+    if (!CAN.savePO(role)) { say(`⚠ ${roleLabel(role)} can't set a PO number`); return; }
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit({ ...p, po: po.trim() }, session, po.trim() ? `PO set to ${po.trim()}` : "PO cleared"));
       const u = next.find(p => p.id === id); if (u) persist(u);
@@ -5992,6 +6119,7 @@ export default function App() {
   };
 
   const logSale = (id, entry) => {
+    if (!CAN.logSales(role)) { say(`⚠ ${roleLabel(role)} can't log a sale`); return; }
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit({
         ...p, salesEntries: [...(p.salesEntries || []), entry],
@@ -6003,6 +6131,7 @@ export default function App() {
   };
 
   const resetAll = async () => {
+    if (!CAN.reset(role)) { say(`⚠ ${roleLabel(role)} can't delete the database`); return; }
     if (dbOnline) await dbDeleteAllPhones();
     setPhones([]);
     setOpenId(null);
@@ -6011,6 +6140,12 @@ export default function App() {
     say("All phones deleted");
   };
 
+  /* AUD-009 / open question: notes and attachments have no permission key, so
+     any signed-in user can add one and delete anyone else's. That is the
+     behaviour as shipped, not an oversight this change decided to settle —
+     whether commentary needs its own key, and whether deletion should be
+     limited to the author, is a business call (BRD OQ-09). Left as-is on
+     purpose; add keys to PERM_KEYS in roles.js when that is decided.     */
   const addNote = (id, text) => {
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit(
@@ -6052,6 +6187,7 @@ export default function App() {
   };
 
   const setArchived = (id, archived) => {
+    if (!CAN.archive(role)) { say(`⚠ ${roleLabel(role)} can't archive a model`); return; }
     setPhones((list) => {
       const next = list.map((p) => p.id !== id ? p : withAudit(
         { ...p, archived }, session, archived ? "Archived" : "Restored from archive"));
@@ -6072,7 +6208,7 @@ export default function App() {
     rows.forEach((r) => made.push(withAudit({
       id: newPhoneId([...phones, ...made]), brand: r.brand, name: r.name, segment: r.segment,
       launch: r.launch, stage: "research", po: null,
-      done: { research: iso(TODAY) }, skus: [], salesEntries: [],
+      done: { research: todayISO() }, skus: [], salesEntries: [],
       notes: [], attachments: [], archived: false,
     }, session, "Imported from CSV")));
     setPhones((list) => [...list, ...made]);
