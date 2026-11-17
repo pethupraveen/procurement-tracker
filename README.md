@@ -2,7 +2,7 @@
 
 > A shared workspace for taking a phone-case range from market research to a live marketplace listing.
 
-[Open the live app](https://pethupraveen.github.io/procurement-tracker/)
+[Open the live app](https://procurement-tracker-tau.vercel.app)
 
 ## At a glance
 
@@ -22,7 +22,7 @@ flowchart LR
 ~~~
 
 The tracker is a single-page React application built with Vite. It stores shared
-procurement data in Supabase and deploys automatically to GitHub Pages.
+procurement data in Supabase and deploys automatically to Vercel.
 
 ## What it tracks
 
@@ -136,14 +136,15 @@ flowchart TB
     Entry[src/main.jsx<br/>Mounts the app]
     DB[(Supabase<br/>users + phones + stage_summary)]
     Schema[schema-bootstrap.sql<br/>Tables, trigger, seed users]
-    Deploy[GitHub Actions]
-    Pages[GitHub Pages]
+    CI[GitHub Actions<br/>check + build]
+    Deploy[Vercel<br/>main to production,<br/>branches to previews]
 
     Browser --> App
     Entry --> App
     App <--> DB
     Schema --> DB
-    Deploy --> Pages
+    App --> CI
+    App --> Deploy
 ~~~
 
 | Location | Purpose |
@@ -158,7 +159,7 @@ flowchart TB
 | <code>schema-compatibility.sql</code> | Compatibility migration script |
 | <code>schema-report-approval.sql</code> | Approval and send-log tables for the emailed STP report |
 | <code>supabase/functions/</code> | Two Edge Functions: request an approval code, send the approved report |
-| <code>.github/workflows/ci.yml</code> | Runs <code>npm ci</code>, <code>npm run check</code> and <code>npm run build</code> on every push |
+| <code>.github/workflows/ci.yml</code> | Runs <code>npm ci</code>, <code>npm run check</code> and <code>npm run build</code> on every push. The only workflow — deployment is Vercel's, not this repository's |
 
 ## Run locally
 
@@ -261,39 +262,45 @@ column.
 ~~~mermaid
 flowchart LR
     Push[Push to any branch] --> CI[.github/workflows/ci.yml]
+    Push --> Vercel[Vercel Git integration]
     CI --> Check[npm run check]
     CI --> Build[npm run build]
+    Vercel --> Prod[main -> production]
+    Vercel --> Prev[any branch -> preview URL]
 ~~~
 
-Every push runs <code>.github/workflows/ci.yml</code>, which installs with
-<code>npm ci</code>, runs the role self-check, and builds <code>dist/</code>.
+**Deployment is Vercel's, not this repository's.** The Vercel project is
+connected to the GitHub repo directly, so:
 
-> **There is currently no deploy workflow in this repository, and pushing to
-> <code>main</code> no longer publishes anything.**
->
-> There was one. <code>.github/workflows/deploy.yml</code> built
-> <code>dist/</code> and published it to GitHub Pages, and its last successful
-> runs were in September 2026. It was deleted in commit <code>afad51c</code>
-> ("Add Customer Care team and move permissions into the database") — a commit
-> about permissions, which suggests the deletion was not intended. Audit
-> finding AUD-007 recorded the absence; this note records how it happened.
->
-> Recover it with <code>git show 4fa2755:.github/workflows/deploy.yml</code>,
-> the last version before the deletion. Check it before restoring it: the
-> preceding commit is titled "Allow clean manual Pages deployments", so
-> somebody may have been moving to manual deploys on purpose. Until that is
-> settled, publish by building locally and uploading <code>dist/</code>.
+- a push to <code>main</code> deploys to production,
+  <https://procurement-tracker-tau.vercel.app>;
+- a push to any other branch gets its own preview URL, which is how a change
+  is reviewed before it is merged.
 
-A restored deploy job should keep the
-<code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> Actions
-secrets. They are read at build time (<code>src/App.jsx</code>,
+There is deliberately **no deploy workflow here**. One used to publish to
+GitHub Pages; it was removed in <code>afad51c</code>, the same commit that the
+Vercel project was created alongside — the move to Vercel was intentional, not
+an accident. Do not restore it: two deploy paths publishing the same app
+against the same database means one of them silently goes stale.
+
+<code>.github/workflows/ci.yml</code> still runs on every push and is the thing
+that gates a merge: <code>npm ci</code>, <code>npm run check</code>,
+<code>npm run build</code>.
+
+<code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> are set
+in **Vercel** (Project → Settings → Environment Variables), for production and
+preview both. They are read at build time (<code>src/App.jsx</code>,
 <code>ENV_DB_CONFIG</code>) and baked into the bundle, so every visitor gets a
 working connection without being shown the DB Setup screen. A config saved in a
-given browser's local storage still wins over them, which is how an admin
-points one machine at a different project.
+given browser's local storage still wins over them — see "Pointing one browser
+at a different project" above.
 
-<code>vite.config.js</code> uses <code>base: "./"</code>, allowing the deployed
-app to work from the <code>/procurement-tracker/</code> project subpath.
+> Preview deployments carry the **production** database credentials. A preview
+> is not a safe place to try something destructive; use the DB Setup override
+> to point your browser at a test project first.
+
+<code>vite.config.js</code> uses <code>base: "./"</code>, which is harmless on
+Vercel and was needed for the old Pages subpath.
 
 ## Security note
 

@@ -1,11 +1,12 @@
-# AUD-007: the repository had no workflows directory at all, while README.md
-# described a deploy.yml that builds and publishes the app. Nothing checked a
-# push, so a change that broke the build or the role self-check could reach
+# AUD-007: the repository had no workflows directory at all, so nothing checked
+# a push and a change that broke the build or the role self-check could reach
 # main unnoticed.
 #
-# This runs the two checks the project actually has. It does not deploy —
-# how the app reaches its users is an open question (BRD OQ-10), and a
-# release workflow should not be invented on its behalf.
+# This runs the two checks the project actually has, and nothing else. It does
+# NOT deploy, and no workflow here should: deployment is Vercel's, connected to
+# this repo directly, publishing main to production and every other branch to
+# its own preview URL. A deploy workflow here would be a second path publishing
+# the same app against the same database, and one of the two would go stale.
 
 name: CI
 
@@ -23,8 +24,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # Matches deploy.yml, so a green run here proves what the deploy
-          # job builds. Node 24 is also what local development uses.
+          # Node 24 is what local development uses. Keep it in step with the
+          # Node version Vercel builds with, or a green run here stops being
+          # evidence about what ships.
           node-version: 24
           cache: npm
 
