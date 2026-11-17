@@ -2,7 +2,7 @@
 
 > A shared workspace for taking a phone-case range from market research to a live marketplace listing.
 
-[Open the live app](https://pethupraveen.github.io/procurement-tracker/)
+[Open the live app](https://procurement-tracker-tau.vercel.app)
 
 ## At a glance
 
@@ -22,7 +22,7 @@ flowchart LR
 ~~~
 
 The tracker is a single-page React application built with Vite. It stores shared
-procurement data in Supabase and deploys automatically to GitHub Pages.
+procurement data in Supabase and deploys automatically to Vercel.
 
 ## What it tracks
 
@@ -136,14 +136,15 @@ flowchart TB
     Entry[src/main.jsx<br/>Mounts the app]
     DB[(Supabase<br/>users + phones + stage_summary)]
     Schema[schema-bootstrap.sql<br/>Tables, trigger, seed users]
-    Deploy[GitHub Actions]
-    Pages[GitHub Pages]
+    CI[GitHub Actions<br/>check + build]
+    Deploy[Vercel<br/>main to production,<br/>branches to previews]
 
     Browser --> App
     Entry --> App
     App <--> DB
     Schema --> DB
-    Deploy --> Pages
+    App --> CI
+    App --> Deploy
 ~~~
 
 | Location | Purpose |
@@ -153,11 +154,12 @@ flowchart TB
 | <code>schema.sql</code> | Full Supabase schema, view, trigger, and seed users. <strong>Drops the tables first</strong> |
 | <code>schema-bootstrap.sql</code> | Non-destructive version of the above: creates only what is missing |
 | <code>schema-roles.sql</code> | The <code>role_permissions</code> table behind the admin matrix |
+| <code>schema-master-child.sql</code> | Adds <code>phones.master_id</code> for models that share a case |
 | <code>schema-phase3.sql</code> | Additional database migration script |
 | <code>schema-compatibility.sql</code> | Compatibility migration script |
 | <code>schema-report-approval.sql</code> | Approval and send-log tables for the emailed STP report |
 | <code>supabase/functions/</code> | Two Edge Functions: request an approval code, send the approved report |
-| <code>.github/workflows/ci.yml</code> | Runs <code>npm ci</code>, <code>npm run check</code> and <code>npm run build</code> on every push |
+| <code>.github/workflows/ci.yml</code> | Runs <code>npm ci</code>, <code>npm run check</code> and <code>npm run build</code> on every push. The only workflow — deployment is Vercel's, not this repository's |
 
 ## Run locally
 
@@ -188,6 +190,33 @@ VITE_SUPABASE_ANON_KEY=<anon-or-publishable-key>
 Without these values, the app opens the Admin-only **DB Setup** screen. The
 same values can be entered there and stored in that browser's local storage.
 
+### Pointing one browser at a different project
+
+`.env.local` and the GitHub Actions secrets configure every visitor, so
+<code>npm run dev</code> talks to whatever project they name — in this
+repository, the same one the live site uses. **Local development is therefore
+production access by default.** Anything destructive you try locally, a bulk
+receive or a reset, lands on real rows.
+
+To work against a throwaway project instead, without touching `.env.local` or
+anyone else's machine:
+
+1. Create a second Supabase project, then run
+   [schema-bootstrap.sql](schema-bootstrap.sql),
+   [schema-roles.sql](schema-roles.sql) and, if you need the emailed report,
+   [schema-report-approval.sql](schema-report-approval.sql) on it.
+2. Sign in as an admin and press the **⚙** button in the header.
+3. Paste the test project's URL and anon key, **Test connection**, then
+   **Save and continue**.
+
+A config saved in a browser always beats the build-time values, so only that
+browser moves. While one is in force the header shows a **⚠ project-ref** pill
+next to the connection dot — if you do not see it, you are on the shipped
+project, which is to say production. **↩ Back to _ref_** on the same screen
+discards the override and returns that browser to the build's own project.
+
+The pill shows the project ref only, never a key.
+
 To create the database, run [schema-bootstrap.sql](schema-bootstrap.sql) in the
 Supabase SQL editor, then [schema-roles.sql](schema-roles.sql). Use
 [schema.sql](schema.sql) only to wipe an existing database and start again.
@@ -195,44 +224,83 @@ Supabase SQL editor, then [schema-roles.sql](schema-roles.sql). Use
 > Warning: <code>schema.sql</code> drops its tables before recreating them. Do
 > not run it against a populated production database.
 
+## Master and child models
+
+Two phones can be the same handset under different names. A Vivo V70 case fits
+a V70FE exactly, so ordering a case for each buys the same stock twice. Mark
+one model the **master** and the other its **child**:
+
+- the master is ordered, produced and received — **once**;
+- the child is never ordered, never carries a PO and never receives goods;
+- **both** are listed and tracked on every marketplace, because each
+  marketplace needs its own listing;
+- the child's stock **is** the master's stock. A V70FE sale draws down V70's
+  on-hand, and the 20% reorder trigger fires on the combined figure.
+
+Set it at **Planned**, the last point before the purchase order is built: open
+the model, find **Master / child**, and link it. Then map each of the child's
+SKUs to the master SKU whose stock it sells, in the **Sells from** column of
+the SKU table.
+
+A child cannot leave Planned until both are done **and** the master has reached
+Received. It then goes straight to Received, skipping Ordered and Production,
+which it genuinely does not have. The board, the PO builder, the inward queue,
+bulk receive and the STP matrix all exclude children — that is what makes
+"ordered once" true in the data rather than only on screen.
+
+**One level only.** A child can never itself be a master. If three handsets
+share a case, all three children point at the one master.
+
+Run [schema-master-child.sql](schema-master-child.sql) **before deploying** a
+build with this feature. The app leaves `master_id` out of a save while a model
+has no master, so an un-migrated database keeps saving existing models
+normally — but the first attempt to link a child will fail on an unknown
+column.
+
 ## Deploy
 
 ~~~mermaid
 flowchart LR
     Push[Push to any branch] --> CI[.github/workflows/ci.yml]
+    Push --> Vercel[Vercel Git integration]
     CI --> Check[npm run check]
     CI --> Build[npm run build]
+    Vercel --> Prod[main -> production]
+    Vercel --> Prev[any branch -> preview URL]
 ~~~
 
-Every push runs <code>.github/workflows/ci.yml</code>, which installs with
-<code>npm ci</code>, runs the role self-check, and builds <code>dist/</code>.
+**Deployment is Vercel's, not this repository's.** The Vercel project is
+connected to the GitHub repo directly, so:
 
-> **There is currently no deploy workflow in this repository, and pushing to
-> <code>main</code> no longer publishes anything.**
->
-> There was one. <code>.github/workflows/deploy.yml</code> built
-> <code>dist/</code> and published it to GitHub Pages, and its last successful
-> runs were in September 2026. It was deleted in commit <code>afad51c</code>
-> ("Add Customer Care team and move permissions into the database") — a commit
-> about permissions, which suggests the deletion was not intended. Audit
-> finding AUD-007 recorded the absence; this note records how it happened.
->
-> Recover it with <code>git show 4fa2755:.github/workflows/deploy.yml</code>,
-> the last version before the deletion. Check it before restoring it: the
-> preceding commit is titled "Allow clean manual Pages deployments", so
-> somebody may have been moving to manual deploys on purpose. Until that is
-> settled, publish by building locally and uploading <code>dist/</code>.
+- a push to <code>main</code> deploys to production,
+  <https://procurement-tracker-tau.vercel.app>;
+- a push to any other branch gets its own preview URL, which is how a change
+  is reviewed before it is merged.
 
-A restored deploy job should keep the
-<code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> Actions
-secrets. They are read at build time (<code>src/App.jsx</code>,
+There is deliberately **no deploy workflow here**. One used to publish to
+GitHub Pages; it was removed in <code>afad51c</code>, the same commit that the
+Vercel project was created alongside — the move to Vercel was intentional, not
+an accident. Do not restore it: two deploy paths publishing the same app
+against the same database means one of them silently goes stale.
+
+<code>.github/workflows/ci.yml</code> still runs on every push and is the thing
+that gates a merge: <code>npm ci</code>, <code>npm run check</code>,
+<code>npm run build</code>.
+
+<code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> are set
+in **Vercel** (Project → Settings → Environment Variables), for production and
+preview both. They are read at build time (<code>src/App.jsx</code>,
 <code>ENV_DB_CONFIG</code>) and baked into the bundle, so every visitor gets a
 working connection without being shown the DB Setup screen. A config saved in a
-given browser's local storage still wins over them, which is how an admin
-points one machine at a different project.
+given browser's local storage still wins over them — see "Pointing one browser
+at a different project" above.
 
-<code>vite.config.js</code> uses <code>base: "./"</code>, allowing the deployed
-app to work from the <code>/procurement-tracker/</code> project subpath.
+> Preview deployments carry the **production** database credentials. A preview
+> is not a safe place to try something destructive; use the DB Setup override
+> to point your browser at a test project first.
+
+<code>vite.config.js</code> uses <code>base: "./"</code>, which is harmless on
+Vercel and was needed for the old Pages subpath.
 
 ## Security note
 

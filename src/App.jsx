@@ -4,7 +4,10 @@ import { PERM_KEYS, PERM_LABELS, DEFAULT_PERMS, LOCKED_TO_ADMIN,
 /* The Phase 1 audit fixes that are worth asserting live in rules.js so the
    existing zero-dependency self-check can run them — see roles.selfcheck.mjs. */
 import { exportCell, safeUrl as safeUrlOf, wouldStrandAdmins, isLastAdmin,
-         materialColumns as materialColumnsOf, materialHeader } from "./rules.js";
+         materialColumns as materialColumnsOf, materialHeader,
+         projectRef as dbProjectRef, isConfigOverride,
+         isChildModel, childrenOf, isMasterModel, masterLinkProblem,
+         eligibleMasters, childSkuMappingProblems } from "./rules.js";
 /* CalendarDays and Inbox are aliased on import: the local components below are
    already called Calendar and Table, and Calendar/Inward previously reused the
    Dashboard and Orders icons, so two pairs of tabs were visually identical. */
@@ -142,6 +145,11 @@ function repairSkuRids(phone) {
 const skuRow = (sku = "", material = "", units = 0) => ({
   rid: newRid(),             // stable React key, never shown to the user
   sku, material, units,
+  /* On a CHILD model only: the rid of the master model's SKU this one sells
+     from. Vivo V70FE lists its own SKU on each marketplace but draws stock
+     from the V70 SKU it is mapped to, so nothing is ordered twice. null on a
+     master, and on a child until Catalog maps it at Planned. */
+  masterRid: null,
   stpStatus: "Not Sent",     // STP file is tracked per SKU, not per phone
   /* Whether this SKU needs an STP file at all — Catalog's call, made model-wise
      and material-wise. Tri-state on purpose: null means nobody has decided yet,
@@ -203,22 +211,49 @@ const REORDER_PCT = 20;
    received − sold + returned. Sales entries may name a SKU; those
    that don't are phone-level and only affect the phone total.    */
 
-function stockOfSku(model, sku) {
-  const entries = (model.salesEntries || []).filter((e) => e.skuRid === sku.rid);
-  const sold     = entries.reduce((t, e) => t + (e.units   || 0), 0);
-  const returned = entries.reduce((t, e) => t + (e.returns || 0), 0);
-  const received = sku.receivedQty ?? 0;
-  const onHand   = Math.max(0, received - sold + returned);
-  const pct      = received > 0 ? Math.round((onHand / received) * 100) : 0;
-  return { received, sold, returned, onHand, pct, low: received > 0 && pct <= REORDER_PCT };
-}
+/* A master and its children sell from ONE pool of stock, because they are the
+   same case: only the master is ordered and only the master receives goods.
+   So every figure below is computed for the pool, and the master and each of
+   its children report the same numbers.
 
-function stockOfModel(model) {
-  const rows = allSkus(model).map((r) => ({ sku: r, ...stockOfSku(model, r) }));
+   The join is not direct. A sale against Vivo V70FE names a V70FE SKU rid,
+   while the stock sits on a V70 SKU — so a child SKU's `masterRid` is what
+   maps the two. `sharers` is every model drawing on this pool: the owner plus
+   its children, or just the model itself when there is no link at all.    */
+function stockOfModel(owner, sharers) {
+  const pool = sharers?.length ? sharers : [owner];
+
+  /* any SKU rid in the pool -> the owner's SKU rid it draws from */
+  const toOwnerRid = new Map();
+  pool.forEach((m) => allSkus(m).forEach((r) => {
+    toOwnerRid.set(r.rid, r.masterRid ?? r.rid);
+  }));
+
+  const entries = pool.flatMap((m) => m.salesEntries || []);
+  const movement = (ownerRid) => {
+    const mine = entries.filter((e) => e.skuRid && toOwnerRid.get(e.skuRid) === ownerRid);
+    return {
+      sold:     mine.reduce((t, e) => t + (e.units   || 0), 0),
+      returned: mine.reduce((t, e) => t + (e.returns || 0), 0),
+    };
+  };
+
+  const rows = allSkus(owner).map((r) => {
+    const { sold, returned } = movement(r.rid);
+    const received = r.receivedQty ?? 0;
+    const onHand   = Math.max(0, received - sold + returned);
+    const pct      = received > 0 ? Math.round((onHand / received) * 100) : 0;
+    return { sku: r, received, sold, returned, onHand, pct,
+             low: received > 0 && pct <= REORDER_PCT };
+  });
+
   const received = rows.reduce((t, x) => t + x.received, 0);
   const onHand   = rows.reduce((t, x) => t + x.onHand,   0);
-  /* sales not tied to a SKU still reduce the model total */
-  const loose = (model.salesEntries || []).filter((e) => !e.skuRid);
+  /* A sale naming no SKU, or naming a child SKU that is not mapped yet, has
+     no row to come off — it still reduces the pool total rather than being
+     quietly ignored. */
+  const loose = entries.filter((e) => !e.skuRid || toOwnerRid.get(e.skuRid) === undefined
+                                   || !rows.some((x) => x.sku.rid === toOwnerRid.get(e.skuRid)));
   const looseSold = loose.reduce((t, e) => t + (e.units || 0) - (e.returns || 0), 0);
   const net = Math.max(0, onHand - looseSold);
   return { rows, received, onHand: net,
@@ -230,7 +265,10 @@ function stockOfModel(model) {
 function reorderQueue(models) {
   const out = [];
   models.filter((m) => m.stage === "live" && !m.archived).forEach((m) => {
-    stockOfModel(m).rows.forEach((x) => { if (x.low) out.push({ model: m, ...x }); });
+    /* derive() has already computed this, pool-aware. Recomputing here would
+       both cost a second pass and, now that stock is shared, need the whole
+       model list threaded in to get the same answer. */
+    (m.stock?.rows || []).forEach((x) => { if (x.low) out.push({ model: m, ...x }); });
   });
   return out.sort((a, b) => a.pct - b.pct);
 }
@@ -332,9 +370,24 @@ function runwayOf(model) {
   return { have, need: STAGES[0].daysBeforeLaunch, isRushed: have < STAGES[0].daysBeforeLaunch };
 }
 
-function derive(model) {
+/* `all` is the whole phone list. A master/child link is the one thing a model
+   cannot be derived from on its own: stock is shared across the link, and a
+   child's gate depends on where its master has got to. Passing the raw list
+   keeps derive a pure function of its arguments. */
+function derive(model, all) {
+  const fleet    = all || [];
   const index    = stageIndex(model.stage);
   const terminal = isTerminal(model.stage);
+
+  /* The raw rows, deliberately not derived — deriving them would recurse, and
+     every rule that reads them wants a stage, a name or a SKU list. */
+  const master   = model.masterId != null
+    ? fleet.find((p) => p.id === model.masterId) || null : null;
+  const children = childrenOf(model.id, fleet);
+  /* Who draws on this model's pool of stock: the master if there is one, plus
+     everything else pointing at it. */
+  const owner    = master || model;
+  const sharers  = master ? [master, ...childrenOf(master.id, fleet)] : [model, ...children];
 
   /* the worst delay across every stage up to where we are now.
      A phone we decided not to buy cannot be late for anything. */
@@ -352,7 +405,11 @@ function derive(model) {
     worstDelay,
     isLate: worstDelay > 3,
     sales: salesSummary(model.salesEntries),
-    stock: stockOfModel(model),
+    stock: stockOfModel(owner, sharers),
+    master,
+    children,
+    isChild: !!master,
+    isMaster: children.length > 0,
     archived: !!model.archived,
   };
 }
@@ -380,6 +437,27 @@ function problemsOf(model) {
 
   if (model.stage === "planned" && allSkus(model).some((r) => !r.sku?.trim()))
     push("warn", "SKU still blank — can't move to Ordered");
+
+  /* A child is listed from its master's stock, so an incomplete mapping is
+     invisible until the gate refuses — say it on the card instead. */
+  if (model.isChild && model.stage === "planned" && allSkus(model).length) {
+    const unmapped = childSkuMappingProblems(allSkus(model),
+      allSkus(model.master || {}).map((r) => r.rid));
+    if (unmapped.length)
+      push("warn", `${unmapped.length} SKU(s) not mapped to a ${model.master?.name || "master"} SKU`);
+    else if (!masterIsReady(model.master))
+      push("warn", `Waiting on ${model.master?.name} — ${STAGES[stageIndex(model.master.stage)].label}`);
+  }
+
+  /* The master is the thing that is late, but it is the child's launch that
+     slips. Without this the child looks fine right up to its launch date. */
+  if (model.isChild && model.master?.isLate)
+    push("bad", `Master ${model.master.name} is +${model.master.worstDelay}d behind`);
+
+  /* A child left unlinked is not an error — it is simply ordered on its own.
+     But a link into a model that no longer exists is a real dead end. */
+  if (model.masterId != null && !model.master)
+    push("bad", "Master model is missing — re-pick it or clear the link");
 
   if (model.stage === "ordered" && !model.po)
     push("warn", "No PO number recorded");
@@ -409,7 +487,7 @@ function problemsOf(model) {
 
   /* Stock running out on a live model */
   if (model.stage === "live") {
-    const low = stockOfModel(model).lowRows;
+    const low = model.stock?.lowRows || [];
     if (low.length)
       push("warn", `Low stock — ${low.length} SKU${low.length > 1 ? "s" : ""} at or below ${REORDER_PCT}%`);
   }
@@ -516,6 +594,41 @@ function applyRoleTables(roles, advance) {
 
 
 
+/* ── MASTER / CHILD, the stage rules ─────────────────────────────
+   A child is never ordered, never produced and never receives goods: its
+   master does all three, once. So a child waits at Planned until the master
+   has the stock in, and then goes straight to Received — skipping two stages
+   it genuinely does not have. From Received it behaves normally, because
+   listing is the one job a child really does own.
+
+   `derive` attaches `master` to a child and `children` to a master, so every
+   rule below is a field read rather than another list scan. */
+
+/* The stage a master must reach before its children can be listed. */
+const CHILD_RELEASE_STAGE = "received";
+
+const masterIsReady = (master) =>
+  !!master && stageIndex(master.stage) >= stageIndex(CHILD_RELEASE_STAGE)
+  && !isTerminal(master.stage);
+
+/* Why this child cannot leave Planned yet, or null. */
+function childPlannedBlock(model) {
+  if (!isChildModel(model)) return null;
+  const master = model.master;
+  if (!master)
+    return "Master model not found — re-pick it, or clear the master to order this model on its own";
+  if (isTerminal(master.stage))
+    return `Master ${master.brand} ${master.name} is out of procurement — clear the master or put it back`;
+  const rows = allSkus(model);
+  if (!rows.length) return "No SKUs added yet";
+  const unmapped = childSkuMappingProblems(rows, allSkus(master).map((r) => r.rid));
+  if (unmapped.length)
+    return `${unmapped.length} SKU${unmapped.length > 1 ? "s" : ""} ${unmapped[0].reason}`;
+  if (!masterIsReady(master))
+    return `Waiting on ${master.brand} ${master.name} — currently at ${STAGES[stageIndex(master.stage)].label}`;
+  return null;
+}
+
 /* ── ADVANCE LOGIC — one source of truth ─────────────────────────
    gateBlock()     — is the DATA ready to move on? returns a reason or null
    advanceStatus() — combines the data gate with the role permission.
@@ -527,7 +640,18 @@ function gateBlock(model) {
     if (allSkus(model).length === 0) return "No SKUs added yet";
     const missing = allSkus(model).filter((r) => !r.sku?.trim());
     if (missing.length) return `${missing.length} SKU${missing.length > 1 ? "s" : ""} missing a code`;
+    /* A child's mapping has to be complete and its master has to hold the
+       stock before it can be listed. This is the "then only we can order"
+       rule: the master is ordered, the child never is. */
+    const childBlock = childPlannedBlock(model);
+    if (childBlock) return childBlock;
   }
+  /* A child never reaches Ordered or Production, so the checks below cannot
+     apply to it. If one is somehow there — a link added after it had already
+     moved on — say so plainly rather than demanding a PO it must not have. */
+  if (isChildModel(model) && ["ordered", "production"].includes(model.stage))
+    return `A child of ${model.master ? model.master.brand + " " + model.master.name : "another model"} is not ordered separately — move it back to Planned`;
+
   /* You cannot manufacture against a purchase order that doesn't exist.
      The STP export carries the PO number, so it has to be in first. */
   if (model.stage === "ordered" && !model.po?.trim())
@@ -607,6 +731,14 @@ function moveStatus(model, role, stageKey) {
   const target = stageIndex(stageKey);
   if (target < 0)             return { ok: false, reason: "Unknown stage" };
   if (target === model.index) return { ok: false, reason: "Already there" };
+
+  /* A child has no Ordered and no Production stage — its master is the thing
+     that gets ordered. Advancing from Planned therefore lands on Received.
+     Un-Procurement is still reachable: deciding not to sell V70FE at all is a
+     separate decision from whether V70 was bought. */
+  if (isChildModel(model) && !isTerminal(stageKey) && !isTerminal(model.stage)
+      && ["ordered", "production"].includes(stageKey))
+    return { ok: false, reason: `${model.brand} ${model.name} is a child of ${model.master ? model.master.name : "another model"} — it is listed from the master's stock, never ordered` };
 
   /* Terminal stages sit off the line, so comparing indexes says nothing.
      Exactly two moves touch them:
@@ -708,6 +840,22 @@ function dbSaveConfig(url, key) {
 }
 function dbClearConfig() { localStorage.removeItem(DB_CONFIG_KEY); }
 
+/* Is this browser pointed somewhere other than the build's own configuration?
+   Used to label the header, because the whole point of overriding the
+   connection is to work against a test project — and the one mistake that
+   costs real data is not noticing which project you are looking at. */
+function dbConfigIsOverride() {
+  try {
+    return isConfigOverride(JSON.parse(localStorage.getItem(DB_CONFIG_KEY) || "null"), ENV_DB_CONFIG);
+  } catch { return false; }   // storage blocked or unparseable: no override
+}
+
+/* Is there a build-time configuration to fall back to at all? */
+const dbHasEnvConfig = () => !!(ENV_DB_CONFIG.url && ENV_DB_CONFIG.key);
+
+/* dbProjectRef (rules.js projectRef) gives the subdomain of a Supabase URL —
+   enough to tell two projects apart on screen, and not a credential. */
+
 /* ── SESSION PERSISTENCE ─────────────────────────────────────────
    The logged-in user is written to localStorage so a page refresh
    doesn't kick you back to the login screen. Sessions expire after
@@ -801,6 +949,13 @@ const phoneToRow = (p) => ({
   done: p.done || {}, skus: p.skus || [], sales_entries: p.salesEntries || [],
   notes: p.notes || [], attachments: p.attachments || [],
   audit: p.audit || [], archived: !!p.archived,
+  /* Sent only when this model actually is a child. phones.master_id arrives
+     with schema-master-child.sql; omitting the key while it is null means a
+     database that has not run that migration keeps saving every existing
+     model exactly as before, instead of every write failing on an unknown
+     column. The first save of an actual master/child link is what fails, and
+     it fails loudly, for the one person using the new feature. */
+  ...(p.masterId != null ? { master_id: p.masterId } : {}),
 });
 /* updatedAt is the row's version stamp, set by a trigger on every write.
    It is never sent back — phoneToRow leaves it out — it only travels in,
@@ -812,6 +967,8 @@ const rowToPhone = (r) => repairSkuRids({
   done: r.done || {}, skus: r.skus || [], salesEntries: r.sales_entries || [],
   notes: r.notes || [], attachments: r.attachments || [],
   audit: r.audit || [], archived: !!r.archived,
+  /* undefined when the column is absent, which reads as "not a child". */
+  masterId: r.master_id ?? null,
 });
 
 /* user row <-> app shape (identical, just snake_case alias) */
@@ -1564,6 +1721,16 @@ function Board({ models, allModels, onOpen, onMove, onAdd, onAdvance, role, comp
                       {m.daysToLaunch != null && m.daysToLaunch >= 0 && m.daysToLaunch <= 30 && !m.isLate && (
                         <Tag tone="warn">{m.daysToLaunch}d to launch</Tag>
                       )}
+                      {/* The same case under another name. On the board this is
+                          what explains why a card has no PO and never will. */}
+                      {m.isChild && (
+                        <Tag tone="warn" >
+                          {compact ? "child" : `child of ${m.master?.name}`}
+                        </Tag>
+                      )}
+                      {m.isMaster && !compact && (
+                        <Tag tone="ok">+{m.children.length} sharing stock</Tag>
+                      )}
                       {!compact && <span style={{ color: "var(--dim)" }}>{showDate(m.launch)}</span>}
                       {!compact && allSkus(m).length > 0 && (
                         <span style={{ color: "var(--dim)" }}>· {allSkus(m).length} SKU</span>
@@ -1745,6 +1912,115 @@ function RoleLocked({ what, who }) {
 }
 
 
+/* ── PLANNED STAGE: IS THIS MODEL A CHILD OF ANOTHER? ────────────
+   Vivo V70 and V70FE are the same handset, so one case fits both.
+   Marking V70FE a child of V70 means V70 is ordered once and V70FE is
+   listed from that stock — rather than buying the same case twice.
+
+   Decided here, at Planned, because that is the last moment before the
+   purchase order is built. */
+
+function MasterLink({ model, fleet, onSetMaster, canEdit }) {
+  const [picking, setPicking] = useState(false);
+  const [choice, setChoice]   = useState("");
+
+  const options = eligibleMasters(model, fleet)
+    /* Structural rules live in rules.js; these two depend on stage
+       vocabulary, so they are applied here. */
+    .filter((m) => !m.archived && !isTerminal(m.stage))
+    /* Same brand first — a shared case is nearly always the same maker. */
+    .sort((a, b) => (a.brand === model.brand ? 0 : 1) - (b.brand === model.brand ? 0 : 1)
+                 || a.brand.localeCompare(b.brand) || a.name.localeCompare(b.name));
+
+  const master   = model.master;
+  const kids     = model.children || [];
+  const blocked  = isMasterModel(model, fleet);
+
+  const apply = () => {
+    const picked = fleet.find((m) => String(m.id) === choice);
+    if (!picked) return;
+    onSetMaster(model.id, picked.id);
+    setPicking(false); setChoice("");
+  };
+
+  return (
+    <div>
+      <h2>Master / child</h2>
+      <div className="card" style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+        {master ? (
+          <>
+            <div style={{ marginBottom: 8 }}>
+              This model is a <strong>child</strong> of{" "}
+              <strong>{master.brand} {master.name}</strong>. It is never ordered
+              and never receives goods — {master.name} is ordered once, and this
+              model is listed from that stock. Both still need their own
+              listings on every marketplace.
+            </div>
+            <Tag tone="ok">Stock shared with {master.name}</Tag>
+            {canEdit && (
+              <div style={{ marginTop: 10 }}>
+                <button className="btn" onClick={() => onSetMaster(model.id, null)}>
+                  Clear master — order this model on its own
+                </button>
+              </div>
+            )}
+          </>
+        ) : blocked ? (
+          <div>
+            <strong>This is a master.</strong>{" "}
+            {kids.length} model{kids.length === 1 ? "" : "s"} are listed from its
+            stock: {kids.map((k) => `${k.brand} ${k.name}`).join(", ")}. It is
+            ordered once, for all of them. Clear the children first if this model
+            should itself become a child of something else.
+          </div>
+        ) : !canEdit ? (
+          <div style={{ color: "var(--dim)" }}>
+            Ordered on its own. Only Procurement or Admin can link it to a master.
+          </div>
+        ) : picking ? (
+          <>
+            <Field label="Master model"
+              hint="The model that gets ordered. This one will be listed from its stock.">
+              <select value={choice} onChange={(e) => setChoice(e.target.value)}>
+                <option value="">— pick a model —</option>
+                {options.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.brand} {m.name} · {STAGES[stageIndex(m.stage)].label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            {!options.length && (
+              <div style={{ color: "var(--warn)", fontSize: 12, marginBottom: 10 }}>
+                No eligible model. A master cannot itself be a child, and cannot
+                be archived or out of procurement.
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn" data-primary="1" onClick={apply}
+                style={{ opacity: choice ? 1 : 0.4 }}>Link as child</button>
+              <button className="btn" onClick={() => { setPicking(false); setChoice(""); }}>
+                Cancel
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={{ marginBottom: 8, color: "var(--dim)" }}>
+              Ordered on its own. If this is the same handset as another model —
+              a V70FE to a V70 — link it so the case is bought only once.
+            </div>
+            <button className="btn" onClick={() => setPicking(true)}>
+              Link to a master model
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 /* ── PLANNED STAGE: COVER TYPES + THEIR SKUs ─────────────────────
    Pick cover types, then add as many SKUs as you need under each one.
    Every SKU has its own material and unit count, so a single
@@ -1817,6 +2093,14 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
           {stage === "planned"
             ? <strong> Every SKU needs a code before you can move to Ordered.</strong>
             : <strong> Changing SKUs here changes what you ordered — re-send the PO and STP file.</strong>}
+          {model.isChild && (
+            <div style={{ marginTop: 8, color: "var(--warn)" }}>
+              This model is a child of <strong>{model.master?.name}</strong>, so these
+              SKUs are listings, not orders. Units are ignored — nothing is ordered
+              against them. Each one must say which {model.master?.name} SKU it
+              sells from before this model can be listed.
+            </div>
+          )}
         </div>
 
         {/* the SKU table */}
@@ -1827,7 +2111,9 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
                 <tr>
                   <th style={{ minWidth: 190 }}>SKU *</th>
                   <th style={{ minWidth: 170 }}>Material</th>
-                  <th style={{ minWidth: 100 }}>Units</th>
+                  {model.isChild
+                    ? <th style={{ minWidth: 190 }}>Sells from ({model.master?.name}) *</th>
+                    : <th style={{ minWidth: 100 }}>Units</th>}
                   <th style={{ width: 34 }}></th>
                 </tr>
               </thead>
@@ -1854,12 +2140,30 @@ function PlannedSKUEditor({ model, onSave, stage = "planned" }) {
                         {MATERIALS.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
                       </select>
                     </td>
+                    {model.isChild ? (
+                    <td style={{ padding: "6px 8px" }}>
+                      {/* Which of the master's SKUs this listing draws stock
+                          from. Without it the listing would sell air, which is
+                          what the Planned gate refuses to let past. */}
+                      <select value={r.masterRid ?? ""} style={{ fontSize: 12,
+                          borderColor: r.masterRid == null ? "var(--bad)" : undefined }}
+                        onChange={(e) => editRow(r.rid, { masterRid: e.target.value || null })}>
+                        <option value="">— map to a {model.master?.name} SKU —</option>
+                        {allSkus(model.master || {}).map((ms) => (
+                          <option key={ms.rid} value={ms.rid}>
+                            {ms.sku || "(no code)"}{ms.material ? ` · ${ms.material}` : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    ) : (
                     <td style={{ padding: "6px 8px" }}>
                       <input type="number" min="0" value={r.units || ""}
                         placeholder={r.material ? String(defaultQtyFor(r.material)) : "qty"}
                         style={{ fontFamily: "var(--mono)", fontSize: 12 }}
                         onChange={(e) => editRow(r.rid, { units: +e.target.value })} />
                     </td>
+                    )}
                     <td style={{ padding: "6px 4px", textAlign: "center" }}>
                       <button className="btn" title="Remove this SKU"
                         style={{ padding: "4px 6px", color: "var(--bad)", borderColor: "transparent" }}
@@ -2797,7 +3101,7 @@ function ResearchEditor({ model, onSave }) {
   );
 }
 
-function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave, onSalesLog, canLog, role, onAddNote, onDeleteNote, onAddAttachment, onDeleteAttachment, onArchive }) {
+function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, onSKUSave, onSTPUpdate, onReceiptSave, onPOSave, onListingSave, onSalesLog, canLog, role, onAddNote, onDeleteNote, onAddAttachment, onDeleteAttachment, onArchive, fleet, onSetMaster }) {
   useDismiss(onClose);
 
   const isLast = model.terminal || model.index === PIPELINE.length - 1;
@@ -2855,6 +3159,15 @@ function Detail({ model, onClose, onAdvance, onGoBack, onMove, onResearchSave, o
                   <RoleLocked what="edit phone details" who="Procurement" />
                 </div>
               )
+          )}
+
+          {/* Whether this model is the same handset as another, and so rides on
+              its stock instead of being ordered. Decided at Planned, the last
+              moment before the PO is built; shown later as a read-only fact so
+              nobody has to guess why a model has no PO of its own. */}
+          {model.stage === "planned" && (
+            <MasterLink model={model} fleet={fleet} canEdit={!!onSetMaster}
+              onSetMaster={onSetMaster} />
           )}
 
           {/* Covers stay editable after Planned — a new colour can come up
@@ -3939,7 +4252,25 @@ function CatalogQueue({ models, onSetListing, onOpen, canEdit }) {
   /* group the queue by model for display */
   const byModel = {};
   shown.forEach((row) => { (byModel[row.model.id] ||= { model: row.model, rows: [] }).rows.push(row); });
-  const groups = Object.values(byModel).sort((a, b) => byUrgency(a.model, b.model));
+  /* A master and its children are the same case, so their listings are one
+     job — reviewing them apart is how V70 goes live and V70FE is forgotten.
+     Sort by the family (the master's id, or the model's own when it is one),
+     then put the master first inside the family, then by urgency. */
+  const familyKey = (m) => m.masterId ?? m.id;
+  const groups = Object.values(byModel).sort((a, b) => {
+    const fa = familyKey(a.model), fb = familyKey(b.model);
+    if (fa !== fb) {
+      /* Order families by their most urgent member, so linking two models
+         never pushes an urgent pair down the page. */
+      const ua = Math.min(...Object.values(byModel)
+        .filter((g) => familyKey(g.model) === fa).map((g) => g.model.daysToLaunch ?? 9e9));
+      const ub = Math.min(...Object.values(byModel)
+        .filter((g) => familyKey(g.model) === fb).map((g) => g.model.daysToLaunch ?? 9e9));
+      if (ua !== ub) return ua - ub;
+    }
+    if (a.model.isChild !== b.model.isChild) return a.model.isChild ? 1 : -1;
+    return byUrgency(a.model, b.model);
+  });
 
   const setOne = (model, sku, mp, value) =>
     onSetListing(model.id, { [sku.rid]: { ...sku.listings, [mp]: value } });
@@ -3962,9 +4293,12 @@ function CatalogQueue({ models, onSetListing, onOpen, canEdit }) {
   };
 
   const exportQueue = (fmt) => {
-    const headers = ["Brand", "Model", "SKU", "Material", ...MARKETPLACES, "Missing on"];
+    const headers = ["Brand", "Model", "Listed from", "SKU", "Material", ...MARKETPLACES, "Missing on"];
     const rows = queue.map(({ model, sku, missing }) => [
-      model.brand, model.name, sku.sku || "", sku.material || "",
+      model.brand, model.name,
+      /* Whose stock this listing sells. Blank for a model that owns its own. */
+      model.isChild ? `${model.master.brand} ${model.master.name}` : "own stock",
+      sku.sku || "", sku.material || "",
       ...MARKETPLACES.map((mp) => sku.listings?.[mp] || "Not listed"),
       missing.join(" / "),
     ]);
@@ -4031,6 +4365,14 @@ function CatalogQueue({ models, onSetListing, onOpen, canEdit }) {
               {model.brand} {model.name}
             </span>
             <Tag>{rows.length} SKU{rows.length > 1 ? "s" : ""} pending</Tag>
+            {/* The same case under two names. Shown here because this is the
+                screen where forgetting the sibling costs a sale. */}
+            {model.isChild && (
+              <Tag tone="warn">child of {model.master?.name} · same stock</Tag>
+            )}
+            {model.isMaster && (
+              <Tag tone="ok">also fits {model.children.map((k) => k.name).join(", ")}</Tag>
+            )}
             {model.isLate && <Tag tone="bad">{model.worstDelay}d late</Tag>}
             {model.daysToLaunch != null && model.daysToLaunch >= 0 && model.daysToLaunch <= 14 && (
               <Tag tone="warn">launches in {model.daysToLaunch}d</Tag>
@@ -4112,8 +4454,9 @@ function InwardStock({ models, onSaveReceipt, onOpen, onMove, canEdit, role }) {
   const [onlyPending, setOnlyPending] = useState(false);
   const [selected, setSelected] = useState(() => new Set());
 
+  /* A child receives nothing: the goods arrive against its master. */
   const queue = models
-    .filter((m) => INWARD_STAGES.includes(m.stage) && allSkus(m).length)
+    .filter((m) => !m.isChild && INWARD_STAGES.includes(m.stage) && allSkus(m).length)
     .sort(byUrgency);
 
   /* draft first, stored value second — one place so nothing reads stale */
@@ -4391,8 +4734,9 @@ const stpRequirementRows = (models) => models.flatMap((m) =>
     ]));
 
 function STPRequirement({ models, onSetRequired, canEdit, onEmail, emailState }) {
+  /* A child owes no STP file — the factory makes the master's case. */
   const queue = models
-    .filter((m) => ["ordered", "production"].includes(m.stage) && allSkus(m).length)
+    .filter((m) => !m.isChild && ["ordered", "production"].includes(m.stage) && allSkus(m).length)
     .sort(byUrgency);
 
   const columns = materialColumns(queue);
@@ -4587,8 +4931,9 @@ function BulkReceive({ models, onReceive, canReceive }) {
   const [openPO, setOpenPO] = useState(null);
   const [marks, setMarks]   = useState({});   // { modelId: "got" | "missing" }
 
-  /* Only models actually out with a supplier can be received */
-  const inFlight = models.filter((m) => m.po && m.stage === "production");
+  /* Only models actually out with a supplier can be received, and a child is
+     never out with a supplier. */
+  const inFlight = models.filter((m) => !m.isChild && m.po && m.stage === "production");
 
   const groups = {};
   inFlight.forEach((m) => { (groups[m.po] ||= []).push(m); });
@@ -4741,9 +5086,11 @@ function POManager({ models, onAssign, onOpen, canEdit }) {
   const [poNum, setPoNum]     = useState("");
   const [expanded, setExpanded] = useState({});   // { poNumber: true }
 
-  /* Models that can go on a PO: at Ordered, or at Planned with all SKUs coded */
-  const eligible = models.filter((m) =>
-    m.stage === "ordered" || (m.stage === "planned" && !gateBlock(m)));
+  /* Models that can go on a PO: at Ordered, or at Planned with all SKUs coded.
+     Never a child — its master is what goes on the purchase order, once. This
+     is the filter that stops the same case being bought twice. */
+  const eligible = models.filter((m) => !m.isChild
+    && (m.stage === "ordered" || (m.stage === "planned" && !gateBlock(m))));
 
   const unassigned = eligible.filter((m) => !m.po);
   const chosen     = eligible.filter((m) => picked[m.id]);
@@ -4767,9 +5114,15 @@ function POManager({ models, onAssign, onOpen, canEdit }) {
 
   /* Export one PO as a combined SKU sheet */
   const exportPO = (po, list, fmt) => {
-    const headers = ["PO Number", "Brand", "Model", "Launch Date", "SKU", "Material", "Units"];
+    /* "Also fits" names the child models listed from this model's stock. The
+       factory makes one case; this is the sheet that says which handsets it
+       has to fit, which is exactly the check that catches a wrong mapping
+       before the tooling is cut. */
+    const headers = ["PO Number", "Brand", "Model", "Also fits", "Launch Date", "SKU", "Material", "Units"];
     const rows = list.flatMap((m) =>
-      allSkus(m).map((r) => [po, m.brand, m.name, m.launch, r.sku || "", r.material || "", r.units]));
+      allSkus(m).map((r) => [po, m.brand, m.name,
+        (m.children || []).map((k) => k.name).join(" / ") || "—",
+        m.launch, r.sku || "", r.material || "", r.units]));
     downloadReport("PO_" + po.replace(/[^\w-]/g, "_"), headers, rows, fmt);
   };
 
@@ -4944,8 +5297,13 @@ function POManager({ models, onAssign, onOpen, canEdit }) {
 function buildReportRows(reportKey, models) {
   switch (reportKey) {
     case "all": return {
-      headers: ["Brand", "Model", "Segment", "Launch Date", "Stage", "PO Number", "SKUs", "Total Units", "Late?", "Days to Launch"],
+      headers: ["Brand", "Model", "Segment", "Launch Date", "Stage", "Ordered as", "PO Number", "SKUs", "Total Units", "Late?", "Days to Launch"],
       rows: models.map((m) => [m.brand, m.name, m.segment, m.launch, STAGES[m.index].label,
+        /* A child is never on a purchase order of its own, so an empty PO
+           column against it is correct rather than missing data. */
+        m.isChild ? `child of ${m.master.brand} ${m.master.name}`
+          : m.isMaster ? `master for ${m.children.map((k) => k.name).join(" / ")}`
+          : "own order",
         m.po || "", allSkus(m).length, m.units, m.isLate ? `Yes (+${m.worstDelay}d)` : "No",
         m.daysToLaunch < 0 ? `${-m.daysToLaunch}d ago` : `in ${m.daysToLaunch}d`]),
     };
@@ -5363,6 +5721,11 @@ function DBSetupScreen({ onDone, onSkip }) {
 
   const save = () => { dbSaveConfig(url, key); onDone(); };
 
+  /* Without this there is no way back. dbSaveConfig writes to localStorage,
+     which wins over the build-time config for good, so a browser pointed at a
+     test project stayed pointed at it — and "Skip" only closes the screen. */
+  const useBuiltIn = () => { dbClearConfig(); onDone(); };
+
   return (
     <div className="app" data-theme="dark" style={{ minHeight: "100vh", display: "flex",
       flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
@@ -5406,6 +5769,12 @@ function DBSetupScreen({ onDone, onSkip }) {
               style={{ opacity: url.trim() && key.trim() ? 1 : 0.4 }}>
               Test connection
             </button>
+            {dbHasEnvConfig() && dbConfigIsOverride() && (
+              <button className="btn" onClick={useBuiltIn}
+                title={`Discard this browser's override and use ${dbProjectRef(ENV_DB_CONFIG.url)} again`}>
+                ↩ Back to {dbProjectRef(ENV_DB_CONFIG.url)}
+              </button>
+            )}
             {status === "ok" && (
               <button className="btn" data-primary="1" onClick={save}>
                 Save and continue →
@@ -5846,7 +6215,7 @@ export default function App() {
   }, []);
 
   /* derive everything, every render — never stored, never stale */
-  const models = useMemo(() => phones.map(derive), [phones]);
+  const models = useMemo(() => phones.map((p) => derive(p, phones)), [phones]);
 
   /* filtered + role-aware view of the phone list */
   /* everything except archived — what the rest of the app should see */
@@ -5858,7 +6227,7 @@ export default function App() {
   /* SKUs with stock out with a supplier that nobody has booked in yet —
      drives the Inward badge the same way pendingListings drives Listing. */
   const pendingInward = useMemo(() => liveModels
-    .filter((m) => INWARD_STAGES.includes(m.stage))
+    .filter((m) => !m.isChild && INWARD_STAGES.includes(m.stage))
     .flatMap(allSkus).filter((r) => !isConfirmed(r)).length, [liveModels]);
 
   /* Dashboard click-through: jump to a view with filters pre-applied */
@@ -5924,13 +6293,24 @@ export default function App() {
 
   const advance = (id) => {
     const m = models.find((x) => x.id === id);
-    const next = m && !m.terminal && PIPELINE[m.index + 1];
+    if (!m || m.terminal) return;
+    /* A child has no Ordered and no Production stage — the master is ordered,
+       once, and the child is listed from that stock. So the step after Planned
+       is Received, not the next entry in the pipeline. */
+    const next = m.isChild && m.stage === "planned"
+      ? PIPELINE[stageIndex(CHILD_RELEASE_STAGE)]
+      : PIPELINE[m.index + 1];
     if (next) move(id, next.key);
   };
 
   const goBack = (id) => {
     const m = models.find((x) => x.id === id);
-    const prev = m && (m.terminal ? PIPELINE[0] : PIPELINE[m.index - 1]);
+    if (!m) return;
+    /* Mirror of advance(): stepping back from Received on a child returns it
+       to Planned, not into a Production stage it never passed through. */
+    const prev = m.terminal ? PIPELINE[0]
+      : (m.isChild && m.stage === CHILD_RELEASE_STAGE) ? PIPELINE[stageIndex("planned")]
+      : PIPELINE[m.index - 1];
     if (prev) move(id, prev.key);
   };
 
@@ -5943,6 +6323,33 @@ export default function App() {
       return next;
     });
     saved("Phone details updated");
+  };
+
+  /* Link this model to a master, or clear the link. masterId null means
+     "ordered on its own". Clearing also drops every child SKU's mapping,
+     because a masterRid pointing into a model that is no longer the master is
+     worse than no mapping at all — the Planned gate can see the second but
+     would silently accept the first. */
+  const setMaster = (id, masterId) => {
+    if (!CAN.editSKUs(role)) { say(`⚠ ${roleLabel(role)} can't edit SKUs`); return; }
+    const me   = models.find((m) => m.id === id);
+    const next = masterId == null ? null : models.find((m) => m.id === masterId);
+    if (masterId != null) {
+      const problem = masterLinkProblem(me, next, phonesRef.current);
+      if (problem) { say(`⚠ ${problem}`); return; }
+      if (isTerminal(next.stage) || next.archived) { say("⚠ That model is not in procurement"); return; }
+    }
+    setPhones((list) => {
+      const updated = list.map((p) => p.id !== id ? p : withAudit({
+        ...p, masterId,
+        skus: (p.skus || []).map((r) => ({ ...r, masterRid: null })),
+      }, session, masterId == null ? "Master link cleared"
+          : `Marked as a child of ${next.brand} ${next.name}`));
+      const u = updated.find((p) => p.id === id); if (u) persist(u);
+      return updated;
+    });
+    saved(masterId == null ? "Master link cleared"
+      : `Child of ${next.brand} ${next.name} — it will be listed from that stock`);
   };
 
   /* save covers array from PlannedSKUEditor */
@@ -6313,6 +6720,19 @@ export default function App() {
                     ? "synced " + syncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
                     : "DB live")
                 : "Local only"}
+              {/* The connection is overridden in this browser, so what is on
+                  screen is NOT the project this build ships with. Everything
+                  else in this header looks identical either way, which is how
+                  someone ends up running a destructive test against live
+                  data. */}
+              {dbConfigIsOverride() && (
+                <span title={`This browser is pointed at ${dbProjectRef(dbGetConfig()?.url)}, not the build's own project${dbHasEnvConfig() ? ` (${dbProjectRef(ENV_DB_CONFIG.url)})` : ""}. Use the gear to change it back.`}
+                  style={{ fontSize: 10, fontWeight: 650, letterSpacing: 0.3,
+                    padding: "1px 6px", borderRadius: 999, whiteSpace: "nowrap",
+                    color: "var(--warn)", border: "1px solid var(--warn)" }}>
+                  ⚠ {dbProjectRef(dbGetConfig()?.url) || "override"}
+                </span>
+              )}
               {/* These read as "↻" and "⚙" to a screen reader without a label,
                   and title alone is not a reliable accessible name. */}
               {dbOnline && (
@@ -6446,7 +6866,8 @@ export default function App() {
       {open   && <Detail key={`${open.id}:${open.updatedAt || ""}`} model={open} onClose={() => setOpenId(null)} onAdvance={advance} onGoBack={goBack} onMove={move} onResearchSave={CAN.editResearch(role) ? saveResearch : null} onSKUSave={CAN.editSKUs(role) ? saveSKU : null} onSTPUpdate={CAN.updateSTP(role) ? updateSTP : null} onReceiptSave={CAN.saveReceipt(role) ? saveReceipt : null} onPOSave={CAN.savePO(role) ? savePO : null} onListingSave={CAN.saveListing(role) ? saveListings : null} onSalesLog={logSale} canLog={CAN.logSales(role)} role={role}
                       onAddNote={addNote} onDeleteNote={deleteNote}
                       onAddAttachment={addAttachment} onDeleteAttachment={deleteAttachment}
-                      onArchive={CAN.archive(role) ? setArchived : null} />}
+                      onArchive={CAN.archive(role) ? setArchived : null}
+                      fleet={models} onSetMaster={CAN.editSKUs(role) ? setMaster : null} />}
       {adding && <AddForm onClose={() => setAdding(false)} onSave={addPhone}
                       onImport={importPhones} existing={phones} />}
       {confirmReset && (
