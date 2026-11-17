@@ -23,7 +23,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Matches deploy.yml, so a green run here proves what the deploy
+          # job builds. Node 24 is also what local development uses.
+          node-version: 24
           cache: npm
 
       # ci, not install: fails loudly if package-lock.json and package.json
