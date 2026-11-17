@@ -153,6 +153,7 @@ flowchart TB
 | <code>schema.sql</code> | Full Supabase schema, view, trigger, and seed users. <strong>Drops the tables first</strong> |
 | <code>schema-bootstrap.sql</code> | Non-destructive version of the above: creates only what is missing |
 | <code>schema-roles.sql</code> | The <code>role_permissions</code> table behind the admin matrix |
+| <code>schema-master-child.sql</code> | Adds <code>phones.master_id</code> for models that share a case |
 | <code>schema-phase3.sql</code> | Additional database migration script |
 | <code>schema-compatibility.sql</code> | Compatibility migration script |
 | <code>schema-report-approval.sql</code> | Approval and send-log tables for the emailed STP report |
@@ -221,6 +222,39 @@ Supabase SQL editor, then [schema-roles.sql](schema-roles.sql). Use
 
 > Warning: <code>schema.sql</code> drops its tables before recreating them. Do
 > not run it against a populated production database.
+
+## Master and child models
+
+Two phones can be the same handset under different names. A Vivo V70 case fits
+a V70FE exactly, so ordering a case for each buys the same stock twice. Mark
+one model the **master** and the other its **child**:
+
+- the master is ordered, produced and received — **once**;
+- the child is never ordered, never carries a PO and never receives goods;
+- **both** are listed and tracked on every marketplace, because each
+  marketplace needs its own listing;
+- the child's stock **is** the master's stock. A V70FE sale draws down V70's
+  on-hand, and the 20% reorder trigger fires on the combined figure.
+
+Set it at **Planned**, the last point before the purchase order is built: open
+the model, find **Master / child**, and link it. Then map each of the child's
+SKUs to the master SKU whose stock it sells, in the **Sells from** column of
+the SKU table.
+
+A child cannot leave Planned until both are done **and** the master has reached
+Received. It then goes straight to Received, skipping Ordered and Production,
+which it genuinely does not have. The board, the PO builder, the inward queue,
+bulk receive and the STP matrix all exclude children — that is what makes
+"ordered once" true in the data rather than only on screen.
+
+**One level only.** A child can never itself be a master. If three handsets
+share a case, all three children point at the one master.
+
+Run [schema-master-child.sql](schema-master-child.sql) **before deploying** a
+build with this feature. The app leaves `master_id` out of a save while a model
+has no master, so an un-migrated database keeps saving existing models
+normally — but the first attempt to link a child will fail on an unknown
+column.
 
 ## Deploy
 

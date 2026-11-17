@@ -10,6 +10,8 @@ import {
 import {
   exportCell, safeUrl, adminIdsOf, isLastAdmin, wouldStrandAdmins,
   materialColumns, materialHeader, projectRef, isConfigOverride,
+  isChildModel, childrenOf, isMasterModel, masterLinkProblem, eligibleMasters,
+  childSkuMappingProblems,
 } from "./rules.js";
 
 const STAGE_KEYS = ["research", "planned", "ordered", "production", "received", "live", "unprocured"];
@@ -180,5 +182,69 @@ assert.equal(isConfigOverride({ key: "test-key" }, ENV), false);
    gates on dbHasEnvConfig() for the "back to built-in" button; this stays
    truthful about the comparison. */
 assert.equal(isConfigOverride({ url: "https://test.supabase.co", key: "k" }, { url: "", key: "" }), true);
+
+/* ── master / child models ──
+   Vivo V70 and V70FE are the same handset: one case fits both, so V70 is
+   ordered and V70FE rides on its stock. */
+const V70   = { id: 1, brand: "Vivo", name: "V70",    masterId: null };
+const V70FE = { id: 2, brand: "Vivo", name: "V70FE",  masterId: 1 };
+const V70PRO= { id: 3, brand: "Vivo", name: "V70 Pro", masterId: 1 };
+const R13C  = { id: 4, brand: "Redmi", name: "13C",   masterId: null };
+const FLEET = [V70, V70FE, V70PRO, R13C];
+
+assert.equal(isChildModel(V70FE), true);
+assert.equal(isChildModel(V70), false, "a master is not a child");
+assert.equal(isChildModel(R13C), false, "nor is an unlinked model");
+assert.equal(isChildModel({ id: 9 }), false, "a model with no masterId key at all");
+assert.equal(isChildModel(null), false);
+
+assert.deepEqual(childrenOf(1, FLEET).map((m) => m.name), ["V70FE", "V70 Pro"],
+  "three handsets sharing one case all point at the one master");
+assert.deepEqual(childrenOf(4, FLEET), [], "a model with no children");
+assert.deepEqual(childrenOf(1, null), [], "no fleet loaded yet is not a crash");
+
+assert.equal(isMasterModel(V70, FLEET), true);
+assert.equal(isMasterModel(R13C, FLEET), false);
+assert.equal(isMasterModel(V70FE, FLEET), false, "a child has no children of its own");
+assert.equal(isMasterModel(null, FLEET), false);
+
+/* the structural rules */
+assert.equal(masterLinkProblem(R13C, V70, FLEET), null,
+  "an unlinked model may take an unlinked master");
+assert.equal(masterLinkProblem(V70, V70, FLEET), "A model cannot be its own master");
+assert.match(masterLinkProblem(R13C, V70FE, FLEET), /itself a child/,
+  "no chains: a child cannot be somebody's master");
+assert.match(masterLinkProblem(V70, R13C, FLEET), /already has children/,
+  "a master cannot become a child while it has children");
+assert.equal(masterLinkProblem(R13C, null, FLEET), "No master chosen");
+assert.equal(masterLinkProblem(null, V70, FLEET), "No model");
+/* Re-pointing an existing child at a different master is allowed: the only
+   objection would be the chain rule, and V70 is not a child. */
+assert.equal(masterLinkProblem(V70FE, R13C, FLEET), null);
+
+assert.deepEqual(eligibleMasters(R13C, FLEET).map((m) => m.name), ["V70"],
+  "V70FE and V70 Pro are children, R13C is itself — only V70 is offerable");
+assert.deepEqual(eligibleMasters(V70, FLEET), [],
+  "a model with children has nothing it may be a child of");
+
+/* child SKU -> master SKU mapping, the Planned gate's subject */
+const MASTER_RIDS = ["a", "b"];
+assert.deepEqual(childSkuMappingProblems([{ rid: "x", masterRid: "a" }], MASTER_RIDS), [],
+  "a mapped child SKU is fine");
+assert.deepEqual(
+  childSkuMappingProblems([{ rid: "x", masterRid: "a" }, { rid: "y", masterRid: "b" }], MASTER_RIDS),
+  [], "several, each mapped");
+assert.equal(childSkuMappingProblems([{ rid: "x" }], MASTER_RIDS).length, 1,
+  "an unmapped child SKU is a problem");
+assert.match(childSkuMappingProblems([{ rid: "x" }], MASTER_RIDS)[0].reason, /not mapped/);
+assert.match(childSkuMappingProblems([{ rid: "x", masterRid: "zz" }], MASTER_RIDS)[0].reason,
+  /no longer has/, "a dangling mapping is caught, not silently treated as mapped");
+assert.equal(childSkuMappingProblems([{ rid: "x", masterRid: null }], MASTER_RIDS).length, 1,
+  "an explicit null is still unmapped");
+assert.deepEqual(childSkuMappingProblems([], MASTER_RIDS), [],
+  "no child SKUs is not a mapping problem — the empty-list check belongs to the gate");
+assert.deepEqual(childSkuMappingProblems(null, MASTER_RIDS), []);
+assert.equal(childSkuMappingProblems([{ rid: "x", masterRid: "a" }], []).length, 1,
+  "a master with no SKUs at all cannot satisfy any mapping");
 
 console.log("roles.js OK");

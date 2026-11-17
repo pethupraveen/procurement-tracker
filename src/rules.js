@@ -103,3 +103,65 @@ export function isConfigOverride(saved, env) {
   if (!saved?.url || !saved?.key) return false;
   return saved.url !== env?.url || saved.key !== env?.key;
 }
+
+/* ── MASTER / CHILD MODELS ───────────────────────────────────────
+   Two phones can be the same handset under different names — Vivo
+   V70 and V70FE take an identical case. Ordering a case for each
+   would buy the same stock twice, so one model is the MASTER and
+   the other is its CHILD:
+
+     • the master is ordered, produced and received, once;
+     • the child is never ordered and never receives goods;
+     • both must be listed and tracked on every marketplace,
+       because each needs its own listing;
+     • the child's stock is the master's stock.
+
+   The link is `masterId` on the child, holding the master's id.
+   One level only: a child can never itself be a master. That keeps
+   every rule here a single lookup instead of a graph walk, and
+   there is no real case for a chain — if three handsets share a
+   case, all three children point at one master.          */
+
+export const isChildModel = (model) => model?.masterId != null;
+
+export const childrenOf = (id, all) =>
+  (all || []).filter((m) => m?.masterId != null && m.masterId === id);
+
+export const isMasterModel = (model, all) =>
+  !!model && childrenOf(model.id, all).length > 0;
+
+/* Why `candidate` cannot be the master of `model`, or null if it can.
+   Structural rules only — whether a candidate is archived or out of
+   procurement is the picker's business, since those depend on stage
+   vocabulary this module deliberately does not know. */
+export function masterLinkProblem(model, candidate, all) {
+  if (!model) return "No model";
+  if (!candidate) return "No master chosen";
+  if (candidate.id === model.id) return "A model cannot be its own master";
+  if (isChildModel(candidate))
+    return `${candidate.brand} ${candidate.name} is itself a child — a master cannot be a child`;
+  if (isMasterModel(model, all))
+    return `${model.brand} ${model.name} already has children of its own, so it cannot become a child`;
+  return null;
+}
+
+/* Which models may be offered as a master for this one. */
+export const eligibleMasters = (model, all) =>
+  (all || []).filter((m) => !masterLinkProblem(model, m, all));
+
+/* Every child SKU names the master SKU whose stock it sells, through
+   `masterRid`. An unmapped or dangling child SKU is what the Planned
+   gate refuses to let past: without it there is nothing to draw the
+   child's stock from, and the listing would sell air.
+
+   `masterRids` is the set of rids on the master. Returns the child
+   SKU rows that are not correctly mapped, with a reason each. */
+export function childSkuMappingProblems(childSkus, masterRids) {
+  const known = new Set(masterRids || []);
+  const out = [];
+  (childSkus || []).forEach((r) => {
+    if (r?.masterRid == null) out.push({ sku: r, reason: "not mapped to a master SKU" });
+    else if (!known.has(r.masterRid)) out.push({ sku: r, reason: "mapped to a SKU the master no longer has" });
+  });
+  return out;
+}
