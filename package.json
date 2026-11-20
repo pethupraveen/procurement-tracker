@@ -6,7 +6,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "node src/roles.selfcheck.mjs"
+    "check": "node src/roles.selfcheck.mjs && npm run check:stages",
+    "check:stages": "node src/stages.selfcheck.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

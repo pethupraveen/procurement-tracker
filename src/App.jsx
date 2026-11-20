@@ -7082,3 +7082,17 @@ export default function App() {
     </div>
   );
 }
+
+/* ── EXPORTED FOR THE STAGE SELF-CHECK ──────────────────────────────
+   The master/child stage rules live here rather than in rules.js because
+   they read STAGES, MARKETPLACES and the role matrix, which are this
+   module's. That left them untestable — the one part of the pipeline with
+   two kinds of model walking different routes through it. Naming them here
+   lets src/stages.selfcheck.mjs drive the real functions (npm run
+   check:stages) instead of a copy that can drift.
+
+   `releasesChildren` is exported deliberately: a check that reimplements
+   the guard releases children on the master's Ordered move and reports a
+   bug that is not there. Use the app's own. */
+export { STAGES, MARKETPLACES, derive, nextStageOf, prevStageOf,
+         releasesChildren, releaseChildrenOf, gateBlock, advanceStatus, moveStatus };
