@@ -20,9 +20,13 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # v7 on both: the v4 pair is built against Node 20, which the runners
+      # now refuse to honour — they force those steps onto 24 and warn on
+      # every run. That is the ACTION's own runtime, nothing to do with
+      # node-version below, which is the Node this project's code runs on.
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           # Node 24 is what local development uses. Keep it in step with the
           # Node version Vercel builds with, or a green run here stops being
@@ -34,7 +38,11 @@ jobs:
       # have drifted apart, rather than quietly resolving something else.
       - run: npm ci
 
-      # The role permission rules — the only tested module in the project.
+      # Both self-checks: the role permission rules (roles.js / rules.js) and
+      # the master/child stage walk, which bundles App.jsx to drive the real
+      # advance and move functions. `check` chains `check:stages`, so adding a
+      # step for the latter here would only run it twice. Each prints which
+      # module it cleared, so a red run still says where to look.
       - run: npm run check
 
       - run: npm run build
