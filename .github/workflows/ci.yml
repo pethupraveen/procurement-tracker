@@ -34,7 +34,11 @@ jobs:
       # have drifted apart, rather than quietly resolving something else.
       - run: npm ci
 
-      # The role permission rules — the only tested module in the project.
+      # Both self-checks: the role permission rules (roles.js / rules.js) and
+      # the master/child stage walk, which bundles App.jsx to drive the real
+      # advance and move functions. `check` chains `check:stages`, so adding a
+      # step for the latter here would only run it twice. Each prints which
+      # module it cleared, so a red run still says where to look.
       - run: npm run check
 
       - run: npm run build
