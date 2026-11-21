@@ -208,3 +208,45 @@ export function isReadyToRelease(child, masterRids, plannedKey) {
   if (!rows.length) return false;
   return childSkuMappingProblems(rows, masterRids).length === 0;
 }
+
+/* ── launch dates out of a spreadsheet ───────────────────────────
+   The import box took YYYY-MM-DD and DD/MM/YYYY only, but Excel
+   shows a real date cell as `16-Apr-25` and writes exactly that to
+   CSV, so a file filled in from our own template came back with
+   every row rejected as a bad date.
+
+   Returns "" for anything it cannot read, which is what the caller
+   reports as an error. Day and month are range-checked but not
+   calendar-checked: 31-Feb-25 still passes, same as the DD/MM/YYYY
+   branch always did.
+
+   The two-digit year follows Excel's own rule — 00-29 is 2000s,
+   30-99 is 1900s — because that is what the person saw in the cell
+   they typed it into. */
+const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+
+export function parseLaunchDate(value) {
+  const text = String(value ?? "").trim();
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (iso) return inRange(iso[1], iso[2], iso[3]);
+
+  const slash = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(text);
+  if (slash) return inRange(slash[3], slash[2], slash[1]);
+
+  /* 16-Apr-25, 16-Apr-2025, and the same with a space or a slash */
+  const named = /^(\d{1,2})[-/ ]([A-Za-z]{3,})[-/ ](\d{2}|\d{4})$/.exec(text);
+  if (named) {
+    const month = MONTHS.indexOf(named[2].slice(0, 3).toLowerCase()) + 1;
+    if (!month) return "";
+    const yy = named[3];
+    const year = yy.length === 4 ? yy : Number(yy) <= 29 ? `20${yy}` : `19${yy}`;
+    return inRange(year, month, named[1]);
+  }
+  return "";
+}
+
+function inRange(y, m, d) {
+  const month = Number(m), day = Number(d);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return "";
+  return `${y}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
