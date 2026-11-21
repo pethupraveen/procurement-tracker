@@ -1389,6 +1389,14 @@ const CSS = `
   background: var(--card); color: var(--text); font: inherit; font-size: 13px; outline: none;
 }
 .app input:focus, .app select:focus { border-color: var(--accent); }
+/* The rule above is written for things you type in. A checkbox is not one:
+   at width:100% it claims its whole flex row, so the label beside it has
+   nowhere left to render and the row looks empty. One call site had already
+   worked around it locally with width:auto — this fixes it for all of them. */
+.app input[type=checkbox], .app input[type=radio] {
+  width: auto; flex: none; padding: 0; margin: 0;
+  accent-color: var(--accent); cursor: pointer;
+}
 /* Native option popups don't inherit from the select, so in dark mode they
    render dark-on-dark and look empty. These two lines make them readable. */
 .app option { background: var(--card); color: var(--text); }
@@ -3701,7 +3709,7 @@ function CSVImport({ existing, onImport, onDone }) {
           {dupes.length > 0 && (
             <label style={{ display: "flex", gap: 8, alignItems: "center",
               fontSize: 12, marginBottom: 12, cursor: "pointer" }}>
-              <input type="checkbox" checked={skipDupes} style={{ width: "auto" }}
+              <input type="checkbox" checked={skipDupes}
                 onChange={(e) => setSkipDupes(e.target.checked)} />
               Skip the {dupes.length} phone{dupes.length > 1 ? "s" : ""} already in the system
             </label>
@@ -5345,28 +5353,44 @@ function BulkPlanning({ models, onMoveMany, onOpen, role }) {
 
 const GEN_CAP = 500;
 
-function PickList({ title, names, picked, onToggle, onNone, q, setQ, placeholder, codeOf }) {
+function PickList({ title, names, picked, onToggle, onAll, onNone, q, setQ, placeholder, codeOf }) {
   const shown = names.filter((n) => n.toLowerCase().includes(q.trim().toLowerCase()));
   return (
     <div style={{ flex: "1 1 260px", minWidth: 230 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
         <span style={{ fontSize: 12, fontWeight: 600 }}>{title}</span>
         <Tag>{picked.size}</Tag>
-        {picked.size > 0 && (
-          <button className="btn" style={{ fontSize: 10, padding: "2px 6px", marginLeft: "auto" }}
-            onClick={onNone}>Clear</button>
-        )}
+        <span style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+          {/* Eighty colours is too many to tick one at a time, and the filter
+              box is how you get to the dozen you mean — so this takes what the
+              filter is showing, not the whole list. */}
+          {shown.length > 0 && shown.some((n) => !picked.has(n)) && (
+            <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
+              onClick={() => onAll(shown)}>
+              {q.trim() ? `All ${shown.length} shown` : `All ${shown.length}`}
+            </button>
+          )}
+          {picked.size > 0 && (
+            <button className="btn" style={{ fontSize: 10, padding: "2px 6px" }}
+              onClick={onNone}>Clear</button>
+          )}
+        </span>
       </div>
       <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={placeholder}
         style={{ fontSize: 12, padding: "4px 8px", width: "100%", marginBottom: 6 }} />
-      <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid var(--line)",
+      <div style={{ maxHeight: 260, overflowY: "auto", border: "1px solid var(--line)",
         borderRadius: 6, padding: "4px 6px" }}>
         {shown.map((n) => (
-          <label key={n} style={{ display: "flex", gap: 6, alignItems: "center",
-            fontSize: 12, padding: "2px 0", cursor: "pointer" }}>
+          <label key={n} title={`${n} → ${codeOf(n)}`}
+            style={{ display: "flex", gap: 8, alignItems: "center",
+              fontSize: 12, padding: "3px 2px", cursor: "pointer", borderRadius: 4,
+              background: picked.has(n) ? "var(--line)" : undefined }}>
             <input type="checkbox" checked={picked.has(n)} onChange={() => onToggle(n)} />
-            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{n}</span>
-            <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--dim)" }}>{codeOf(n)}</span>
+            <span style={{ flex: 1, minWidth: 0, overflow: "hidden",
+              textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{n}</span>
+            {/* The code is the point of the row, so it never wraps or shrinks. */}
+            <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--dim)",
+              whiteSpace: "nowrap", flex: "none" }}>{codeOf(n)}</span>
           </label>
         ))}
         {!shown.length && <div style={{ fontSize: 11, color: "var(--dim)", padding: "6px 0" }}>Nothing matches.</div>}
@@ -5394,6 +5418,10 @@ function SKUGenerator({ models, onGenerate, onOpen, canEdit }) {
   const toggler = (put) => (value) => put((old) => {
     const next = new Set(old); next.has(value) ? next.delete(value) : next.add(value); return next;
   });
+
+  /* Adds to the selection rather than replacing it, so filtering for "blue",
+     taking all of them, then filtering for "green" keeps both. */
+  const addAll = (put) => (values) => put((old) => new Set([...old, ...values]));
 
   const typeList   = [...types];
   const colourList = [...colours];
@@ -5468,7 +5496,7 @@ function SKUGenerator({ models, onGenerate, onOpen, canEdit }) {
             <table>
               <thead><tr>
                 <th style={{ width: 34 }}></th>
-                <th>Model</th><th style={{ width: 180 }}>Code in the SKU</th><th>Has</th><th></th>
+                <th>Model</th><th style={{ width: 180 }}>Code in the SKU</th><th>SKUs now</th><th></th>
               </tr></thead>
               <tbody>
                 {planned.map((m) => (
@@ -5500,11 +5528,13 @@ function SKUGenerator({ models, onGenerate, onOpen, canEdit }) {
           {/* ── covers and colours ── */}
           <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 14 }}>
             <PickList title="Cover type" names={MATERIAL_NAMES} picked={types}
-              onToggle={toggler(setTypes)} onNone={() => setTypes(new Set())}
+              onToggle={toggler(setTypes)} onAll={addAll(setTypes)}
+              onNone={() => setTypes(new Set())}
               q={typeQ} setQ={setTypeQ} placeholder="Filter covers"
               codeOf={(n) => typeCode(n) || "—"} />
             <PickList title="Colour" names={COLOUR_NAMES} picked={colours}
-              onToggle={toggler(setColours)} onNone={() => setColours(new Set())}
+              onToggle={toggler(setColours)} onAll={addAll(setColours)}
+              onNone={() => setColours(new Set())}
               q={colourQ} setQ={setColourQ} placeholder="Filter colours"
               codeOf={(n) => colourCode(n) || "—"} />
           </div>
@@ -5513,7 +5543,7 @@ function SKUGenerator({ models, onGenerate, onOpen, canEdit }) {
             <label style={{ fontSize: 12, color: "var(--dim)", display: "flex", gap: 6, alignItems: "center" }}>
               Units each
               <input type="number" min="0" value={units} onChange={(e) => setUnits(e.target.value)}
-                placeholder="per cover" style={{ fontFamily: "var(--mono)", fontSize: 12, width: 90 }} />
+                placeholder="per cover" style={{ fontFamily: "var(--mono)", fontSize: 12, width: 120 }} />
             </label>
             <span style={{ fontSize: 11, color: "var(--dim)" }}>
               blank books each cover's usual quantity
