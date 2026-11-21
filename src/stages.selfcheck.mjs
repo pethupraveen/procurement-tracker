@@ -157,6 +157,34 @@ advance(1); advance(1); advance(1);
 check("a child mapped to a SKU the master no longer has is not released",
   D(2).stage === "planned");
 
+/* ── WHO MAY BULK-PLAN ────────────────────────── */
+
+/* The Planning screen ticks Research models and moves them to Planned in one
+   pass, deciding what is tickable with moveStatus exactly as the drag and the
+   arrow do. The rule is therefore already covered — but that screen is the
+   one place that can put twenty models through the gate on a single click,
+   so the answer is pinned here rather than trusted. */
+fleet = freshFleet();
+const inResearch = D(1);
+check("Procurement can plan a Research model",
+  moveStatus(inResearch, "procurement", "planned").ok);
+check("Admin can too", moveStatus(inResearch, "admin", "planned").ok);
+check("Warehouse cannot — it owns Production, not the buying decision",
+  !moveStatus(inResearch, "warehouse", "planned").ok);
+check("Catalog cannot", !moveStatus(inResearch, "catalog", "planned").ok);
+check("Sales cannot", !moveStatus(inResearch, "sales", "planned").ok);
+check("a child is planned like any other — only Ordered and Production are closed to it",
+  moveStatus(D(2), "procurement", "planned").ok);
+
+/* One stage, never two: the screen must not become a way to skip Planned. */
+check("Research cannot jump straight to Ordered",
+  !moveStatus(inResearch, "admin", "ordered").ok);
+
+/* Nothing outside Research is offered, and the gate agrees. */
+advance(1);
+check("a model already at Planned cannot be planned again",
+  !moveStatus(D(1), "admin", "planned").ok);
+
 /* ── RUN C — the stage vocabulary the rules above assume ───────── */
 const keys = STAGES.filter((s) => !s.terminal).map((s) => s.key);
 assert.deepEqual(keys, ["research", "planned", "ordered", "production", "received", "live"],

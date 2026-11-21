@@ -13,7 +13,7 @@ import { exportCell, safeUrl as safeUrlOf, wouldStrandAdmins, isLastAdmin,
    already called Calendar and Table, and Calendar/Inward previously reused the
    Dashboard and Orders icons, so two pairs of tabs were visually identical. */
 import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, LayoutGrid, List, BarChart2, FileText,
-         CalendarDays as CalendarIcon, Inbox as InboxIcon } from "lucide-react";
+         CalendarDays as CalendarIcon, Inbox as InboxIcon, ClipboardList } from "lucide-react";
 
 /* ═══════════════════════════════════════════════════════════════
    NEW MODEL PROCUREMENT TRACKER — simple version
@@ -553,6 +553,7 @@ const VIEWS = [
   { key: "board",     label: "Board",     Icon: LayoutGrid   },
   { key: "table",     label: "List",      Icon: List         },
   { key: "calendar",  label: "Calendar",  Icon: CalendarIcon },
+  { key: "planning",  label: "Planning",  Icon: ClipboardList },
   { key: "orders",    label: "Orders",    Icon: Package      },
   { key: "inward",    label: "Inward",    Icon: InboxIcon,     badge: "inward"  },
   { key: "listing",   label: "Listing",   Icon: CheckCircle2,  badge: "listing" },
@@ -5173,6 +5174,157 @@ function BulkReceive({ models, onReceive, canReceive }) {
 }
 
 
+/* ── BULK PLANNING ───────────────────────────────────────────────
+   Research is the long tail: every handset anyone has heard about,
+   most of which will never be bought. Deciding what to buy is one
+   judgement taken across the whole list in a sitting — but the board
+   only ever offered one card at a time, and past twenty models that
+   is twenty drags down a column that reorders itself as each card
+   leaves it.
+
+   This is the same decision in one pass. It moves models exactly one
+   stage, Research → Planned, and does nothing else: the covers and
+   quantities that make a Planned model real are chosen per model
+   afterwards, where the SKU list lives.
+   ─────────────────────────────────────────────────────────────── */
+
+function BulkPlanning({ models, onMoveMany, onOpen, role }) {
+  const [picked, setPicked] = useState(() => new Set());
+  const [q, setQ]           = useState("");
+
+  const waiting = models.filter((m) => m.stage === "research").sort(byUrgency);
+  /* The same gate the drag and the arrow use, asked per model, so this
+     screen can never be the one route around the rules. */
+  const blockOf = (m) => moveStatus(m, role, "planned").reason;
+  const canMove = (m) => !blockOf(m);
+  const movable = waiting.filter(canMove);
+  /* Chosen is counted across the whole list, not the filtered view: a
+     search typed after ticking must not quietly shrink what the button
+     is about to move. */
+  const chosen  = movable.filter((m) => picked.has(m.id));
+  const shown   = waiting.filter((m) => matchesSearch(m, q));
+
+  const toggle = (id) => setPicked((ids) => {
+    const next = new Set(ids); next.has(id) ? next.delete(id) : next.add(id); return next;
+  });
+  /* Select all takes what is on screen, so a search narrows it — that is
+     the point of the box. */
+  const pickAll  = () => setPicked(new Set(shown.filter(canMove).map((m) => m.id)));
+  const clearAll = () => setPicked(new Set());
+
+  const run = () => {
+    if (!chosen.length) return;
+    onMoveMany(chosen.map((m) => m.id), "planned");
+    setPicked(new Set());
+  };
+
+  const skuCount = chosen.reduce((t, m) => t + allSkus(m).length, 0);
+
+  return (
+    <div>
+      <h2>Plan the research list</h2>
+
+      {waiting.length > 0 && !movable.length && (
+        <RoleLocked what="move models into Planned" who="Procurement" />
+      )}
+
+      <div className="card">
+        {waiting.length === 0 ? (
+          <div style={{ fontSize: 13, color: "var(--dim)" }}>
+            Nothing in Research. Models appear here as they are added, and leave
+            as they are planned or taken out of procurement.
+          </div>
+        ) : (<>
+          <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
+            Tick the models you have decided to buy and move them to Planned in one go.
+            Soonest launch first. Everything else about a model — covers, quantities,
+            SKU codes — is chosen afterwards, per model.
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <input value={q} onChange={(e) => setQ(e.target.value)}
+              placeholder="Filter by brand, model or segment"
+              style={{ fontSize: 12, padding: "4px 8px", flex: "1 1 220px", maxWidth: 320 }} />
+            <button className="btn" style={{ fontSize: 11, padding: "4px 9px" }} onClick={pickAll}>
+              Select all {shown.filter(canMove).length}
+            </button>
+            {chosen.length > 0 && (
+              <button className="btn" style={{ fontSize: 11, padding: "4px 9px" }} onClick={clearAll}>
+                Clear selection
+              </button>
+            )}
+            {q && <Tag>{shown.length} of {waiting.length} shown</Tag>}
+          </div>
+
+          <div style={{ overflowX: "auto", marginBottom: 14, maxHeight: 420, overflowY: "auto" }}>
+            <table>
+              <thead><tr>
+                <th style={{ width: 34 }}></th>
+                <th>Model</th><th>Launch</th><th>SKUs</th><th></th>
+              </tr></thead>
+              <tbody>
+                {shown.map((m) => {
+                  const block = blockOf(m);
+                  return (
+                    <tr key={m.id} style={{ cursor: block ? "default" : "pointer", opacity: block ? 0.55 : 1 }}
+                      onClick={() => { if (!block) toggle(m.id); }}>
+                      <td style={{ textAlign: "center" }}>
+                        {block
+                          ? <Circle size={15} style={{ color: "var(--line)" }} />
+                          : picked.has(m.id)
+                            ? <CheckCircle2 size={15} style={{ color: "var(--ok)" }} />
+                            : <Circle size={15} style={{ color: "var(--dim)" }} />}
+                      </td>
+                      <td>
+                        <div style={{ fontWeight: 570 }}>
+                          <span onClick={(e) => { e.stopPropagation(); onOpen(m.id); }}
+                            style={{ cursor: "pointer" }}>{m.brand} {m.name}</span>
+                        </div>
+                        <div style={{ fontSize: 11, color: "var(--dim)" }}>{m.segment}</div>
+                      </td>
+                      <td className="n" style={{ fontSize: 12 }}>
+                        {showDate(m.launch)}
+                        {Number.isFinite(m.daysToLaunch) && (
+                          <div style={{ fontSize: 10, color: m.daysToLaunch < 0 ? "var(--bad)"
+                            : m.daysToLaunch <= 30 ? "var(--warn)" : "var(--dim)" }}>
+                            {m.daysToLaunch < 0 ? `launched ${-m.daysToLaunch}d ago` : `${m.daysToLaunch}d to launch`}
+                          </div>
+                        )}
+                      </td>
+                      <td className="n">{allSkus(m).length || "—"}</td>
+                      <td>
+                        {m.isChild   && <Tag tone="warn">child of {m.master?.name}</Tag>}
+                        {block       && <Tag>{block}</Tag>}
+                      </td>
+                    </tr>
+                  );
+                })}
+                {shown.length === 0 && (
+                  <tr><td colSpan={5} style={{ fontSize: 12, color: "var(--dim)", padding: "12px 8px" }}>
+                    Nothing matches “{q}”.
+                  </td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ fontSize: 12, color: "var(--dim)" }}>
+              {chosen.length} of {movable.length} selected
+              {skuCount > 0 && ` · ${skuCount} SKU${skuCount === 1 ? "" : "s"} already on them`}
+            </span>
+            <button className="btn" data-primary="1" style={{ marginLeft: "auto" }}
+              disabled={!chosen.length} onClick={run}>
+              Move {chosen.length || ""} to Planned →
+            </button>
+          </div>
+        </>)}
+      </div>
+    </div>
+  );
+}
+
+
 /* ── PURCHASE ORDERS ─────────────────────────────────────────────
    One PO usually covers several phone models at once. This view
    lets you tick the models going onto a PO, assign the number to
@@ -6399,6 +6551,35 @@ export default function App() {
     saved(`${m.name} moved ${back ? "back " : ""}to ${STAGES[stageIndex(stageKey)].label}`);
   };
 
+  /* Many models to one stage, in a single pass with a single message.
+     FR-R09: calling move() in a loop would fire one toast per model, each
+     overwriting the last, so twenty moves reported whichever happened to
+     land last and nothing about the other nineteen.
+
+     The gate is re-run per model here against phonesRef, not the list this
+     render captured (AUD-027): a tick made a minute ago can name a model a
+     background sync has since moved on, and moving it twice is worse than
+     naming it as skipped. */
+  const moveMany = (ids, stageKey) => {
+    const label = STAGES[stageIndex(stageKey)].label;
+    const fresh = phonesRef.current;
+    const moved = [], skipped = [];
+    ids.forEach((id) => {
+      const p = fresh.find((x) => x.id === id);
+      if (!p) { skipped.push("one model is no longer in the list"); return; }
+      const st = moveStatus(derive(p, fresh), role, stageKey);
+      if (st.ok) { moveTo(id, stageKey); moved.push(p); }
+      else skipped.push(`${p.brand} ${p.name}: ${st.reason}`);
+    });
+    if (!moved.length) {
+      say(`⚠ Nothing moved — ${skipped[0] || "nothing was selected"}`);
+      return 0;
+    }
+    saved(`${moved.length} model${moved.length === 1 ? "" : "s"} moved to ${label}`
+      + (skipped.length ? ` · ${skipped.length} skipped (${skipped[0]})` : ""));
+    return moved.length;
+  };
+
   const advance = (id) => {
     const m = models.find((x) => x.id === id);
     if (!m || m.terminal) return;
@@ -6980,6 +7161,8 @@ export default function App() {
                                   compact={compact} filters={filters} />}
         {view === "table"     && <Table models={visible} allModels={models} onOpen={setOpenId}
                                   onAdvance={advance} role={role} filters={filters} />}
+        {view === "planning"  && <BulkPlanning models={liveModels} onMoveMany={moveMany}
+                                  onOpen={setOpenId} role={role} />}
         {view === "orders"    && (
           <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
             <POManager models={liveModels} onAssign={assignPO}
