@@ -9,11 +9,13 @@ import { exportCell, safeUrl as safeUrlOf, wouldStrandAdmins, isLastAdmin,
          isChildModel, childrenOf, isMasterModel, masterLinkProblem,
          eligibleMasters, childSkuMappingProblems,
          nextStageKey, prevStageKey, isReadyToRelease, parseLaunchDate } from "./rules.js";
+import { COVER_TYPES, COLOUR_NAMES, buildSku, modelCodeFor, brandCode,
+         typeCode, colourCode, SKU_MAX } from "./sku.js";
 /* CalendarDays and Inbox are aliased on import: the local components below are
    already called Calendar and Table, and Calendar/Inward previously reused the
    Dashboard and Orders icons, so two pairs of tabs were visually identical. */
 import { Plus, X, Sun, Moon, Package, CheckCircle2, Circle, AlertTriangle, LayoutGrid, List, BarChart2, FileText,
-         CalendarDays as CalendarIcon, Inbox as InboxIcon } from "lucide-react";
+         CalendarDays as CalendarIcon, Inbox as InboxIcon, ClipboardList } from "lucide-react";
 
 /* ═══════════════════════════════════════════════════════════════
    NEW MODEL PROCUREMENT TRACKER — simple version
@@ -107,15 +109,15 @@ const MARKETPLACES = ["Flipkart", "Amazon", "Meesho", "Shopify"];
 
 /* Materials you actually buy. Edit this one array to change the
    dropdown everywhere it appears.                               */
-/* The four materials you actually order, each with the quantity you
-   normally book. Picking a material fills the units for you — you can
-   always type over it.                                                */
-const MATERIALS = [
-  { name: "TPU+PC",           defaultQty: 50 },
-  { name: "Silicone Cover",   defaultQty: 30 },
-  { name: "TPU+PC+MSF",       defaultQty: 50 },
-  { name: "Silicone MagSafe", defaultQty: 30 },
-];
+/* The covers you actually order, each with the quantity you normally
+   book. Picking one fills the units for you — you can always type over
+   it. This was four hardcoded names until the SKU sheet arrived; it is
+   now the sheet's own cover-type list, so a material chosen here and a
+   material in a SKU code can never be two different vocabularies
+   (AUD-013). A type the sheet carries no quantity for books 0, which
+   the buyer has to replace — a wrong default lands on a purchase
+   order, and 0 is at least visibly unanswered.                      */
+const MATERIALS = COVER_TYPES.map(([name, , defaultQty]) => ({ name, defaultQty }));
 const MATERIAL_NAMES = MATERIALS.map((m) => m.name);
 const defaultQtyFor  = (name) => MATERIALS.find((m) => m.name === name)?.defaultQty ?? 0;
 
@@ -553,6 +555,7 @@ const VIEWS = [
   { key: "board",     label: "Board",     Icon: LayoutGrid   },
   { key: "table",     label: "List",      Icon: List         },
   { key: "calendar",  label: "Calendar",  Icon: CalendarIcon },
+  { key: "planning",  label: "Planning",  Icon: ClipboardList },
   { key: "orders",    label: "Orders",    Icon: Package      },
   { key: "inward",    label: "Inward",    Icon: InboxIcon,     badge: "inward"  },
   { key: "listing",   label: "Listing",   Icon: CheckCircle2,  badge: "listing" },
@@ -5173,6 +5176,413 @@ function BulkReceive({ models, onReceive, canReceive }) {
 }
 
 
+/* ── BULK PLANNING ───────────────────────────────────────────────
+   Research is the long tail: every handset anyone has heard about,
+   most of which will never be bought. Deciding what to buy is one
+   judgement taken across the whole list in a sitting — but the board
+   only ever offered one card at a time, and past twenty models that
+   is twenty drags down a column that reorders itself as each card
+   leaves it.
+
+   This is the same decision in one pass. It moves models exactly one
+   stage, Research → Planned, and does nothing else: the covers and
+   quantities that make a Planned model real are chosen per model
+   afterwards, where the SKU list lives.
+   ─────────────────────────────────────────────────────────────── */
+
+function BulkPlanning({ models, onMoveMany, onOpen, role }) {
+  const [picked, setPicked] = useState(() => new Set());
+  const [q, setQ]           = useState("");
+
+  const waiting = models.filter((m) => m.stage === "research").sort(byUrgency);
+  /* The same gate the drag and the arrow use, asked per model, so this
+     screen can never be the one route around the rules. */
+  const blockOf = (m) => moveStatus(m, role, "planned").reason;
+  const canMove = (m) => !blockOf(m);
+  const movable = waiting.filter(canMove);
+  /* Chosen is counted across the whole list, not the filtered view: a
+     search typed after ticking must not quietly shrink what the button
+     is about to move. */
+  const chosen  = movable.filter((m) => picked.has(m.id));
+  const shown   = waiting.filter((m) => matchesSearch(m, q));
+
+  const toggle = (id) => setPicked((ids) => {
+    const next = new Set(ids); next.has(id) ? next.delete(id) : next.add(id); return next;
+  });
+  /* Select all takes what is on screen, so a search narrows it — that is
+     the point of the box. */
+  const pickAll  = () => setPicked(new Set(shown.filter(canMove).map((m) => m.id)));
+  const clearAll = () => setPicked(new Set());
+
+  const run = () => {
+    if (!chosen.length) return;
+    onMoveMany(chosen.map((m) => m.id), "planned");
+    setPicked(new Set());
+  };
+
+  const skuCount = chosen.reduce((t, m) => t + allSkus(m).length, 0);
+
+  return (
+    <div>
+      <h2>Plan the research list</h2>
+
+      {waiting.length > 0 && !movable.length && (
+        <RoleLocked what="move models into Planned" who="Procurement" />
+      )}
+
+      <div className="card">
+        {waiting.length === 0 ? (
+          <div style={{ fontSize: 13, color: "var(--dim)" }}>
+            Nothing in Research. Models appear here as they are added, and leave
+            as they are planned or taken out of procurement.
+          </div>
+        ) : (<>
+          <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
+            Tick the models you have decided to buy and move them to Planned in one go.
+            Soonest launch first. Everything else about a model — covers, quantities,
+            SKU codes — is chosen afterwards, per model.
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <input value={q} onChange={(e) => setQ(e.target.value)}
+              placeholder="Filter by brand, model or segment"
+              style={{ fontSize: 12, padding: "4px 8px", flex: "1 1 220px", maxWidth: 320 }} />
+            <button className="btn" style={{ fontSize: 11, padding: "4px 9px" }} onClick={pickAll}>
+              Select all {shown.filter(canMove).length}
+            </button>
+            {chosen.length > 0 && (
+              <button className="btn" style={{ fontSize: 11, padding: "4px 9px" }} onClick={clearAll}>
+                Clear selection
+              </button>
+            )}
+            {q && <Tag>{shown.length} of {waiting.length} shown</Tag>}
+          </div>
+
+          <div style={{ overflowX: "auto", marginBottom: 14, maxHeight: 420, overflowY: "auto" }}>
+            <table>
+              <thead><tr>
+                <th style={{ width: 34 }}></th>
+                <th>Model</th><th>Launch</th><th>SKUs</th><th></th>
+              </tr></thead>
+              <tbody>
+                {shown.map((m) => {
+                  const block = blockOf(m);
+                  return (
+                    <tr key={m.id} style={{ cursor: block ? "default" : "pointer", opacity: block ? 0.55 : 1 }}
+                      onClick={() => { if (!block) toggle(m.id); }}>
+                      <td style={{ textAlign: "center" }}>
+                        {block
+                          ? <Circle size={15} style={{ color: "var(--line)" }} />
+                          : picked.has(m.id)
+                            ? <CheckCircle2 size={15} style={{ color: "var(--ok)" }} />
+                            : <Circle size={15} style={{ color: "var(--dim)" }} />}
+                      </td>
+                      <td>
+                        <div style={{ fontWeight: 570 }}>
+                          <span onClick={(e) => { e.stopPropagation(); onOpen(m.id); }}
+                            style={{ cursor: "pointer" }}>{m.brand} {m.name}</span>
+                        </div>
+                        <div style={{ fontSize: 11, color: "var(--dim)" }}>{m.segment}</div>
+                      </td>
+                      <td className="n" style={{ fontSize: 12 }}>
+                        {showDate(m.launch)}
+                        {Number.isFinite(m.daysToLaunch) && (
+                          <div style={{ fontSize: 10, color: m.daysToLaunch < 0 ? "var(--bad)"
+                            : m.daysToLaunch <= 30 ? "var(--warn)" : "var(--dim)" }}>
+                            {m.daysToLaunch < 0 ? `launched ${-m.daysToLaunch}d ago` : `${m.daysToLaunch}d to launch`}
+                          </div>
+                        )}
+                      </td>
+                      <td className="n">{allSkus(m).length || "—"}</td>
+                      <td>
+                        {m.isChild   && <Tag tone="warn">child of {m.master?.name}</Tag>}
+                        {block       && <Tag>{block}</Tag>}
+                      </td>
+                    </tr>
+                  );
+                })}
+                {shown.length === 0 && (
+                  <tr><td colSpan={5} style={{ fontSize: 12, color: "var(--dim)", padding: "12px 8px" }}>
+                    Nothing matches “{q}”.
+                  </td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ fontSize: 12, color: "var(--dim)" }}>
+              {chosen.length} of {movable.length} selected
+              {skuCount > 0 && ` · ${skuCount} SKU${skuCount === 1 ? "" : "s"} already on them`}
+            </span>
+            <button className="btn" data-primary="1" style={{ marginLeft: "auto" }}
+              disabled={!chosen.length} onClick={run}>
+              Move {chosen.length || ""} to Planned →
+            </button>
+          </div>
+        </>)}
+      </div>
+    </div>
+  );
+}
+
+
+/* ── SKU GENERATOR ───────────────────────────────────────────────
+   The codes in Excel_SKU_Gen/SKU Generator.xlsx, built in the app
+   instead of in the sheet. src/sku.js holds the lookup tables and
+   the formula; this is the screen that drives them.
+
+   One pass covers several models, because that is the shape of the
+   sheet and of the job: a cover type and a run of colours are
+   decided once and apply across every handset in a launch. Models
+   × covers × colours is a cross-product, so the count is shown
+   before anything is written, and the button refuses past a count
+   nobody meant to ask for.
+
+   It only ever adds. Codes already on a model are marked and
+   skipped, so running it again after adding one colour is safe.
+   ─────────────────────────────────────────────────────────────── */
+
+const GEN_CAP = 500;
+
+function PickList({ title, names, picked, onToggle, onNone, q, setQ, placeholder, codeOf }) {
+  const shown = names.filter((n) => n.toLowerCase().includes(q.trim().toLowerCase()));
+  return (
+    <div style={{ flex: "1 1 260px", minWidth: 230 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+        <span style={{ fontSize: 12, fontWeight: 600 }}>{title}</span>
+        <Tag>{picked.size}</Tag>
+        {picked.size > 0 && (
+          <button className="btn" style={{ fontSize: 10, padding: "2px 6px", marginLeft: "auto" }}
+            onClick={onNone}>Clear</button>
+        )}
+      </div>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={placeholder}
+        style={{ fontSize: 12, padding: "4px 8px", width: "100%", marginBottom: 6 }} />
+      <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid var(--line)",
+        borderRadius: 6, padding: "4px 6px" }}>
+        {shown.map((n) => (
+          <label key={n} style={{ display: "flex", gap: 6, alignItems: "center",
+            fontSize: 12, padding: "2px 0", cursor: "pointer" }}>
+            <input type="checkbox" checked={picked.has(n)} onChange={() => onToggle(n)} />
+            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{n}</span>
+            <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--dim)" }}>{codeOf(n)}</span>
+          </label>
+        ))}
+        {!shown.length && <div style={{ fontSize: 11, color: "var(--dim)", padding: "6px 0" }}>Nothing matches.</div>}
+      </div>
+    </div>
+  );
+}
+
+function SKUGenerator({ models, onGenerate, onOpen, canEdit }) {
+  const [pickedModels, setPickedModels] = useState(() => new Set());
+  const [codes, setCodes]     = useState({});       // { modelId: "18-PRO" }
+  const [types, setTypes]     = useState(() => new Set());
+  const [colours, setColours] = useState(() => new Set());
+  const [typeQ, setTypeQ]     = useState("");
+  const [colourQ, setColourQ] = useState("");
+  const [units, setUnits]     = useState("");
+
+  const planned = models.filter((m) => m.stage === "planned").sort(byUrgency);
+  const chosen  = planned.filter((m) => pickedModels.has(m.id));
+  /* The sheet types this column already shortened. Nobody can derive
+     FND-X10-PMAX from "Find X10 Pro Max", so this is only a suggestion
+     and the buyer corrects it. */
+  const codeFor = (m) => (codes[m.id] ?? modelCodeFor(m.name));
+
+  const toggler = (put) => (value) => put((old) => {
+    const next = new Set(old); next.has(value) ? next.delete(value) : next.add(value); return next;
+  });
+
+  const typeList   = [...types];
+  const colourList = [...colours];
+  const total = chosen.length * typeList.length * colourList.length;
+
+  /* Every row this selection would write, with everything the buyer has
+     to see first: a part the tables have never heard of, a code past the
+     sheet's own 40-character mark, and a code the model already has. */
+  const rows = useMemo(() => {
+    if (!total || total > GEN_CAP) return [];
+    const out = [];
+    chosen.forEach((m) => {
+      const have = new Set(allSkus(m).map((r) => (r.sku || "").trim().toLowerCase()));
+      typeList.forEach((type) => colourList.forEach((colour) => {
+        const built = buildSku({ brand: m.brand, modelCode: codeFor(m), type, colour });
+        out.push({ model: m, type, colour, ...built,
+          duplicate: have.has(built.sku.trim().toLowerCase()) });
+      }));
+    });
+    return out;
+  }, [total, chosen.map((m) => `${m.id}:${codeFor(m)}:${allSkus(m).length}`).join("|"),
+      typeList.join("|"), colourList.join("|")]);
+
+  const fresh    = rows.filter((r) => !r.duplicate);
+  const dupes    = rows.length - fresh.length;
+  const unknowns = fresh.filter((r) => r.unknown.length);
+  const tooLong  = fresh.filter((r) => r.tooLong);
+  /* A brand with no short form drops out of the code silently, which is
+     how two different handsets end up sharing one SKU. */
+  const noBrand  = chosen.filter((m) => !brandCode(m.brand));
+
+  const run = () => {
+    if (!fresh.length) return;
+    const byModel = chosen.map((m) => ({
+      id: m.id,
+      skus: fresh.filter((r) => r.model.id === m.id).map((r) => ({
+        ...skuRow(r.sku, r.type, 0),
+        /* A child carries no quantity — its master holds the stock. */
+        units: m.isChild ? 0 : (units === "" ? defaultQtyFor(r.type) : Math.max(0, +units || 0)),
+      })),
+    })).filter((x) => x.skus.length);
+    onGenerate(byModel);
+    setPickedModels(new Set()); setTypes(new Set()); setColours(new Set());
+  };
+
+  return (
+    <div>
+      <h2>Generate SKU codes</h2>
+
+      {!canEdit && <RoleLocked what="edit SKUs" who="Procurement" />}
+
+      <div className="card">
+        {planned.length === 0 ? (
+          <div style={{ fontSize: 13, color: "var(--dim)" }}>
+            Nothing at Planned. Models appear here once they are planned, and leave
+            once they are ordered — a Planned model cannot move on until every SKU
+            on it has a code.
+          </div>
+        ) : (<>
+          <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 12, lineHeight: 1.5 }}>
+            Pick the models, the covers and the colours. Every combination becomes one
+            SKU, built to the sheet's rule:{" "}
+            <code style={{ fontSize: 11 }}>BRAND-MODEL-COVER-COLOUR</code>. Codes already
+            on a model are skipped, so you can run this again after adding a colour.
+          </div>
+
+          {/* ── the models, each with the short code that goes in its SKU ── */}
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+            Models at Planned <Tag>{pickedModels.size} of {planned.length}</Tag>
+          </div>
+          <div style={{ maxHeight: 240, overflowY: "auto", marginBottom: 14 }}>
+            <table>
+              <thead><tr>
+                <th style={{ width: 34 }}></th>
+                <th>Model</th><th style={{ width: 180 }}>Code in the SKU</th><th>Has</th><th></th>
+              </tr></thead>
+              <tbody>
+                {planned.map((m) => (
+                  <tr key={m.id} style={{ cursor: "pointer" }}
+                    onClick={() => toggler(setPickedModels)(m.id)}>
+                    <td style={{ textAlign: "center" }}>
+                      {pickedModels.has(m.id)
+                        ? <CheckCircle2 size={15} style={{ color: "var(--ok)" }} />
+                        : <Circle size={15} style={{ color: "var(--dim)" }} />}
+                    </td>
+                    <td>
+                      <span style={{ fontWeight: 570, cursor: "pointer" }}
+                        onClick={(e) => { e.stopPropagation(); onOpen(m.id); }}>{m.brand} {m.name}</span>
+                      {m.isChild && <Tag tone="warn">child</Tag>}
+                    </td>
+                    <td onClick={(e) => e.stopPropagation()}>
+                      <input value={codeFor(m)}
+                        onChange={(e) => setCodes((c) => ({ ...c, [m.id]: e.target.value.toUpperCase() }))}
+                        style={{ fontFamily: "var(--mono)", fontSize: 11, width: 170, padding: "3px 6px" }} />
+                    </td>
+                    <td className="n">{allSkus(m).length || "—"}</td>
+                    <td>{!brandCode(m.brand) && <Tag tone="bad">{m.brand} has no short form</Tag>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* ── covers and colours ── */}
+          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 14 }}>
+            <PickList title="Cover type" names={MATERIAL_NAMES} picked={types}
+              onToggle={toggler(setTypes)} onNone={() => setTypes(new Set())}
+              q={typeQ} setQ={setTypeQ} placeholder="Filter covers"
+              codeOf={(n) => typeCode(n) || "—"} />
+            <PickList title="Colour" names={COLOUR_NAMES} picked={colours}
+              onToggle={toggler(setColours)} onNone={() => setColours(new Set())}
+              q={colourQ} setQ={setColourQ} placeholder="Filter colours"
+              codeOf={(n) => colourCode(n) || "—"} />
+          </div>
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
+            <label style={{ fontSize: 12, color: "var(--dim)", display: "flex", gap: 6, alignItems: "center" }}>
+              Units each
+              <input type="number" min="0" value={units} onChange={(e) => setUnits(e.target.value)}
+                placeholder="per cover" style={{ fontFamily: "var(--mono)", fontSize: 12, width: 90 }} />
+            </label>
+            <span style={{ fontSize: 11, color: "var(--dim)" }}>
+              blank books each cover's usual quantity
+            </span>
+          </div>
+
+          {total > GEN_CAP && (
+            <div className="card" style={{ background: "var(--bg)", fontSize: 12, marginBottom: 10 }}>
+              {qty(total)} combinations — more than the {GEN_CAP} this writes in one go.
+              Narrow the models, covers or colours.
+            </div>
+          )}
+
+          {rows.length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 6 }}>
+                <Tag tone="ok">{fresh.length} new</Tag>
+                {dupes > 0           && <Tag>{dupes} already there</Tag>}
+                {tooLong.length > 0  && <Tag tone="warn">{tooLong.length} over {SKU_MAX} characters</Tag>}
+                {unknowns.length > 0 && <Tag tone="bad">{unknowns.length} missing a short form</Tag>}
+                {noBrand.length > 0  && <Tag tone="bad">{noBrand.length} model{noBrand.length === 1 ? "" : "s"} with no brand code</Tag>}
+              </div>
+              <div style={{ maxHeight: 260, overflowY: "auto" }}>
+                <table>
+                  <thead><tr><th>SKU</th><th>Model</th><th>Cover</th><th>Colour</th><th>Len</th><th></th></tr></thead>
+                  <tbody>
+                    {rows.slice(0, 120).map((r, i) => (
+                      <tr key={i} style={{ cursor: "default", opacity: r.duplicate ? 0.45 : 1 }}>
+                        <td className="n" style={{ fontWeight: 550, fontSize: 11.5 }}>{r.sku}</td>
+                        <td style={{ fontSize: 11.5 }}>{r.model.brand} {r.model.name}</td>
+                        <td style={{ fontSize: 11.5, color: "var(--dim)" }}>{r.type}</td>
+                        <td style={{ fontSize: 11.5, color: "var(--dim)" }}>{r.colour}</td>
+                        <td className="n" style={{ color: r.tooLong ? "var(--warn)" : "var(--dim)" }}>{r.length}</td>
+                        <td>
+                          {r.duplicate && <Tag>already on this model</Tag>}
+                          {!r.duplicate && r.unknown.length > 0 &&
+                            <Tag tone="bad">no short form for {r.unknown.join(", ")}</Tag>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {rows.length > 120 && (
+                  <div style={{ fontSize: 11, color: "var(--dim)", padding: "6px 2px" }}>
+                    …and {rows.length - 120} more.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ fontSize: 12, color: "var(--dim)" }}>
+              {chosen.length} model{chosen.length === 1 ? "" : "s"} × {typeList.length} cover
+              {typeList.length === 1 ? "" : "s"} × {colourList.length} colour
+              {colourList.length === 1 ? "" : "s"}
+            </span>
+            <button className="btn" data-primary="1" style={{ marginLeft: "auto" }}
+              disabled={!canEdit || !fresh.length || total > GEN_CAP} onClick={run}>
+              Add {fresh.length || ""} SKU{fresh.length === 1 ? "" : "s"}
+            </button>
+          </div>
+        </>)}
+      </div>
+    </div>
+  );
+}
+
+
 /* ── PURCHASE ORDERS ─────────────────────────────────────────────
    One PO usually covers several phone models at once. This view
    lets you tick the models going onto a PO, assign the number to
@@ -6399,6 +6809,35 @@ export default function App() {
     saved(`${m.name} moved ${back ? "back " : ""}to ${STAGES[stageIndex(stageKey)].label}`);
   };
 
+  /* Many models to one stage, in a single pass with a single message.
+     FR-R09: calling move() in a loop would fire one toast per model, each
+     overwriting the last, so twenty moves reported whichever happened to
+     land last and nothing about the other nineteen.
+
+     The gate is re-run per model here against phonesRef, not the list this
+     render captured (AUD-027): a tick made a minute ago can name a model a
+     background sync has since moved on, and moving it twice is worse than
+     naming it as skipped. */
+  const moveMany = (ids, stageKey) => {
+    const label = STAGES[stageIndex(stageKey)].label;
+    const fresh = phonesRef.current;
+    const moved = [], skipped = [];
+    ids.forEach((id) => {
+      const p = fresh.find((x) => x.id === id);
+      if (!p) { skipped.push("one model is no longer in the list"); return; }
+      const st = moveStatus(derive(p, fresh), role, stageKey);
+      if (st.ok) { moveTo(id, stageKey); moved.push(p); }
+      else skipped.push(`${p.brand} ${p.name}: ${st.reason}`);
+    });
+    if (!moved.length) {
+      say(`⚠ Nothing moved — ${skipped[0] || "nothing was selected"}`);
+      return 0;
+    }
+    saved(`${moved.length} model${moved.length === 1 ? "" : "s"} moved to ${label}`
+      + (skipped.length ? ` · ${skipped.length} skipped (${skipped[0]})` : ""));
+    return moved.length;
+  };
+
   const advance = (id) => {
     const m = models.find((x) => x.id === id);
     if (!m || m.terminal) return;
@@ -6483,6 +6922,54 @@ export default function App() {
       return next;
     });
     saved("SKUs saved");
+  };
+
+  /* Generated SKU rows, several models at a time, appended rather than
+     replacing — the generator adds colours and covers to a list someone
+     may have started by hand, and dropping that would be the worst kind
+     of silent loss.
+
+     The whole plan is worked out from phonesRef BEFORE setPhones, so the
+     counts this reports are counted once however many times React runs
+     the updater, and a code already on the model (or repeated inside the
+     batch) is skipped rather than duplicated.
+
+     No child is released here, unlike saveSKU: a generated row carries no
+     masterRid, so a child still needs its mapping before it is ready, and
+     pretending otherwise would list stock it has no claim on. */
+  const addSkus = (byModel) => {
+    if (!CAN.editSKUs(role)) { say(`⚠ ${roleLabel(role)} can't edit SKUs`); return 0; }
+    const fresh = phonesRef.current;
+    const plan  = [];
+    byModel.forEach(({ id, skus }) => {
+      const p = fresh.find((x) => x.id === id);
+      if (!p) return;
+      const have = new Set(allSkus(p).map((r) => (r.sku || "").trim().toLowerCase()));
+      const add  = [];
+      skus.forEach((r) => {
+        const key = (r.sku || "").trim().toLowerCase();
+        if (!key || have.has(key)) return;
+        have.add(key); add.push(r);
+      });
+      if (add.length) plan.push({ id, skus: [...allSkus(p), ...add], added: add.length });
+    });
+    if (!plan.length) {
+      say("⚠ Nothing added — every one of those codes is already on its model");
+      return 0;
+    }
+    const byId = new Map(plan.map((x) => [x.id, x]));
+    setPhones((list) => {
+      const next = list.map((p) => {
+        const item = byId.get(p.id);
+        return item ? withAudit({ ...p, skus: item.skus }, session,
+          `Generated ${item.added} SKU${item.added === 1 ? "" : "s"}`) : p;
+      });
+      next.filter((p) => byId.has(p.id)).forEach(persist);
+      return next;
+    });
+    const total = plan.reduce((t, x) => t + x.added, 0);
+    saved(`${total} SKU${total === 1 ? "" : "s"} added to ${plan.length} model${plan.length === 1 ? "" : "s"}`);
+    return total;
   };
 
   /* update STP file status from ProductionSTP */
@@ -6980,6 +7467,14 @@ export default function App() {
                                   compact={compact} filters={filters} />}
         {view === "table"     && <Table models={visible} allModels={models} onOpen={setOpenId}
                                   onAdvance={advance} role={role} filters={filters} />}
+        {view === "planning"  && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+            <BulkPlanning models={liveModels} onMoveMany={moveMany}
+              onOpen={setOpenId} role={role} />
+            <SKUGenerator models={liveModels} onGenerate={addSkus}
+              onOpen={setOpenId} canEdit={CAN.editSKUs(role)} />
+          </div>
+        )}
         {view === "orders"    && (
           <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
             <POManager models={liveModels} onAssign={assignPO}

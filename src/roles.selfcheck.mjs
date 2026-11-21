@@ -14,6 +14,10 @@ import {
   childSkuMappingProblems, nextStageKey, prevStageKey, isReadyToRelease,
   parseLaunchDate,
 } from "./rules.js";
+import {
+  buildSku, modelCodeFor, brandCode, typeCode, colourCode,
+  COVER_TYPES, COLOUR_CODES, SKU_MAX,
+} from "./sku.js";
 
 const STAGE_KEYS = ["research", "planned", "ordered", "production", "received", "live", "unprocured"];
 
@@ -353,5 +357,112 @@ assert.equal(parseLaunchDate("2026-13-01"), "", "an ISO-shaped string is range-c
 assert.equal(parseLaunchDate("next tuesday"), "");
 assert.equal(parseLaunchDate(""), "");
 assert.equal(parseLaunchDate(null), "");
+
+/* ── SKU codes, against the sheet they came from ── */
+
+/* Every worked row in Excel_SKU_Gen/SKU Generator.xlsx: the brand, the
+   model code, the cover and the colour the buyer chose, and the code the
+   sheet's own formula produced for them. This is the whole point of
+   sku.js — if the app and the sheet ever disagree about a code, the
+   factory gets one and the marketplace listing gets the other. */
+const SHEET_ROWS = [
+  ["iPhone", "DUO", "Magsafe Silicone Cover", "Midnight Blue", "IPHN-DUO-SLC-CVR-MSF-MD-BLU"],
+  ["iPhone", "DUO", "Magsafe Silicone Cover", "White", "IPHN-DUO-SLC-CVR-MSF-WHT"],
+  ["iPhone", "DUO", "Magsafe Silicone Cover", "Charcoal Grey", "IPHN-DUO-SLC-CVR-MSF-COAL-GRAY"],
+  ["iPhone", "DUO", "Magsafe Silicone Cover", "Forest Green", "IPHN-DUO-SLC-CVR-MSF-FOR-GRN"],
+  ["iPhone", "DUO", "Magsafe Silicone Cover", "Black", "IPHN-DUO-SLC-CVR-MSF-BLK"],
+  ["iPhone", "18-PRO", "Translucent Cover MSF", "Cherry Red", "IPHN-18-PRO-TLST-MSF-CVR-CHY-RED"],
+  ["iPhone", "18-PRO", "Translucent Cover MSF", "White", "IPHN-18-PRO-TLST-MSF-CVR-WHT"],
+  ["iPhone", "18-PRO", "Translucent Cover MSF", "Peak Blue", "IPHN-18-PRO-TLST-MSF-CVR-PEK-BLU"],
+  ["iPhone", "18-PRO-MAX", "Translucent Cover MSF", "Cherry Red", "IPHN-18-PRO-MAX-TLST-MSF-CVR-CHY-RED"],
+  ["iPhone", "18-PRO-MAX", "Translucent Cover MSF", "White", "IPHN-18-PRO-MAX-TLST-MSF-CVR-WHT"],
+  ["iPhone", "18-PRO-MAX", "Translucent Cover MSF", "Peak Blue", "IPHN-18-PRO-MAX-TLST-MSF-CVR-PEK-BLU"],
+  ["iPhone", "DUO", "Translucent Cover MSF", "White", "IPHN-DUO-TLST-MSF-CVR-WHT"],
+  ["iPhone", "DUO", "Translucent Cover MSF", "Dark Blue", "IPHN-DUO-TLST-MSF-CVR-DK-BLU"],
+  ["iPhone", "18-PRO", "TPU+PC+MSF", "Dark Blue", "IPHN-18-PRO-TPU-PC-CVR-MSF-MT-DK-BLU"],
+  ["iPhone", "18-PRO", "TPU+PC+MSF", "Peak Blue", "IPHN-18-PRO-TPU-PC-CVR-MSF-MT-PEK-BLU"],
+  ["iPhone", "18-PRO", "TPU+PC+MSF", "White", "IPHN-18-PRO-TPU-PC-CVR-MSF-MT-WHT"],
+  ["iPhone", "18-PRO-MAX", "TPU+PC+MSF", "Dark Blue", "IPHN-18-PRO-MAX-TPU-PC-CVR-MSF-MT-DK-BLU"],
+  ["iPhone", "18-PRO-MAX", "TPU+PC+MSF", "Light Brown", "IPHN-18-PRO-MAX-TPU-PC-CVR-MSF-MT-LT-BRN"],
+  ["iPhone", "18-PRO-MAX", "TPU+PC+MSF", "White", "IPHN-18-PRO-MAX-TPU-PC-CVR-MSF-MT-WHT"],
+  ["iPhone", "18-PRO-MAX", "TPU+PC+MSF", "Wine Red", "IPHN-18-PRO-MAX-TPU-PC-CVR-MSF-MT-WN-RED"],
+  ["iPhone", "DUO", "TPU+PC+MSF", "Dark Blue", "IPHN-DUO-TPU-PC-CVR-MSF-MT-DK-BLU"],
+  ["iPhone", "DUO", "TPU+PC+MSF", "Dark Purple", "IPHN-DUO-TPU-PC-CVR-MSF-MT-DK-PRPL"],
+  ["iPhone", "DUO", "TPU+PC+MSF", "White", "IPHN-DUO-TPU-PC-CVR-MSF-MT-WHT"],
+  ["Oppo", "FND-X10-PMAX", "TPU+PC+MSF", "Black Transparent", "OPPO-FND-X10-PMAX-TPU-PC-CVR-MSF-MT-BLK-TRNS"],
+  ["Oneplus", "16", "TPU+PC+MSF", "Black Transparent", "OPLUS-16-TPU-PC-CVR-MSF-MT-BLK-TRNS"],
+  ["POCO", "X8-PMAX", "TPU+PC+MSF", "Black Transparent", "POCO-X8-PMAX-TPU-PC-CVR-MSF-MT-BLK-TRNS"],
+  ["Samsung", "Z-FOLD-8-ULTRA", "TPU+PC+MSF", "Black Transparent", "SM-Z-FOLD-8-ULTRA-TPU-PC-CVR-MSF-MT-BLK-TRNS"],
+  ["POCO", "X8-PWR", "TPU+PC", "Black Transparent", "POCO-X8-PWR-TPU-PC-CVR-MT-BLK-TRNS"],
+  ["Vivo", "X500", "TPU+PC", "Black Transparent", "VIVO-X500-TPU-PC-CVR-MT-BLK-TRNS"],
+  ["Vivo", "X500-PRO", "TPU+PC", "Black Transparent", "VIVO-X500-PRO-TPU-PC-CVR-MT-BLK-TRNS"],
+  ["Vivo", "X500-PRO-MAX", "TPU+PC", "Black Transparent", "VIVO-X500-PRO-MAX-TPU-PC-CVR-MT-BLK-TRNS"],
+];
+
+SHEET_ROWS.forEach(([brand, modelCode, type, colour, expected]) => {
+  const got = buildSku({ brand, modelCode, type, colour });
+  assert.equal(got.sku, expected,
+    `${brand} ${modelCode} ${type} ${colour} — the app and the sheet disagree`);
+  assert.deepEqual(got.unknown, [],
+    `${expected} is in the sheet, so every part of it must have a short form`);
+});
+
+/* The house brand adds nothing: Sprig's short form is blank and the
+   sheet's TEXTJOIN drops blanks, which is why no code starts with it. */
+assert.equal(brandCode("Sprig"), "");
+assert.equal(buildSku({ brand: "Sprig", modelCode: "DUO", type: "TPU+PC", colour: "Black" }).sku,
+  "DUO-TPU-PC-CVR-MT-BLK", "a blank short form contributes no segment and no stray dash");
+
+/* A repeated name keeps its FIRST code, because XLOOKUP returns the
+   first match. "Shining Yellow" is in the sheet twice. */
+assert.equal(colourCode("Shining Yellow"), "SHN-YLW");
+
+/* Lookups ignore case and stray spaces — a brand typed "iphone" and a
+   colour pasted with a trailing space are the same choice. */
+assert.equal(brandCode("iphone"), "IPHN");
+assert.equal(colourCode("  black  "), "BLK");
+assert.equal(typeCode("tpu+pc"), "TPU-PC-CVR-MT");
+
+/* A part with no short form is NAMED, not silently dropped: without this
+   two handsets whose brand is missing would generate the same code. */
+const noBrand = buildSku({ brand: "Fairphone", modelCode: "6", type: "TPU+PC", colour: "Black" });
+assert.deepEqual(noBrand.unknown, ["brand"]);
+assert.equal(noBrand.sku, "6-TPU-PC-CVR-MT-BLK",
+  "the rest still builds, so the screen can show what the code would be");
+assert.deepEqual(buildSku({ brand: "iPhone", modelCode: "DUO", type: "Leather", colour: "Taupe" }).unknown,
+  ["type", "colour"]);
+
+/* The sheet's 40-character line is a warning, not a limit: the sheet
+   itself ships codes past it, so nothing may be truncated. */
+const long = buildSku({ brand: "Samsung", modelCode: "Z-FOLD-8-ULTRA",
+  type: "TPU+PC+MSF", colour: "Black Transparent" });
+assert.equal(long.sku, "SM-Z-FOLD-8-ULTRA-TPU-PC-CVR-MSF-MT-BLK-TRNS");
+assert.equal(long.length, 44);
+assert.equal(long.tooLong, true, "44 characters is over the sheet's own mark");
+assert.equal(buildSku({ brand: "iPhone", modelCode: "DUO", type: "TPU+PC", colour: "Black" }).tooLong, false);
+
+/* The model code is typed, not looked up — this only tidies it. */
+assert.equal(modelCodeFor("18 Pro"), "18-PRO");
+assert.equal(modelCodeFor("Galaxy A57 5G"), "GALAXY-A57-5G");
+assert.equal(modelCodeFor("  Reno 15  "), "RENO-15", "no leading or trailing separator");
+assert.equal(modelCodeFor("V70/FE"), "V70-FE", "one separator, whatever was typed");
+assert.equal(modelCodeFor(""), "");
+
+/* Silicone MagSafe is not in the sheet. It is kept because models
+   ordered under that name already exist, and a material the app does not
+   list is invisible to the STP matrix (AUD-013). */
+assert.equal(typeCode("Silicone MagSafe"), typeCode("Magsafe Silicone Cover"),
+  "the legacy name must build the same code as the sheet's name");
+
+/* Nothing in either table may carry a code that would break the format
+   or collide: a blank code (other than the house brand) silently
+   shortens every SKU built from it. */
+COVER_TYPES.forEach(([name, code]) => {
+  assert.ok(code && /^[A-Z0-9-]+$/.test(code), `cover "${name}" has an unusable short form: ${code}`);
+});
+COLOUR_CODES.forEach(([name, code]) => {
+  assert.ok(code && /^[A-Z0-9-]+$/.test(code), `colour "${name}" has an unusable short form: ${code}`);
+});
+assert.equal(SKU_MAX, 40);
 
 console.log("roles.js OK");
