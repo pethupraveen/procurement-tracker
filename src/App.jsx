@@ -8,7 +8,7 @@ import { exportCell, safeUrl as safeUrlOf, wouldStrandAdmins, isLastAdmin,
          projectRef as dbProjectRef, isConfigOverride,
          isChildModel, childrenOf, isMasterModel, masterLinkProblem,
          eligibleMasters, childSkuMappingProblems,
-         nextStageKey, prevStageKey, isReadyToRelease } from "./rules.js";
+         nextStageKey, prevStageKey, isReadyToRelease, parseLaunchDate } from "./rules.js";
 /* CalendarDays and Inbox are aliased on import: the local components below are
    already called Calendar and Table, and Calendar/Inward previously reused the
    Dashboard and Orders icons, so two pairs of tabs were visually identical. */
@@ -3598,14 +3598,13 @@ function CSVImport({ existing, onImport, onDone }) {
       const errs = [];
       if (!brand) errs.push("no brand");
       if (!name)  errs.push("no model name");
-      /* accept YYYY-MM-DD or DD/MM/YYYY */
+      /* YYYY-MM-DD, DD/MM/YYYY, or Excel's own 16-Apr-25 — see rules.js */
       let iso8601 = "";
       if (!launch) errs.push("no launch date");
-      else if (/^\d{4}-\d{2}-\d{2}$/.test(launch)) iso8601 = launch;
-      else if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(launch)) {
-        const [d, m, y] = launch.split("/");
-        iso8601 = `${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
-      } else errs.push("bad date — use YYYY-MM-DD");
+      else {
+        iso8601 = parseLaunchDate(launch);
+        if (!iso8601) errs.push("bad date — use YYYY-MM-DD");
+      }
       const seg = ["Budget","Mid Range","Premium","Flagship"]
         .find((x) => x.toLowerCase() === (segment || "").toLowerCase()) || "Mid Range";
       const dupe = brand && name ? findDuplicate(existing, brand, name) : null;
@@ -3673,7 +3672,7 @@ function CSVImport({ existing, onImport, onDone }) {
 
         <div style={{ fontSize: 11, color: "var(--dim)", marginBottom: 6, lineHeight: 1.6 }}>
           Columns: <code>Brand, Model, Launch date, Segment</code>.
-          Dates as <code>2026-07-20</code> or <code>20/07/2026</code>. Segment is optional
+          Dates as <code>2026-07-20</code>, <code>20/07/2026</code> or <code>20-Jul-26</code>. Segment is optional
           and defaults to Mid Range. Tabs from Excel work, and a header row is skipped.
         </div>
         <textarea rows={7} value={text}

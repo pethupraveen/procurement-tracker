@@ -12,6 +12,7 @@ import {
   materialColumns, materialHeader, projectRef, isConfigOverride,
   isChildModel, childrenOf, isMasterModel, masterLinkProblem, eligibleMasters,
   childSkuMappingProblems, nextStageKey, prevStageKey, isReadyToRelease,
+  parseLaunchDate,
 } from "./rules.js";
 
 const STAGE_KEYS = ["research", "planned", "ordered", "production", "received", "live", "unprocured"];
@@ -333,5 +334,24 @@ assert.equal(isReadyToRelease({ ...ready, masterId: null }, MRIDS), false,
 assert.equal(isReadyToRelease(null, MRIDS), false);
 assert.equal(isReadyToRelease(ready, []), false,
   "a master with no SKUs cannot release anything");
+
+/* ── launch dates pasted out of a spreadsheet ── */
+assert.equal(parseLaunchDate("2026-07-20"), "2026-07-20");
+assert.equal(parseLaunchDate("20/07/2026"), "2026-07-20", "DD/MM/YYYY, not MM/DD");
+assert.equal(parseLaunchDate("5/7/2026"),   "2026-07-05", "single digits still pad");
+assert.equal(parseLaunchDate("16-Apr-25"),  "2025-04-16", "what Excel writes for a date cell");
+assert.equal(parseLaunchDate("09-Sep-26"),  "2026-09-09");
+assert.equal(parseLaunchDate("16-APR-2025"),"2025-04-16", "case and a four-digit year");
+assert.equal(parseLaunchDate("1-June-26"),  "2026-06-01", "a full month name is read by its first three");
+assert.equal(parseLaunchDate(" 16-Apr-25 "),"2025-04-16", "surrounding space");
+assert.equal(parseLaunchDate("12-Dec-99"),  "1999-12-12", "Excel's rule: 30-99 is last century");
+assert.equal(parseLaunchDate("12-Dec-29"),  "2029-12-12", "and 00-29 is this one");
+assert.equal(parseLaunchDate("16-Xyz-25"),  "", "not a month");
+assert.equal(parseLaunchDate("32/07/2026"), "", "no 32nd day");
+assert.equal(parseLaunchDate("20/13/2026"), "", "no 13th month");
+assert.equal(parseLaunchDate("2026-13-01"), "", "an ISO-shaped string is range-checked too");
+assert.equal(parseLaunchDate("next tuesday"), "");
+assert.equal(parseLaunchDate(""), "");
+assert.equal(parseLaunchDate(null), "");
 
 console.log("roles.js OK");
