@@ -90,6 +90,7 @@ flowchart LR
 | Board | Drag models through the procurement pipeline |
 | Table | Review and filter all models in a compact list |
 | Calendar | See model launches and target completion dates |
+| Planning | Move the research list to Planned in one pass, and generate SKU codes across several Planned models |
 | Orders | Assign and review POs; bulk-confirm received stock |
 | Inward stock | Record SKU receipts and choose STP requirements by model and material |
 | Listing | Work through the per-SKU marketplace listing queue |
@@ -151,6 +152,8 @@ flowchart TB
 | --- | --- |
 | <code>src/App.jsx</code> | The application: UI, business rules, permissions, derived data, and database calls |
 | <code>src/main.jsx</code> | React entry point |
+| <code>src/sku.js</code> | The SKU code tables and formula, generated from the workbook. Do not hand-edit |
+| <code>Excel_SKU_Gen/</code> | The SKU workbook these codes come from, and <code>refresh-sku-codes.py</code>, which rewrites <code>src/sku.js</code> from it |
 | <code>schema.sql</code> | Full Supabase schema, view, trigger, and seed users. <strong>Drops the tables first</strong> |
 | <code>schema-bootstrap.sql</code> | Non-destructive version of the above: creates only what is missing |
 | <code>schema-roles.sql</code> | The <code>role_permissions</code> table behind the admin matrix |
